@@ -21,7 +21,6 @@ async fn f() {
     println!("1");
     let a: i32 = ().await;
     println!("2 {a}");
-    // calc before await (`pre_b(a)`), method call after await (`.print()`)
     let b: f64 = pre_b(a).await.print();
     println!("3 {b}");
 }
@@ -29,12 +28,12 @@ async fn f() {
 fn main() {
     let mut c = f();
 
-    assert!(matches!(c.step(), Poll::Pending)); // prints 1 → WaitingA
+    assert!(matches!(c.step(), Ok(Poll::Pending)));
     c.settle_wait(&2);
 
-    assert!(matches!(c.step(), Poll::Pending)); // prints 2 2, eval (2.0+1.5) → WaitingB
+    assert!(matches!(c.step(), Ok(Poll::Pending)));
     c.settle_wait(&3.14);
 
-    assert!(matches!(c.step(), Poll::Ready(()))); // print 3.14, prints 3 3.14 → Finished
-    assert!(matches!(c.step(), Poll::Ready(())));
+    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
 }
