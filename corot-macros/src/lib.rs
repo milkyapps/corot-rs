@@ -15,17 +15,24 @@ use syn::{
 /// Methods (`self`) and generics are not supported yet.
 ///
 /// Return type may be `()`, any `T`, or `Result<T, E>`. A trailing expression
-/// (or `return` / `Ok(…)` / `Err(…)`) becomes `Poll::Ready(…)`.
+/// (or `return` / `Ok(…)` / `Err(…)`) becomes `Step::Ready(…)`.
+///
+/// `step` returns `Result<corot_rs::Step<Output, Effect>, Rehydration>`:
+/// `Ready` / `Pending` (settle with `settle_wait`) / `Effect` (host runs an
+/// external async call such as `send_message(1).await`, then settles).
 ///
 /// - `let name: T = expr.await?` when the fn returns `Result<U, E>` (settle
-///   `Result<T, E>`; `Err` finishes with `Poll::Ready(Err(...))`)
+///   `Result<T, E>`; `Err` finishes with `Step::Ready(Err(...))`)
 /// - general `expr?` in a `Result<U, E>` fn (rewritten to finish with `Err`)
 /// - `try { … }` blocks (including with await / `await?`): desugared; block type
 ///   must be written as `let name: Result<T, E> = try { … }`
 /// - `return` / `return <expr>` before or after an await (rewritten to finish the
-///   coroutine with `Poll::Ready(...)`)
+///   coroutine with `Step::Ready(...)`)
+/// - `foo(args…).await` (not `call` / `iter` / `val`) — `step` returns
+///   `Step::Effect(CallFoo(args…))` so the host can invoke `foo` itself
 /// - `corot_rs::call::<ChildCoroutine>(child()).await` — drive another `#[corot]`
-///   coroutine to completion (composition)
+///   coroutine to completion (composition); child effects bubble as
+///   `Effect::NestedChildCoroutine(…)`
 /// - `loop` / `while` / `while let` / `for`: optional label; `break` / `continue`
 ///   before or after the await (unlabeled or `'label`); unlabeled `break`/`continue`
 ///   inside nested sync loops stay native
@@ -63,6 +70,18 @@ pub fn corot(_attr: TokenStream, item: TokenStream) -> TokenStream {
     }
 }
 
+struct EffectArg {
+    expr: Expr,
+    /// Filled at parse when obvious; otherwise resolved from captures.
+    ty: Option<Type>,
+}
+
+/// External async call surfaced as `Step::Effect(CallFoo(…))`.
+struct EffectCall {
+    variant: Ident,
+    args: Vec<EffectArg>,
+}
+
 struct AwaitPoint {
     /// Binding / variant stem, e.g. `a` → `WaitingA`.
     name: Ident,
@@ -79,6 +98,8 @@ struct AwaitPoint {
     try_ok: Option<(Ident, Type)>,
     /// `call::<ChildCoroutine>(…)` — drive another `#[corot]` enum.
     nested_child: Option<Type>,
+    /// Non-`#[corot]` async call for the host to perform.
+    effect: Option<EffectCall>,
 }
 
 struct PlainAwait {
@@ -89,6 +110,7 @@ struct PlainAwait {
     after_resume: Vec<Stmt>,
     try_ok: Option<(Ident, Type)>,
     nested_child: Option<Type>,
+    effect: Option<EffectCall>,
 }
 
 enum SuspendKind {
@@ -566,6 +588,13 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     }
 
+    for (ap, caps) in awaits.iter_mut().zip(captures_at_await.iter()) {
+        resolve_effect_arg_types(ap, caps)?;
+    }
+
+    let effect_enum = format_ident!("{}Effect", enum_name);
+    let effect_enum_tokens = build_effect_enum(vis, &effect_enum, &awaits)?;
+
     let mut variants = if fn_args.is_empty() {
         vec![quote! { NotStarted }]
     } else {
@@ -771,7 +800,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             &awaits,
             &captures_at_await,
             &ready_ok,
-        );
+            &effect_enum);
         step_arms.push(quote! {
             #not_started_pat => {
                 #enter
@@ -834,7 +863,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         &ready_ok,
                     );
                     let some_body = if *has_body_await {
-                        let go_wait = gen_enter_wait(ap, &var, caps);
+                        let go_wait = gen_enter_wait(ap, &var, caps, &effect_enum);
                         quote! {
                             #before_await_toks
                             #go_wait
@@ -881,7 +910,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 } => {
                     let join_i = join_caps_index(ap, i);
                     let join_caps = &join_caps_at[join_i];
-                    let go_wait = gen_enter_wait(ap, &var, caps);
+                    let go_wait = gen_enter_wait(ap, &var, caps, &effect_enum);
                     let before_await_toks = rewrite_loop_body_stmts(
                         head,
                         before_await,
@@ -907,7 +936,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 } => {
                     let join_i = join_caps_index(ap, i);
                     let join_caps = &join_caps_at[join_i];
-                    let go_wait = gen_enter_wait(ap, &var, caps);
+                    let go_wait = gen_enter_wait(ap, &var, caps, &effect_enum);
                     let goto_after =
                         gen_goto_join(ap, join_i, &effective_join_caps(ap, join_caps));
                     let before_await_toks = rewrite_loop_body_stmts(
@@ -940,7 +969,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     let join_i = join_caps_index(ap, i);
                     let join_caps = &join_caps_at[join_i];
                     let cond_var = waiting_cond_variant(join_i);
-                    let go_cond = gen_go_waiting(&cond_var, join_caps, base);
+                    let go_cond = gen_go_waiting(&cond_var, join_caps, base, None, &effect_enum);
                     step_arms.push(quote! {
                         Self::#head_var { #(#head_pats,)* } => {
                             #go_cond
@@ -952,7 +981,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     label,
                     ..
                 } => {
-                    let go_wait = gen_enter_wait(ap, &var, caps);
+                    let go_wait = gen_enter_wait(ap, &var, caps, &effect_enum);
                     let _ = label;
                     step_arms.push(quote! {
                         Self::#head_var { #(#head_pats,)* } => {
@@ -1001,7 +1030,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         let before_await =
                             emit_stmts_rewrite_returns(before_await, &ready_ok);
                         let go_wait =
-                            gen_enter_wait(ap, &waiting_variant(&ap.name), caps);
+                            gen_enter_wait(ap, &waiting_variant(&ap.name), caps, &effect_enum);
                         quote! {
                             match __scrut {
                                 #sus_pat => {
@@ -1024,7 +1053,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     }
                     _ => quote! {},
                 };
-                let go_wait = gen_enter_wait(ap, &waiting_variant(&ap.name), caps);
+                let go_wait = gen_enter_wait(ap, &waiting_variant(&ap.name), caps, &effect_enum);
                 match &ap.kind {
                     SuspendKind::MatchGuard {
                         has_body_await: true,
@@ -1060,7 +1089,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                             // Outer cond false → run else suspend toward body wait or join.
                             // When outer cond_await: false means take else path (emit already
                             // handled at enter); WaitingCond resume for outer uses false → else.
-                            let go_wait = gen_enter_wait(ap, &waiting_variant(&ap.name), caps);
+                            let go_wait = gen_enter_wait(ap, &waiting_variant(&ap.name), caps, &effect_enum);
                             let mut sib_idx = 0usize;
                             let else_body = emit_else_suspend(
                                 else_suspend,
@@ -1145,7 +1174,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         }
                         _ => quote! {},
                     };
-                    let go_wait = gen_enter_wait(ap, &waiting_variant(&ap.name), caps);
+                    let go_wait = gen_enter_wait(ap, &waiting_variant(&ap.name), caps, &effect_enum);
                     let else_suspend = match &ap.kind {
                         SuspendKind::IfElse { else_suspend, .. } => else_suspend,
                         _ => unreachable!(),
@@ -1219,7 +1248,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                             &join_caps_at,
                             &after_last,
                             &ready_ok,
-                        )
+            &effect_enum)
                     }
                 }
                 SuspendKind::IfElse { .. } => {
@@ -1251,7 +1280,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                             &join_caps_at,
                             &after_last,
                             &ready_ok,
-                        )
+            &effect_enum)
                     }
                 }
                 // Else-path of let…else diverges after resume (see gen_after_resume).
@@ -1263,28 +1292,40 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     &join_caps_at,
                     &after_last,
                     &ready_ok,
-                ),
+            &effect_enum),
             };
 
             if ap.nested_child.is_some() {
                 let cap_moves_pending = cap_moves.clone();
-                let cap_moves_err = cap_moves;
+                let cap_moves_err = cap_moves.clone();
+                let cap_moves_effect = cap_moves;
+                let child_ty = ap.nested_child.as_ref().unwrap();
+                let nest_var = nested_effect_variant(child_ty)?;
                 step_arms.push(quote! {
                     Self::#var { #(#cap_pats,)* mut __child } => {
                         #guard
                         match __child.step() {
-                            ::core::result::Result::Ok(::core::task::Poll::Pending) => {
+                            ::core::result::Result::Ok(::corot_rs::Step::Pending) => {
                                 *self = Self::#var {
                                     #(#cap_moves_pending,)*
                                     __child,
                                 };
                                 break 'step ::core::result::Result::Ok(
-                                    ::core::task::Poll::Pending,
+                                    ::corot_rs::Step::Pending,
                                 );
                             }
-                            ::core::result::Result::Ok(::core::task::Poll::Ready(#tmp)) => {
+                            ::core::result::Result::Ok(::corot_rs::Step::Ready(#tmp)) => {
                                 #after_resume
                                 #tail
+                            }
+                            ::core::result::Result::Ok(::corot_rs::Step::Effect(__eff)) => {
+                                *self = Self::#var {
+                                    #(#cap_moves_effect,)*
+                                    __child,
+                                };
+                                break 'step ::core::result::Result::Ok(
+                                    ::corot_rs::Step::Effect(#effect_enum::#nest_var(__eff)),
+                                );
                             }
                             ::core::result::Result::Err(_) => {
                                 *self = Self::#var {
@@ -1328,7 +1369,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     &join_caps_at,
                     &after_last,
                     &ready_ok,
-                );
+            &effect_enum);
                 quote! {
                     #join_toks
                     #after_join
@@ -1374,6 +1415,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         &join_caps_at,
         &all_skips,
         &output_ty,
+        &effect_enum,
     );
     let getters = make_getters(&awaits, &captures_at_await, &join_caps_at);
 
@@ -1406,6 +1448,8 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         #vis enum #enum_name {
             #(#variants,)*
         }
+
+        #effect_enum_tokens
 
         #rehyd_enum
 
@@ -1507,6 +1551,7 @@ fn expand_await_stmt(
             before: Vec::new(),
             try_ok: plain.try_ok,
             nested_child: plain.nested_child,
+            effect: plain.effect,
             kind: SuspendKind::Plain {
                 after_resume: plain.after_resume,
             },
@@ -1597,6 +1642,7 @@ where
             before: Vec::new(),
             try_ok: plain.try_ok,
             nested_child: plain.nested_child,
+            effect: plain.effect,
             kind: make_kind(pos, len, before_await, after_await),
         });
     }
@@ -1795,6 +1841,18 @@ fn as_plain_await_let(
         strip_val_call(base)
     };
 
+    let effect = if nested_child.is_none() {
+        as_effect_call(&base)?
+    } else {
+        None
+    };
+    // Effect calls must not run the callee; only capture args for the host.
+    let base = if effect.is_some() {
+        syn::parse_quote!(())
+    } else {
+        base
+    };
+
     let after_resume = if try_ok.is_some() {
         // Emitted specially in gen_after_resume (expands `?` to early Ready(Err)).
         Vec::new()
@@ -1820,6 +1878,7 @@ fn as_plain_await_let(
         after_resume,
         try_ok,
         nested_child,
+        effect,
     }))
 }
 
@@ -1870,6 +1929,7 @@ fn as_await_let_else_stmt(
         before: Vec::new(),
         try_ok: plain.try_ok,
         nested_child: plain.nested_child,
+        effect: plain.effect,
         kind: SuspendKind::LetElseAwait {
             pat: pat.clone(),
             init: strip_val_call(expr.as_ref().clone()),
@@ -1918,6 +1978,7 @@ fn as_await_if_stmt(
                     before: Vec::new(),
                     try_ok: None,
                     nested_child: None,
+                    effect: None,
                     kind: SuspendKind::IfLetScrutinee {
                         pat: expr_let.pat.as_ref().clone(),
                         then_branch: expr_if.then_branch.clone(),
@@ -1941,6 +2002,7 @@ fn as_await_if_stmt(
                     before: Vec::new(),
                     try_ok: None,
                     nested_child: None,
+                    effect: None,
                     kind: SuspendKind::IfCondition {
                         resume_cond: ident_expr(&tmp),
                         then_branch: expr_if.then_branch.clone(),
@@ -1961,6 +2023,7 @@ fn as_await_if_stmt(
                 before: Vec::new(),
                 try_ok: plain.try_ok,
                 nested_child: plain.nested_child,
+                effect: plain.effect,
                 kind: SuspendKind::IfThen {
                     chain_head: index,
                     chain_pos: 0,
@@ -1995,6 +2058,7 @@ fn as_await_if_stmt(
                 before: Vec::new(),
                 try_ok: plain.try_ok,
                 nested_child: plain.nested_child,
+                effect: plain.effect,
                 kind: SuspendKind::IfThen {
                     chain_head: index,
                     chain_pos: 0,
@@ -2030,6 +2094,7 @@ fn as_await_if_stmt(
                 before: Vec::new(),
                 try_ok: None,
                 nested_child: None,
+                effect: None,
                 kind: SuspendKind::IfElse {
                     cond: strip_val_in_if_cond(expr_if.cond.as_ref().clone()),
                     then_branch: expr_if.then_branch.clone(),
@@ -2069,6 +2134,7 @@ fn as_await_if_stmt(
                 before: Vec::new(),
                 try_ok: None,
                 nested_child: None,
+                effect: None,
                 kind: SuspendKind::IfElse {
                     cond: sync_cond,
                     then_branch: expr_if.then_branch.clone(),
@@ -2235,6 +2301,7 @@ fn expand_if_stmt(
                     before: Vec::new(),
                     try_ok: None,
                     nested_child: None,
+                    effect: None,
                     kind: SuspendKind::IfElse {
                         cond: sync_cond.clone(),
                         then_branch: then_branch.clone(),
@@ -2864,6 +2931,7 @@ fn as_await_while_stmt(
                 before: Vec::new(),
                 try_ok: plain.try_ok,
                 nested_child: plain.nested_child,
+                effect: plain.effect,
                 kind: SuspendKind::While {
                     chain_head: index,
                     chain_pos: 0,
@@ -2899,6 +2967,7 @@ fn as_await_while_stmt(
                     before: Vec::new(),
                     try_ok: None,
                     nested_child: None,
+                    effect: None,
                     kind: SuspendKind::While {
                         chain_head: index,
                         chain_pos: 0,
@@ -2932,6 +3001,7 @@ fn as_await_while_stmt(
                     before: Vec::new(),
                     try_ok: None,
                     nested_child: None,
+                    effect: None,
                     kind: SuspendKind::While {
                         chain_head: index,
                         chain_pos: 0,
@@ -3003,6 +3073,7 @@ fn as_await_for_stmt(
                 after_resume: Vec::new(),
                 try_ok: None,
                 nested_child: None,
+                effect: None,
             },
             Vec::new(),
         )
@@ -3016,6 +3087,7 @@ fn as_await_for_stmt(
         before: Vec::new(),
         try_ok: plain.try_ok,
         nested_child: plain.nested_child,
+        effect: plain.effect,
         kind: SuspendKind::For {
             chain_head: index,
             chain_pos: 0,
@@ -3216,6 +3288,213 @@ fn as_corot_call(expr: &Expr) -> Option<(Type, Expr)> {
         return None;
     };
     Some((ty.clone(), call.args.first().unwrap().clone()))
+}
+
+/// `foo(args…)` — external async call the host should perform.
+fn as_effect_call(expr: &Expr) -> syn::Result<Option<EffectCall>> {
+    let expr = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        Expr::Group(g) => g.expr.as_ref(),
+        other => other,
+    };
+    let Expr::Call(call) = expr else {
+        return Ok(None);
+    };
+    if as_corot_call(expr).is_some()
+        || as_val_call(expr).is_some()
+        || as_corot_iter_call(expr).is_some()
+    {
+        return Ok(None);
+    }
+    let Expr::Path(path) = call.func.as_ref() else {
+        return Ok(None);
+    };
+    let seg = path.path.segments.last().ok_or_else(|| {
+        syn::Error::new_spanned(&call.func, "#[corot] external call needs a function path")
+    })?;
+    // Skip turbofish helpers we don't treat as effects.
+    if matches!(
+        seg.ident.to_string().as_str(),
+        "call" | "val" | "iter"
+    ) {
+        return Ok(None);
+    }
+    let variant = format_ident!("Call{}", to_upper_camel_case(&seg.ident.to_string()));
+    let mut args = Vec::new();
+    for arg in &call.args {
+        args.push(EffectArg {
+            expr: arg.clone(),
+            ty: infer_effect_arg_ty(arg),
+        });
+    }
+    Ok(Some(EffectCall { variant, args }))
+}
+
+fn infer_effect_arg_ty(expr: &Expr) -> Option<Type> {
+    let expr = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        Expr::Group(g) => g.expr.as_ref(),
+        other => other,
+    };
+    if let Some((ty, _)) = as_val_call(expr) {
+        return Some(ty);
+    }
+    match expr {
+        Expr::Cast(c) => Some(c.ty.as_ref().clone()),
+        Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
+            Lit::Int(i) => {
+                let ty: Type = if i.suffix().is_empty() {
+                    syn::parse_quote!(i32)
+                } else {
+                    let s = i.suffix();
+                    syn::parse_str(s).unwrap_or_else(|_| syn::parse_quote!(i32))
+                };
+                Some(ty)
+            }
+            Lit::Float(f) => {
+                let ty: Type = if f.suffix().is_empty() {
+                    syn::parse_quote!(f64)
+                } else {
+                    let s = f.suffix();
+                    syn::parse_str(s).unwrap_or_else(|_| syn::parse_quote!(f64))
+                };
+                Some(ty)
+            }
+            Lit::Bool(_) => Some(syn::parse_quote!(bool)),
+            Lit::Str(_) => Some(syn::parse_quote!(&'static str)),
+            Lit::Char(_) => Some(syn::parse_quote!(char)),
+            _ => None,
+        },
+        Expr::Reference(r) => {
+            let inner = infer_effect_arg_ty(&r.expr)?;
+            if r.mutability.is_some() {
+                Some(syn::parse_quote!(&mut #inner))
+            } else {
+                Some(syn::parse_quote!(&#inner))
+            }
+        }
+        Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => infer_effect_arg_ty(&u.expr),
+        _ => None,
+    }
+}
+
+fn resolve_effect_arg_types(ap: &mut AwaitPoint, caps: &[Binding]) -> syn::Result<()> {
+    let Some(effect) = &mut ap.effect else {
+        return Ok(());
+    };
+    for arg in &mut effect.args {
+        if arg.ty.is_some() {
+            continue;
+        }
+        if let Some(ty) = infer_effect_arg_ty(&arg.expr) {
+            arg.ty = Some(ty);
+            continue;
+        }
+        if let Expr::Path(p) = &arg.expr {
+            if p.path.get_ident().is_some() {
+                let id = p.path.get_ident().unwrap();
+                if let Some(b) = caps.iter().find(|b| &b.name == id) {
+                    arg.ty = Some(b.ty.clone());
+                    continue;
+                }
+            }
+        }
+        return Err(syn::Error::new_spanned(
+            &arg.expr,
+            "#[corot] external call arg needs a known type \
+             (literal, `as T`, `corot_rs::val::<T>(…)`, or a captured local)",
+        ));
+    }
+    Ok(())
+}
+
+fn type_path_last_ident(ty: &Type) -> Option<Ident> {
+    let Type::Path(p) = ty else {
+        return None;
+    };
+    p.path.segments.last().map(|s| s.ident.clone())
+}
+
+fn effect_enum_name_for_child(child_ty: &Type) -> syn::Result<Ident> {
+    let Some(id) = type_path_last_ident(child_ty) else {
+        return Err(syn::Error::new_spanned(
+            child_ty,
+            "#[corot] nested call child type must be a path",
+        ));
+    };
+    Ok(format_ident!("{}Effect", id))
+}
+
+fn nested_effect_variant(child_ty: &Type) -> syn::Result<Ident> {
+    let Some(id) = type_path_last_ident(child_ty) else {
+        return Err(syn::Error::new_spanned(
+            child_ty,
+            "#[corot] nested call child type must be a path",
+        ));
+    };
+    Ok(format_ident!("Nested{}", id))
+}
+
+fn build_effect_enum(
+    vis: &syn::Visibility,
+    effect_enum: &Ident,
+    awaits: &[AwaitPoint],
+) -> syn::Result<proc_macro2::TokenStream> {
+    let mut variants: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut seen_calls: Vec<(Ident, Vec<Type>)> = Vec::new();
+    for ap in awaits {
+        if let Some(eff) = &ap.effect {
+            let tys: Vec<Type> = eff
+                .args
+                .iter()
+                .map(|a| {
+                    a.ty.clone().ok_or_else(|| {
+                        syn::Error::new_spanned(&a.expr, "internal: unresolved effect arg type")
+                    })
+                })
+                .collect::<syn::Result<_>>()?;
+            if let Some((_, prev)) = seen_calls
+                .iter()
+                .find(|(v, _)| v == &eff.variant)
+            {
+                let prev_s: Vec<String> = prev.iter().map(|t| quote!(#t).to_string()).collect();
+                let new_s: Vec<String> = tys.iter().map(|t| quote!(#t).to_string()).collect();
+                if prev_s != new_s {
+                    return Err(syn::Error::new_spanned(
+                        &eff.variant,
+                        format!(
+                            "#[corot] conflicting external calls named `{}` with different argument types",
+                            eff.variant
+                        ),
+                    ));
+                }
+                continue;
+            }
+            seen_calls.push((eff.variant.clone(), tys.clone()));
+            let v = &eff.variant;
+            variants.push(quote! { #v(#(#tys),*) });
+        }
+    }
+    let mut seen_nested = Vec::new();
+    for ap in awaits {
+        if let Some(child) = &ap.nested_child {
+            let key = quote!(#child).to_string();
+            if seen_nested.contains(&key) {
+                continue;
+            }
+            seen_nested.push(key);
+            let nest_var = nested_effect_variant(child)?;
+            let child_eff = effect_enum_name_for_child(child)?;
+            variants.push(quote! { #nest_var(#child_eff) });
+        }
+    }
+    Ok(quote! {
+        #[allow(dead_code)]
+        #[derive(Debug)]
+        #vis enum #effect_enum {
+            #(#variants,)*
+        }
+    })
 }
 
 /// `val::<T>(arg)` / `corot_rs::val::<T>(arg)` — identity wrapper for type ascription.
@@ -3711,7 +3990,7 @@ fn emit_question_fn_exit(inner: proc_macro2::TokenStream) -> proc_macro2::TokenS
             ::core::result::Result::Err(__e) => {
                 *self = Self::Finished;
                 break 'step ::core::result::Result::Ok(
-                    ::core::task::Poll::Ready(::core::result::Result::Err(
+                    ::corot_rs::Step::Ready(::core::result::Result::Err(
                         ::core::convert::From::from(__e),
                     )),
                 );
@@ -3906,7 +4185,7 @@ fn emit_return_finish(
         }},
         Some(e) => quote! {{
             *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(#e));
+            break 'step ::core::result::Result::Ok(::corot_rs::Step::Ready(#e));
         }},
     }
 }
@@ -3940,7 +4219,7 @@ fn emit_completion_stmts(
         quote! {
             #prefix_toks
             *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(#e));
+            break 'step ::core::result::Result::Ok(::corot_rs::Step::Ready(#e));
         }
     } else {
         let last_tok = emit_stmt_rewrite_returns(last, ready_ok);
@@ -3981,7 +4260,7 @@ fn as_result_finish_expr(
         return Some(quote! {
             *self = Self::Finished;
             break 'step ::core::result::Result::Ok(
-                ::core::task::Poll::Ready(::core::result::Result::Ok(#ok_arg)),
+                ::corot_rs::Step::Ready(::core::result::Result::Ok(#ok_arg)),
             );
         });
     }
@@ -3989,7 +4268,7 @@ fn as_result_finish_expr(
         return Some(quote! {
             *self = Self::Finished;
             break 'step ::core::result::Result::Ok(
-                ::core::task::Poll::Ready(::core::result::Result::Err(
+                ::corot_rs::Step::Ready(::core::result::Result::Err(
                     ::core::convert::From::from(#err),
                 )),
             );
@@ -4121,6 +4400,7 @@ fn as_await_match_stmt(
                 before: Vec::new(),
                 try_ok: None,
                 nested_child: None,
+                effect: None,
                 kind: SuspendKind::MatchScrutinee {
                     arms: expr_match.arms.clone(),
                 },
@@ -4153,6 +4433,7 @@ fn as_await_match_stmt(
                 before: Vec::new(),
                 try_ok: plain.try_ok,
                 nested_child: plain.nested_child,
+                effect: plain.effect,
                 kind: SuspendKind::MatchArm {
                    chain_head: index,
                    chain_pos: 0,
@@ -4203,6 +4484,7 @@ fn as_await_match_stmt(
                 before: Vec::new(),
                 try_ok: None,
                 nested_child: None,
+                effect: None,
                 kind: SuspendKind::MatchGuard {
                     scrutinee: expr_match.expr.as_ref().clone(),
                     scrut_ty,
@@ -5444,11 +5726,18 @@ fn gen_enter_wait(
     ap: &AwaitPoint,
     waiting_var: &Ident,
     caps: &[Binding],
+    effect_enum: &Ident,
 ) -> proc_macro2::TokenStream {
     if ap.nested_child.is_some() {
         gen_go_nested(waiting_var, caps, &ap.base)
     } else {
-        gen_go_waiting(waiting_var, caps, &ap.base)
+        gen_go_waiting(
+            waiting_var,
+            caps,
+            &ap.base,
+            ap.effect.as_ref(),
+            effect_enum,
+        )
     }
 }
 
@@ -5471,18 +5760,55 @@ fn gen_go_nested(
     }
 }
 
-fn gen_go_waiting(var: &Ident, caps: &[Binding], base: &Expr) -> proc_macro2::TokenStream {
+fn gen_go_waiting(
+    var: &Ident,
+    caps: &[Binding],
+    base: &Expr,
+    effect: Option<&EffectCall>,
+    effect_enum: &Ident,
+) -> proc_macro2::TokenStream {
     let cap_moves = caps.iter().map(|b| {
         let n = &b.name;
         quote! { #n }
     });
-    quote! {
-        let _ = #base;
-        *self = Self::#var {
-            #(#cap_moves,)*
-            __wait: ::core::option::Option::None,
-        };
-        break 'step ::core::result::Result::Ok(::core::task::Poll::Pending);
+    if let Some(eff) = effect {
+        let variant = &eff.variant;
+        let arg_lets: Vec<_> = eff
+            .args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let id = format_ident!("__eff_arg{}", i);
+                let e = if let Some((_, inner)) = as_val_call(&a.expr) {
+                    inner
+                } else {
+                    a.expr.clone()
+                };
+                quote! { let #id = #e; }
+            })
+            .collect();
+        let arg_ids: Vec<_> = (0..eff.args.len())
+            .map(|i| format_ident!("__eff_arg{}", i))
+            .collect();
+        quote! {
+            #(#arg_lets)*
+            *self = Self::#var {
+                #(#cap_moves,)*
+                __wait: ::core::option::Option::None,
+            };
+            break 'step ::core::result::Result::Ok(::corot_rs::Step::Effect(
+                #effect_enum::#variant(#(#arg_ids),*)
+            ));
+        }
+    } else {
+        quote! {
+            let _ = #base;
+            *self = Self::#var {
+                #(#cap_moves,)*
+                __wait: ::core::option::Option::None,
+            };
+            break 'step ::core::result::Result::Ok(::corot_rs::Step::Pending);
+        }
     }
 }
 
@@ -5495,9 +5821,10 @@ fn gen_enter_await(
     awaits: &[AwaitPoint],
     captures_at_await: &[Vec<Binding>],
     ready_ok: &proc_macro2::TokenStream,
+    effect_enum: &Ident,
 ) -> proc_macro2::TokenStream {
     let before = emit_stmts_rewrite_returns(&ap.before, ready_ok);
-    let go_wait = gen_enter_wait(ap, waiting_var, caps);
+    let go_wait = gen_enter_wait(ap, waiting_var, caps, effect_enum);
     // After* join caps may include expression values (loop/block break binds).
     // LoopHead / WaitingIter must not — those run before a value exists.
     let after_caps = effective_join_caps(ap, join_caps);
@@ -5704,7 +6031,7 @@ fn gen_enter_await(
                         #(#join_moves,)*
                         __wait: ::core::option::Option::None,
                     };
-                    break 'step ::core::result::Result::Ok(::core::task::Poll::Pending);
+                    break 'step ::core::result::Result::Ok(::corot_rs::Step::Pending);
                 }
             } else {
                 let expr = iter_expr
@@ -5734,7 +6061,7 @@ fn gen_enter_await(
                 }
             } else if let Some(base) = cond_await_base {
                 let cond_var = waiting_cond_variant(join_index);
-                let go_cond = gen_go_waiting(&cond_var, &cond_caps, base);
+                let go_cond = gen_go_waiting(&cond_var, &cond_caps, base, None, effect_enum);
                 quote! {
                     #before
                     #go_cond
@@ -5779,19 +6106,19 @@ fn gen_enter_await(
                     }
                     let sib = &awaits[sib_i];
                     let sib_caps = &captures_at_await[sib_i];
-                    gen_enter_wait(sib, &waiting_variant(&sib.name), sib_caps)
+                    gen_enter_wait(sib, &waiting_variant(&sib.name), sib_caps, effect_enum)
                 })
                 .collect();
             let go_cond = if let Some(base) = cond_await_base {
                 let cond_var = waiting_cond_variant(join_index);
-                Some(gen_go_waiting(&cond_var, &cond_caps, base))
+                Some(gen_go_waiting(&cond_var, &cond_caps, base, None, effect_enum))
             } else if let ElseSuspend::ElseIfCondThen {
                 cond_await_base: base,
                 ..
             } = else_suspend_resume_leaf(else_suspend)
             {
                 let cond_var = waiting_cond_variant(join_index);
-                Some(gen_go_waiting(&cond_var, &cond_caps, base))
+                Some(gen_go_waiting(&cond_var, &cond_caps, base, None, effect_enum))
             } else {
                 None
             };
@@ -5933,7 +6260,7 @@ fn gen_enter_await(
             let sus_enter = if *has_body_await {
                 if let Some(base) = guard_await_base {
                     let cond_var = waiting_cond_variant(join_index);
-                    gen_go_waiting(&cond_var, &cond_caps, base)
+                    gen_go_waiting(&cond_var, &cond_caps, base, None, effect_enum)
                 } else {
                     go_wait.clone()
                 }
@@ -6117,7 +6444,7 @@ fn gen_after_resume(
                     ::core::result::Result::Err(e) => {
                         *self = Self::Finished;
                         break 'step ::core::result::Result::Ok(
-                            ::core::task::Poll::Ready(::core::result::Result::Err(
+                            ::corot_rs::Step::Ready(::core::result::Result::Err(
                                 ::core::convert::From::from(e),
                             )),
                         );
@@ -7296,6 +7623,7 @@ fn gen_join_tail(
     join_caps_at: &[Vec<Binding>],
     after_last: &[Stmt],
     ready_ok: &proc_macro2::TokenStream,
+    effect_enum: &Ident,
 ) -> proc_macro2::TokenStream {
     if completed_i + 1 >= awaits.len() {
         emit_completion_stmts(after_last, ready_ok)
@@ -7313,6 +7641,7 @@ fn gen_join_tail(
             awaits,
             captures_at_await,
             ready_ok,
+            effect_enum,
         )
     }
 }
@@ -7340,15 +7669,15 @@ fn is_unit_ty(ty: &Type) -> bool {
 /// come from a trailing expr or `return <expr>` / `Ok` / `Err`).
 fn ready_ok_tokens(output_ty: &Type) -> proc_macro2::TokenStream {
     if is_unit_ty(output_ty) {
-        quote! { ::core::task::Poll::Ready(()) }
+        quote! { ::corot_rs::Step::Ready(()) }
     } else if let Some(ok) = result_ok_ty(output_ty) {
         if is_unit_ty(&ok) {
-            quote! { ::core::task::Poll::Ready(::core::result::Result::Ok(())) }
+            quote! { ::corot_rs::Step::Ready(::core::result::Result::Ok(())) }
         } else {
-            quote! { ::core::task::Poll::Ready(loop {}) }
+            quote! { ::corot_rs::Step::Ready(loop {}) }
         }
     } else {
-        quote! { ::core::task::Poll::Ready(loop {}) }
+        quote! { ::corot_rs::Step::Ready(loop {}) }
     }
 }
 
@@ -7666,13 +7995,14 @@ fn make_rehydration(
     join_caps_at: &[Vec<Binding>],
     all_skips: &[Binding],
     output_ty: &Type,
+    effect_enum: &Ident,
 ) -> (
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
 ) {
     let step_ret = quote! {
-        ::core::result::Result<::core::task::Poll<#output_ty>, #rehyd_name>
+        ::core::result::Result<::corot_rs::Step<#output_ty, #effect_enum>, #rehyd_name>
     };
 
     if all_skips.is_empty() {
@@ -7828,7 +8158,7 @@ fn make_rehydration(
     };
 
     let step_ret = quote! {
-        ::core::result::Result<::core::task::Poll<#output_ty>, #rehyd_name<'_>>
+        ::core::result::Result<::corot_rs::Step<#output_ty, #effect_enum>, #rehyd_name<'_>>
     };
 
     (rehyd_enum, rehyd_method, step_ret)

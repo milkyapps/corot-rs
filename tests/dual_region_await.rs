@@ -3,7 +3,7 @@
 #![allow(unused_mut)]
 
 use corot_rs::corot;
-use std::task::Poll;
+
 
 #[corot]
 async fn while_cond_and_body() {
@@ -119,98 +119,98 @@ async fn else_if_multi_body() {
 fn test_dual_region_await() {
     println!("=== while cond + body ===");
     let mut c = while_cond_and_body();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&3i32); // n=3
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&3i32); // n=6 → break → done
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     println!("=== for iter + multi body ===");
     let mut c = for_iter_and_multi_body();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&vec![10, 20]);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&1i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&2i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     println!("=== if cond + then ===");
     let mut c = if_cond_and_then();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&7i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     let mut c = if_cond_and_then();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&false);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     println!("=== if let scrut + then ===");
     let mut c = if_let_scrut_and_then();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&Some(5i32));
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&9i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     let mut c = if_let_scrut_and_then();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&None::<i32>);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     println!("=== if cond + else ===");
     let mut c = if_cond_and_else();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&false);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&11i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     let mut c = if_cond_and_else();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     println!("=== match guard + body ===");
     let mut c = match_guard_and_body();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&42i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     let mut c = match_guard_and_body();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&false);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     println!("=== else-if cond + then ===");
     let mut c = else_if_cond_and_then();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     let mut c = else_if_cond_and_then();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&false);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 
     println!("=== else-if multi body (exclusive) ===");
     let mut c = else_if_multi_body();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&99i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 }

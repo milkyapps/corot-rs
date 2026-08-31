@@ -1,6 +1,6 @@
 //! General `expr?` and `try { … }` blocks (including with await / `await?`).
 //!
-//! - In a `Result<(), E>` fn, `expr?` finishes with `Poll::Ready(Err(…))`.
+//! - In a `Result<(), E>` fn, `expr?` finishes with `corot_rs::Step::Ready(Err(…))`.
 //! - `let name: Result<T, E> = try { … }` desugars so `?` targets the block.
 //! - `await?` inside `try` settles `Result` and joins the try block on `Err`.
 //!
@@ -10,7 +10,7 @@
 #![allow(unused_mut, unreachable_code)]
 
 use corot_rs::corot;
-use std::task::Poll;
+
 
 fn ok_i(n: i32) -> Result<i32, &'static str> {
     Ok(n)
@@ -105,45 +105,45 @@ async fn try_await_then_question() -> Result<(), &'static str> {
 fn test_try_block_await() {
     println!("=== general ? ok ===");
     let mut c = general_question_ok();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(Ok(())))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Ok(())))));
     println!();
 
     println!("=== general ? err after await ===");
     let mut c = general_question_err();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&1i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(Err("nope")))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Err("nope")))));
     println!();
 
     println!("=== sync try ok ===");
     let mut c = sync_try_ok();
-    assert!(matches!(c.step(), Ok(Poll::Ready(Ok(())))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Ok(())))));
     println!();
 
     println!("=== sync try err ===");
     let mut c = sync_try_err();
-    assert!(matches!(c.step(), Ok(Poll::Ready(Ok(())))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Ok(())))));
     println!();
 
     println!("=== try await ok ===");
     let mut c = try_await_ok();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&Ok::<i32, &str>(9));
-    assert!(matches!(c.step(), Ok(Poll::Ready(Ok(())))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Ok(())))));
     println!();
 
     println!("=== try await err ===");
     let mut c = try_await_err();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&Err::<i32, &str>("suspended"));
-    assert!(matches!(c.step(), Ok(Poll::Ready(Ok(())))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Ok(())))));
     println!();
 
     println!("=== try await then ? ===");
     let mut c = try_await_then_question();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&Ok::<i32, &str>(5));
-    assert!(matches!(c.step(), Ok(Poll::Ready(Ok(())))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Ok(())))));
 }

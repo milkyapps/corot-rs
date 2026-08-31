@@ -10,6 +10,19 @@
 
 pub use corot_macros::corot;
 
+/// Result of `step` on a `#[corot]` coroutine.
+///
+/// - [`Ready`](Step::Ready): coroutine finished with this value
+/// - [`Pending`](Step::Pending): suspended on a typed settle await — call `settle_wait`
+/// - [`Effect`](Step::Effect): suspended on an external call (e.g. `send_message(1).await`);
+///   the host should perform that call, then `settle_wait` with its return value
+#[derive(Debug)]
+pub enum Step<T, E = core::convert::Infallible> {
+    Ready(T),
+    Pending,
+    Effect(E),
+}
+
 /// Type ascription helper for `#[corot]` `for` loops over arbitrary iterables.
 ///
 /// Proc macros cannot infer `IntoIterator` types, so write:
@@ -48,7 +61,8 @@ pub fn val<T>(value: T) -> T {
 /// ```
 ///
 /// `C` is the child's coroutine enum type (the return type of the `#[corot]` fn).
-/// The parent drives `C::step` / `settle_wait` until `Poll::Ready`, then resumes.
+/// The parent drives `C::step` / `settle_wait` until `Step::Ready`, then resumes.
+/// Child `Step::Effect` values bubble as `ParentEffect::NestedChildCoroutine(…)`.
 ///
 /// This function is the identity: it exists only so the macro can read `C`.
 #[inline(always)]

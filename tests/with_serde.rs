@@ -3,7 +3,7 @@
 //! Richer serde demo: checkpoint mid-flight, then rehydrate skipped locals.
 
 use corot_rs::{corot, SkipSerde};
-use std::task::Poll;
+
 
 /// Persisted identity — *is* serializable.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -61,7 +61,7 @@ fn dump(label: &str, c: &CheckoutCoroutine) {
 fn test_with_serde() {
     println!("=== run A: step until first wait, checkpoint ===\n");
     let mut a = checkout();
-    assert!(matches!(a.step(), Ok(Poll::Pending)));
+    assert!(matches!(a.step(), Ok(corot_rs::Step::Pending)));
     dump("after first step (WaitingRows)", &a);
 
     println!("=== restore into B from JSON (db skipped → needs rehydration) ===\n");
@@ -86,10 +86,13 @@ fn test_with_serde() {
     }
 
     assert!(matches!(b.rehydrate(), CheckoutCoroutineRehydration::Ok));
-    assert!(matches!(b.step(), Ok(Poll::Pending))); // → WaitingTotal
+    assert!(matches!(
+        b.step(),
+        Ok(corot_rs::Step::Effect(CheckoutCoroutineEffect::CallScale(10)))
+    )); // → WaitingTotal via scale(rows).await
     dump("B waiting for total", &b);
 
     b.settle_wait(&99.5);
-    assert!(matches!(b.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(b.step(), Ok(corot_rs::Step::Ready(()))));
     dump("B finished", &b);
 }

@@ -6,7 +6,7 @@
 #![allow(unused_mut, unreachable_code)]
 
 use corot_rs::corot;
-use std::task::Poll;
+
 
 #[corot]
 async fn break_with_value() {
@@ -78,39 +78,39 @@ async fn break_from_nested_for() {
 fn test_labeled_block_await() {
     println!("=== break with value ===");
     let mut c = break_with_value();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== fallthrough value ===");
     let mut c = fallthrough_value();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&5i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== early break skips await ===");
     let mut c = early_break_skips_await();
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== stmt labeled block ===");
     let mut c = stmt_labeled_block();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&-1i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     let mut c = stmt_labeled_block();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== break from nested for ===");
     let mut c = break_from_nested_for();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&9i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 }

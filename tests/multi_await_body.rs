@@ -3,7 +3,7 @@
 #![allow(unused_mut, unreachable_code)]
 
 use corot_rs::corot;
-use std::task::Poll;
+
 
 #[corot]
 async fn multi_loop() {
@@ -66,44 +66,44 @@ async fn multi_match() {
 fn test_multi_await_body() {
     println!("=== multi loop ===");
     let mut c = multi_loop();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&4i32); // sum=7
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&2i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&2i32); // sum=11 → break
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== multi if ===");
     let mut c = multi_if();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&5i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&7i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== multi for ===");
     let mut c = multi_for();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&1i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&2i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== multi match ===");
     let mut c = multi_match();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&8i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&9i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 }

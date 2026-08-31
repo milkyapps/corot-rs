@@ -3,7 +3,7 @@
 //! Args are stored on `NotStarted` and captured across awaits like locals.
 
 use corot_rs::corot;
-use std::task::Poll;
+
 
 #[corot]
 async fn greet(name: String) {
@@ -50,28 +50,28 @@ async fn root_calls_leaf(seed: i32) {
 fn test_fn_args() {
     println!("=== greet ===");
     let mut c = greet("Ada".into());
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&7i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== accumulate ===");
     let mut c = accumulate(10, 3);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&5i32); // sum = 10 + 5 + 3 = 18
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&2i32); // sum = 20
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== sync only ===");
     let mut c = sync_only(true);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== compose with args ===");
     let mut c = root_calls_leaf(40);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&2i32); // leaf: 41 + 2
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 }

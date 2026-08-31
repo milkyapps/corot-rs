@@ -3,7 +3,7 @@
 #![allow(unused_mut)]
 
 use corot_rs::corot;
-use std::task::Poll;
+
 
 #[corot]
 async fn while_body_await() {
@@ -79,52 +79,52 @@ fn test_while_await() {
     println!("=== while body await ===");
     let mut c = while_body_await();
     for expected in [10, 20, 30] {
-        assert!(matches!(c.step(), Ok(Poll::Pending)));
+        assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
         c.settle_wait(&expected);
     }
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== while let body await ===");
     let mut c = while_let_body_await();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&100i32);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&200i32);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== while cond await ===");
     let mut c = while_cond_await();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true); // enters body, left becomes 0, break
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== while let scrutinee await ===");
     let mut c = while_let_scrut_await();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&Some(7i32));
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&Some(8i32));
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== while continue ===");
     let mut c = while_continue();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&-1i32); // continue
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&5i32); // seen=1
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&-2i32); // continue
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&6i32); // seen=2
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&7i32); // i hits 5 after this path... need to track
     // i starts 0; each LoopHead does i+=1 then await. After 5 iterations i=5, cond fails.
     // Settles: -1,5,-2,6,7 → 5 body entries; after 5th resume i=5, goto head, while i<5 false.
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 }

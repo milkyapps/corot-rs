@@ -1,7 +1,7 @@
 //! Simple `loop` with one await inside (and `break`).
 
 use corot_rs::corot;
-use std::task::Poll;
+
 
 #[corot]
 #[allow(unused_mut)]
@@ -25,16 +25,16 @@ fn test_loop_await() {
     let mut c = count_loop();
 
     // iteration 1
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&3);
 
     // iteration 2
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&4);
 
     // iteration 3 → sum becomes 10 → break → done
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&3);
 
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 }

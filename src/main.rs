@@ -1,5 +1,5 @@
 use corot_macros::corot;
-use std::task::Poll;
+
 
 trait Print {
     fn print(self) -> Self;
@@ -21,19 +21,23 @@ async fn f() {
     println!("1");
     let a: i32 = ().await;
     println!("2 {a}");
-    let b: f64 = pre_b(a).await.print();
+    let b: f64 = pre_b(a).await;
+    let b = b.print();
     println!("3 {b}");
 }
 
 fn main() {
     let mut c = f();
 
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&2);
 
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
-    c.settle_wait(&3.14);
+    assert!(matches!(
+        c.step(),
+        Ok(corot_rs::Step::Effect(FCoroutineEffect::CallPreB(2)))
+    ));
+    c.settle_wait(&pre_b(2));
 
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 }

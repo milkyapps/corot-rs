@@ -1,10 +1,10 @@
 //! Compose `#[corot]` functions via `call::<Child>(…).await`.
 //!
 //! The child is the generated coroutine enum (not a Rust `Future`). The parent
-//! drives `child.step()` / forwards `settle_wait` until `Poll::Ready`.
+//! drives `child.step()` / forwards `settle_wait` until `corot_rs::Step::Ready`.
 
 use corot_rs::corot;
-use std::task::Poll;
+
 
 #[corot]
 async fn leaf() {
@@ -37,13 +37,13 @@ fn test_compose_await() {
     let mut c = root();
 
     // Enter mid → leaf → leaf's await
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&10i32); // leaf
     // mid's own await
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&20i32); // mid
     // root's second leaf
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&30i32); // leaf again
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
 }

@@ -1,7 +1,7 @@
 //! Await inside `if`: condition, then, else, and else-if chains.
 
 use corot_rs::corot;
-use std::task::Poll;
+
 
 // --- await in the condition (bare `expr.await` → bool) ---
 
@@ -135,24 +135,24 @@ async fn await_in_else_if_cond_nested_skip() {
 fn run_cond() {
     println!("=== await in condition ===");
     let mut c = await_in_cond();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     let mut c = await_in_cond();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&false);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 }
 
 fn run_then() {
     println!("=== await in then ===");
     let mut c = await_in_then();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&7);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 }
 
@@ -170,64 +170,64 @@ async fn await_in_then_skipped() {
 fn run_then_skipped() {
     println!("=== await in then (else path, no suspend) ===");
     let mut c = await_in_then_skipped();
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 }
 
 fn run_else() {
     println!("=== await in else ===");
     let mut c = await_in_else();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&9);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 }
 
 fn run_else_if() {
     println!("=== await in else-if ===");
     let mut c = await_in_else_if();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&42);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 }
 
 fn run_else_if_final() {
     println!("=== await in final else of else-if chain ===");
     let mut c = await_in_else_if_final();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&99);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 }
 
 fn run_else_if_skipped() {
     println!("=== else-if chain (first branch, no suspend) ===");
     let mut c = await_in_else_if_skipped();
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 }
 
 fn run_else_if_cond() {
     println!("=== await in else-if condition (true) ===");
     let mut c = await_in_else_if_cond();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== await in else-if condition (false) ===");
     let mut c = await_in_else_if_cond();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&false);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 
     println!("=== await in else-if condition nested skip (true) ===");
     let mut c = await_in_else_if_cond_nested_skip();
-    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
     c.settle_wait(&true);
-    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
     println!();
 }
 
