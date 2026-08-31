@@ -1,8 +1,9 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use syn::{
-    parse_macro_input, Expr, ExprPath, Ident, ItemFn, Lit, Local, LocalInit, Pat, PatIdent, PatType,
-    Path, Stmt, Type,
+    parse_macro_input, Expr, ExprPath, Ident, ItemFn, Lifetime, Lit, Local, LocalInit, Pat, PatIdent,
+    PatType, Path, Stmt, Type,
 };
 
 /// Suspension points: typed `let` awaits (including `await?`); `if` / `if let` /
@@ -10,6 +11,9 @@ use syn::{
 ///
 /// - `let name: T = expr.await?` when the fn returns `Result<(), E>` (settle
 ///   `Result<T, E>`; `Err` finishes with `Poll::Ready(Err(...))`)
+/// - general `expr?` in a `Result<(), E>` fn (rewritten to finish with `Err`)
+/// - `try { … }` blocks (including with await / `await?`): desugared; block type
+///   must be written as `let name: Result<T, E> = try { … }`
 /// - `return` / `return <expr>` before or after an await (rewritten to finish the
 ///   coroutine with `Poll::Ready(...)`)
 /// - `corot_rs::call::<ChildCoroutine>(child()).await` — drive another `#[corot]`
@@ -198,6 +202,17 @@ enum SuspendKind {
         bind_ty: Type,
         /// Statement form `'a: { … }` (no outer `let`); fallthrough is `()`.
         is_stmt: bool,
+        before_await: Vec<Stmt>,
+        after_await: Vec<Stmt>,
+        join_stmts: Vec<Stmt>,
+    },
+    /// `let name: Result<T, E> = try { …; let x: T = ….await?; … }`
+    ///
+    /// `?` / `await?` Err paths assign `Err(…)` to `bind_name` and join; fallthrough
+    /// wraps the trailing expression in `Ok`.
+    TryBlock {
+        bind_name: Ident,
+        bind_ty: Type,
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
@@ -396,7 +411,8 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     },
                 );
             }
-            SuspendKind::LabeledBlock { before_await, .. } => {
+            SuspendKind::LabeledBlock { before_await, .. }
+            | SuspendKind::TryBlock { before_await, .. } => {
                 for stmt in before_await {
                     if let Some(b) = typed_let_binding(stmt) {
                         upsert_binding(&mut live, b);
@@ -762,7 +778,8 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 | SuspendKind::IfElse { .. }
                 | SuspendKind::MatchArm { .. }
                 | SuspendKind::MatchGuard { .. }
-                | SuspendKind::LabeledBlock { .. } => {
+                | SuspendKind::LabeledBlock { .. }
+                | SuspendKind::TryBlock { .. } => {
                     gen_goto_join(ap, i, &effective_join_caps(ap, &join_caps_at[i]))
                 }
                 // Else-path of let…else diverges after resume (see gen_after_resume).
@@ -826,19 +843,27 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             let join_caps = effective_join_caps(ap, &join_caps_at[i]);
             let join_pats: Vec<_> = join_caps.iter().map(cap_pat).collect();
             let join_stmts = join_stmts_of(ap).unwrap_or(&[]);
-            let join_toks = emit_stmts_rewrite_returns(join_stmts, &ready_ok);
-            let after_join = gen_join_tail(
-                i,
-                &awaits,
-                &captures_at_await,
-                &join_caps_at,
-                &after_last,
-                &ready_ok,
-            );
-            step_arms.push(quote! {
-                Self::#after_var { #(#join_pats,)* } => {
+            // Final join owns the remaining body (including trailing `Ok(())`).
+            let join_body = if i + 1 >= awaits.len() {
+                emit_completion_stmts(join_stmts, &ready_ok)
+            } else {
+                let join_toks = emit_stmts_rewrite_returns(join_stmts, &ready_ok);
+                let after_join = gen_join_tail(
+                    i,
+                    &awaits,
+                    &captures_at_await,
+                    &join_caps_at,
+                    &after_last,
+                    &ready_ok,
+                );
+                quote! {
                     #join_toks
                     #after_join
+                }
+            };
+            step_arms.push(quote! {
+                Self::#after_var { #(#join_pats,)* } => {
+                    #join_body
                 }
             });
         }
@@ -953,7 +978,7 @@ fn split_awaits(
         } else if stmt_contains_await(stmt) {
             return Err(syn::Error::new_spanned(
                 stmt,
-                "#[corot] unsupported await placement (supported: typed let; if; match; loop; while; for; labeled block)",
+                "#[corot] unsupported await placement (supported: typed let; if; match; loop; while; for; labeled block; try)",
             ));
         } else {
             current.push(stmt.clone());
@@ -968,6 +993,9 @@ fn as_await_stmt(
     index: usize,
     err_ty: Option<&Type>,
 ) -> syn::Result<Option<AwaitPoint>> {
+    if let Some(ap) = as_await_try_block_stmt(stmt, index, err_ty)? {
+        return Ok(Some(ap));
+    }
     if let Some(ap) = as_await_labeled_block_stmt(stmt, index, err_ty)? {
         return Ok(Some(ap));
     }
@@ -1647,6 +1675,78 @@ fn as_await_labeled_block_stmt(
     Ok(None)
 }
 
+fn as_await_try_block_stmt(
+    stmt: &Stmt,
+    index: usize,
+    _fn_err_ty: Option<&Type>,
+) -> syn::Result<Option<AwaitPoint>> {
+    // `let name: Result<T, E> = try { … }`
+    let Stmt::Local(Local {
+        pat,
+        init: Some(LocalInit { expr, diverge, .. }),
+        ..
+    }) = stmt
+    else {
+        return Ok(None);
+    };
+    if diverge.is_some() {
+        return Ok(None);
+    }
+    let Expr::TryBlock(try_block) = unwrap_parens_ref(expr) else {
+        return Ok(None);
+    };
+    if !try_block.block.stmts.iter().any(stmt_contains_await) {
+        return Ok(None);
+    }
+    let Pat::Type(PatType { pat: inner, ty, .. }) = pat else {
+        return Err(syn::Error::new_spanned(
+            pat,
+            "try-block await bindings must be `let name: Result<T, E> = try { … }`",
+        ));
+    };
+    let bind_ty = ty.as_ref().clone();
+    let (_ok_ty, err_ty) = parse_result_binding_ty(&bind_ty, pat)?;
+    let bind_name = pat_ident_or_discard(inner)?;
+    let bind_name = if bind_name == "_unit" {
+        format_ident!("_try{}", index)
+    } else {
+        bind_name
+    };
+    // Use the try-block's `E` for `await?` settle typing (fn may even return `()`).
+    let (before_await, plain, after_await) =
+        extract_single_await_from_stmts(&try_block.block.stmts, Some(&err_ty))?;
+    Ok(Some(AwaitPoint {
+        name: plain.name,
+        tmp: plain.tmp,
+        wait_ty: plain.wait_ty,
+        base: plain.base,
+        before: Vec::new(),
+        try_ok: plain.try_ok,
+        nested_child: plain.nested_child,
+        kind: SuspendKind::TryBlock {
+            bind_name,
+            bind_ty,
+            before_await,
+            after_await: {
+                let mut v = plain.after_resume;
+                v.extend(after_await);
+                v
+            },
+            join_stmts: Vec::new(),
+        },
+    }))
+}
+
+fn parse_result_binding_ty(ty: &Type, span: &Pat) -> syn::Result<(Type, Type)> {
+    match (result_ok_ty(ty), result_err_ty(ty)) {
+        (Some(ok), Some(err)) => Ok((ok, err)),
+        _ => Err(syn::Error::new_spanned(
+            span,
+            "try-block bindings must be `let name: Result<T, E> = try { … }`",
+        )),
+    }
+}
+
 fn as_await_for_stmt(
     stmt: &Stmt,
     err_ty: Option<&Type>,
@@ -2103,21 +2203,35 @@ fn emit_stmt_rewrite_returns(
 ) -> proc_macro2::TokenStream {
     match stmt {
         Stmt::Local(local) => {
+            let attrs = &local.attrs;
+            let pat = &local.pat;
             if let Some(init) = &local.init {
+                let expr = emit_expr_rewrite_returns(&init.expr, ready_ok);
                 if let Some((_, diverge)) = &init.diverge {
-                    let attrs = &local.attrs;
-                    let pat = &local.pat;
-                    let expr = &init.expr;
                     let else_body = emit_expr_rewrite_returns(diverge, ready_ok);
                     return quote! {
                         #(#attrs)*
                         let #pat = #expr else #else_body;
                     };
                 }
+                return quote! {
+                    #(#attrs)*
+                    let #pat = #expr;
+                };
             }
             quote! { #stmt }
         }
         Stmt::Expr(expr, semi) => {
+            // Trailing `Ok(())` / `Err(e)` / `return` must finish the coroutine —
+            // do not emit them as values before a following `*self = …`.
+            if semi.is_none() {
+                if let Some(finish) = as_result_finish_expr(expr, ready_ok) {
+                    return finish;
+                }
+                if let Expr::Return(ret) = expr {
+                    return emit_return_finish(ret.expr.as_deref(), ready_ok);
+                }
+            }
             let e = emit_expr_rewrite_returns(expr, ready_ok);
             match semi {
                 Some(_) => quote! { #e; },
@@ -2134,12 +2248,18 @@ fn emit_expr_rewrite_returns(
 ) -> proc_macro2::TokenStream {
     match expr {
         Expr::Return(ret) => emit_return_finish(ret.expr.as_deref(), ready_ok),
+        Expr::Try(t) => {
+            let inner = emit_expr_rewrite_returns(&t.expr, ready_ok);
+            emit_question_fn_exit(inner)
+        }
+        Expr::TryBlock(tb) => emit_sync_try_block(&tb.block.stmts, ready_ok),
         Expr::Block(b) => {
+            let label = &b.label;
             let stmts = emit_stmts_rewrite_returns(&b.block.stmts, ready_ok);
-            quote! {{ #stmts }}
+            quote! { #label { #stmts } }
         }
         Expr::If(expr_if) => {
-            let cond = &expr_if.cond;
+            let cond = emit_expr_rewrite_returns(&expr_if.cond, ready_ok);
             let then_stmts = emit_stmts_rewrite_returns(&expr_if.then_branch.stmts, ready_ok);
             match &expr_if.else_branch {
                 None => quote! {
@@ -2158,8 +2278,23 @@ fn emit_expr_rewrite_returns(
             }
         }
         Expr::Match(m) => {
-            let scrut = &m.expr;
-            let arms = m.arms.iter().map(|a| emit_arm_body(a, ready_ok));
+            let scrut = emit_expr_rewrite_returns(&m.expr, ready_ok);
+            let arms = m.arms.iter().map(|a| {
+                let attrs = &a.attrs;
+                let pat = &a.pat;
+                let guard = match &a.guard {
+                    Some((_, g)) => {
+                        let g = emit_expr_rewrite_returns(g, ready_ok);
+                        quote! { if #g }
+                    }
+                    None => quote! {},
+                };
+                let body = emit_expr_rewrite_returns(&a.body, ready_ok);
+                quote! {
+                    #(#attrs)*
+                    #pat #guard => #body,
+                }
+            });
             quote! {
                 match #scrut {
                     #(#arms)*
@@ -2176,7 +2311,7 @@ fn emit_expr_rewrite_returns(
             }
         }
         Expr::While(w) => {
-            let cond = &w.cond;
+            let cond = emit_expr_rewrite_returns(&w.cond, ready_ok);
             let body = emit_stmts_rewrite_returns(&w.body.stmts, ready_ok);
             let label = &w.label;
             quote! {
@@ -2187,7 +2322,7 @@ fn emit_expr_rewrite_returns(
         }
         Expr::ForLoop(f) => {
             let pat = &f.pat;
-            let iter = &f.expr;
+            let iter = emit_expr_rewrite_returns(&f.expr, ready_ok);
             let body = emit_stmts_rewrite_returns(&f.body.stmts, ready_ok);
             let label = &f.label;
             quote! {
@@ -2196,11 +2331,81 @@ fn emit_expr_rewrite_returns(
                 }
             }
         }
+        Expr::Call(c) => {
+            let func = emit_expr_rewrite_returns(&c.func, ready_ok);
+            let args = c
+                .args
+                .iter()
+                .map(|a| emit_expr_rewrite_returns(a, ready_ok));
+            quote! { #func(#(#args),*) }
+        }
+        Expr::MethodCall(m) => {
+            let receiver = emit_expr_rewrite_returns(&m.receiver, ready_ok);
+            let method = &m.method;
+            let turbofish = &m.turbofish;
+            let args = m
+                .args
+                .iter()
+                .map(|a| emit_expr_rewrite_returns(a, ready_ok));
+            quote! { #receiver.#method #turbofish (#(#args),*) }
+        }
+        Expr::Binary(b) => {
+            let left = emit_expr_rewrite_returns(&b.left, ready_ok);
+            let op = &b.op;
+            let right = emit_expr_rewrite_returns(&b.right, ready_ok);
+            quote! { #left #op #right }
+        }
+        Expr::Unary(u) => {
+            let op = &u.op;
+            let expr = emit_expr_rewrite_returns(&u.expr, ready_ok);
+            quote! { #op #expr }
+        }
         Expr::Paren(p) => {
             let inner = emit_expr_rewrite_returns(&p.expr, ready_ok);
             quote! { (#inner) }
         }
         Expr::Group(g) => emit_expr_rewrite_returns(&g.expr, ready_ok),
+        Expr::Reference(r) => {
+            let mutability = &r.mutability;
+            let expr = emit_expr_rewrite_returns(&r.expr, ready_ok);
+            quote! { &#mutability #expr }
+        }
+        Expr::Field(f) => {
+            let base = emit_expr_rewrite_returns(&f.base, ready_ok);
+            let member = &f.member;
+            quote! { #base.#member }
+        }
+        Expr::Index(i) => {
+            let expr = emit_expr_rewrite_returns(&i.expr, ready_ok);
+            let index = emit_expr_rewrite_returns(&i.index, ready_ok);
+            quote! { #expr[#index] }
+        }
+        Expr::Tuple(t) => {
+            let elems = t
+                .elems
+                .iter()
+                .map(|e| emit_expr_rewrite_returns(e, ready_ok));
+            quote! { (#(#elems),*) }
+        }
+        Expr::Array(a) => {
+            let elems = a
+                .elems
+                .iter()
+                .map(|e| emit_expr_rewrite_returns(e, ready_ok));
+            quote! { [#(#elems),*] }
+        }
+        Expr::Cast(c) => {
+            let expr = emit_expr_rewrite_returns(&c.expr, ready_ok);
+            let ty = &c.ty;
+            quote! { #expr as #ty }
+        }
+        Expr::Assign(a) => {
+            let left = emit_expr_rewrite_returns(&a.left, ready_ok);
+            let right = emit_expr_rewrite_returns(&a.right, ready_ok);
+            quote! { #left = #right }
+        }
+        // Closures / async blocks keep native `?` (returns from the closure).
+        Expr::Closure(_) | Expr::Async(_) => quote! { #expr },
         other => {
             if let Some(finish) = as_result_finish_expr(other, ready_ok) {
                 finish
@@ -2208,6 +2413,197 @@ fn emit_expr_rewrite_returns(
                 quote! { #other }
             }
         }
+    }
+}
+
+/// `expr?` at function level → finish coroutine with `Poll::Ready(Err(…))`.
+fn emit_question_fn_exit(inner: proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    quote! {
+        match #inner {
+            ::core::result::Result::Ok(__v) => __v,
+            ::core::result::Result::Err(__e) => {
+                *self = Self::Finished;
+                break 'step ::core::result::Result::Ok(
+                    ::core::task::Poll::Ready(::core::result::Result::Err(
+                        ::core::convert::From::from(__e),
+                    )),
+                );
+            }
+        }
+    }
+}
+
+/// Desugar a sync (no-await) `try { … }` to a labeled block with `break` values.
+fn emit_sync_try_block(
+    stmts: &[Stmt],
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    static TRY_LABEL: AtomicUsize = AtomicUsize::new(0);
+    let n = TRY_LABEL.fetch_add(1, Ordering::Relaxed);
+    let label = Lifetime::new(
+        &format!("'__corot_try{n}"),
+        proc_macro2::Span::call_site(),
+    );
+    let (body_stmts, trailing) = split_block_trailing(stmts);
+    let body = body_stmts
+        .iter()
+        .map(|s| rewrite_sync_try_stmt(s, &label, ready_ok));
+    let value = match trailing {
+        Some(e) => rewrite_sync_try_expr(e, &label, ready_ok),
+        None => quote! { () },
+    };
+    quote! {
+        #label: {
+            #(#body)*
+            break #label (::core::result::Result::Ok(#value));
+        }
+    }
+}
+
+fn rewrite_sync_try_stmt(
+    stmt: &Stmt,
+    label: &Lifetime,
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match stmt {
+        Stmt::Local(local) => {
+            let attrs = &local.attrs;
+            let pat = &local.pat;
+            if let Some(init) = &local.init {
+                let expr = rewrite_sync_try_expr(&init.expr, label, ready_ok);
+                if let Some((_, diverge)) = &init.diverge {
+                    let else_body = rewrite_sync_try_expr(diverge, label, ready_ok);
+                    return quote! {
+                        #(#attrs)*
+                        let #pat = #expr else #else_body;
+                    };
+                }
+                return quote! {
+                    #(#attrs)*
+                    let #pat = #expr;
+                };
+            }
+            quote! { #stmt }
+        }
+        Stmt::Expr(expr, semi) => {
+            let e = rewrite_sync_try_expr(expr, label, ready_ok);
+            match semi {
+                Some(_) => quote! { #e; },
+                None => quote! { #e },
+            }
+        }
+        other => emit_stmt_rewrite_returns(other, ready_ok),
+    }
+}
+
+fn rewrite_sync_try_expr(
+    expr: &Expr,
+    label: &Lifetime,
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match expr {
+        Expr::Try(t) => {
+            let inner = rewrite_sync_try_expr(&t.expr, label, ready_ok);
+            quote! {
+                match #inner {
+                    ::core::result::Result::Ok(__v) => __v,
+                    ::core::result::Result::Err(__e) => {
+                        break #label (::core::result::Result::Err(
+                            ::core::convert::From::from(__e),
+                        ));
+                    }
+                }
+            }
+        }
+        Expr::Return(ret) => emit_return_finish(ret.expr.as_deref(), ready_ok),
+        Expr::TryBlock(tb) => emit_sync_try_block(&tb.block.stmts, ready_ok),
+        Expr::Block(b) => {
+            let parts = b
+                .block
+                .stmts
+                .iter()
+                .map(|s| rewrite_sync_try_stmt(s, label, ready_ok));
+            let blk_label = &b.label;
+            quote! { #blk_label { #(#parts)* } }
+        }
+        Expr::If(expr_if) => {
+            let cond = rewrite_sync_try_expr(&expr_if.cond, label, ready_ok);
+            let then_parts = expr_if
+                .then_branch
+                .stmts
+                .iter()
+                .map(|s| rewrite_sync_try_stmt(s, label, ready_ok));
+            match &expr_if.else_branch {
+                None => quote! {
+                    if #cond {
+                        #(#then_parts)*
+                    }
+                },
+                Some((_, else_expr)) => {
+                    let else_body = rewrite_sync_try_expr(else_expr, label, ready_ok);
+                    quote! {
+                        if #cond {
+                            #(#then_parts)*
+                        } else #else_body
+                    }
+                }
+            }
+        }
+        Expr::Match(m) => {
+            let scrut = rewrite_sync_try_expr(&m.expr, label, ready_ok);
+            let arms = m.arms.iter().map(|arm| {
+                let attrs = &arm.attrs;
+                let pat = &arm.pat;
+                let guard = match &arm.guard {
+                    Some((_, g)) => {
+                        let g = rewrite_sync_try_expr(g, label, ready_ok);
+                        quote! { if #g }
+                    }
+                    None => quote! {},
+                };
+                let body = rewrite_sync_try_expr(&arm.body, label, ready_ok);
+                quote! {
+                    #(#attrs)*
+                    #pat #guard => #body,
+                }
+            });
+            quote! {
+                match #scrut {
+                    #(#arms)*
+                }
+            }
+        }
+        Expr::Call(c) => {
+            let func = rewrite_sync_try_expr(&c.func, label, ready_ok);
+            let args = c
+                .args
+                .iter()
+                .map(|a| rewrite_sync_try_expr(a, label, ready_ok));
+            quote! { #func(#(#args),*) }
+        }
+        Expr::MethodCall(m) => {
+            let receiver = rewrite_sync_try_expr(&m.receiver, label, ready_ok);
+            let method = &m.method;
+            let turbofish = &m.turbofish;
+            let args = m
+                .args
+                .iter()
+                .map(|a| rewrite_sync_try_expr(a, label, ready_ok));
+            quote! { #receiver.#method #turbofish (#(#args),*) }
+        }
+        Expr::Binary(b) => {
+            let left = rewrite_sync_try_expr(&b.left, label, ready_ok);
+            let op = &b.op;
+            let right = rewrite_sync_try_expr(&b.right, label, ready_ok);
+            quote! { #left #op #right }
+        }
+        Expr::Paren(p) => {
+            let inner = rewrite_sync_try_expr(&p.expr, label, ready_ok);
+            quote! { (#inner) }
+        }
+        Expr::Group(g) => rewrite_sync_try_expr(&g.expr, label, ready_ok),
+        Expr::Closure(_) | Expr::Async(_) => quote! { #expr },
+        other => emit_expr_rewrite_returns(other, ready_ok),
     }
 }
 
@@ -2921,7 +3317,8 @@ fn after_resume_stmts(ap: &AwaitPoint) -> Vec<&Stmt> {
         | SuspendKind::For { after_await, .. }
         | SuspendKind::MatchArm { after_await, .. }
         | SuspendKind::LetElseAwait { after_await, .. }
-        | SuspendKind::LabeledBlock { after_await, .. } => after_await.iter().collect(),
+        | SuspendKind::LabeledBlock { after_await, .. }
+        | SuspendKind::TryBlock { after_await, .. } => after_await.iter().collect(),
         SuspendKind::IfCondition { .. }
         | SuspendKind::IfLetScrutinee { .. }
         | SuspendKind::MatchScrutinee { .. }
@@ -2974,6 +3371,7 @@ fn needs_join(kind: &SuspendKind) -> bool {
             | SuspendKind::MatchGuard { .. }
             | SuspendKind::LetElseAwait { .. }
             | SuspendKind::LabeledBlock { .. }
+            | SuspendKind::TryBlock { .. }
     )
 }
 
@@ -3048,7 +3446,8 @@ fn join_stmts_of(ap: &AwaitPoint) -> Option<&[Stmt]> {
         | SuspendKind::MatchArm { join_stmts, .. }
         | SuspendKind::MatchGuard { join_stmts, .. }
         | SuspendKind::LetElseAwait { join_stmts, .. }
-        | SuspendKind::LabeledBlock { join_stmts, .. } => Some(join_stmts.as_slice()),
+        | SuspendKind::LabeledBlock { join_stmts, .. }
+        | SuspendKind::TryBlock { join_stmts, .. } => Some(join_stmts.as_slice()),
         _ => None,
     }
 }
@@ -3063,6 +3462,11 @@ fn effective_join_caps(ap: &AwaitPoint, join_caps: &[Binding]) -> Vec<Binding> {
             caps
         }
         SuspendKind::LabeledBlock {
+            bind_name,
+            bind_ty,
+            ..
+        }
+        | SuspendKind::TryBlock {
             bind_name,
             bind_ty,
             ..
@@ -3100,6 +3504,11 @@ fn effective_join_caps(ap: &AwaitPoint, join_caps: &[Binding]) -> Vec<Binding> {
 fn join_value_binding(ap: &AwaitPoint) -> Option<Binding> {
     match &ap.kind {
         SuspendKind::LabeledBlock {
+            bind_name,
+            bind_ty,
+            ..
+        }
+        | SuspendKind::TryBlock {
             bind_name,
             bind_ty,
             ..
@@ -3154,7 +3563,8 @@ fn assign_join_stmts(awaits: &mut [AwaitPoint], after_last: &mut Vec<Stmt>) {
             | SuspendKind::MatchArm { join_stmts, .. }
             | SuspendKind::MatchGuard { join_stmts, .. }
             | SuspendKind::LetElseAwait { join_stmts, .. }
-            | SuspendKind::LabeledBlock { join_stmts, .. } => {
+            | SuspendKind::LabeledBlock { join_stmts, .. }
+            | SuspendKind::TryBlock { join_stmts, .. } => {
                 *join_stmts = join;
             }
             _ => {}
@@ -3484,6 +3894,26 @@ fn gen_enter_await(
                 #go_wait
             }
         }
+        SuspendKind::TryBlock {
+            bind_name,
+            bind_ty,
+            before_await,
+            ..
+        } => {
+            let before_await = rewrite_try_block_stmts(
+                before_await,
+                index,
+                bind_name,
+                bind_ty,
+                &after_caps,
+                ready_ok,
+            );
+            quote! {
+                #before
+                #before_await
+                #go_wait
+            }
+        }
     }
 }
 
@@ -3545,23 +3975,54 @@ fn gen_after_resume(
     join_caps: &[Binding],
     ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
-    let try_bind = if let Some((name, ok_ty)) = &ap.try_ok {
-        let tmp = &ap.tmp;
-        quote! {
-            let #name: #ok_ty = match #tmp {
-                ::core::result::Result::Ok(v) => v,
-                ::core::result::Result::Err(e) => {
-                    *self = Self::Finished;
-                    break 'step ::core::result::Result::Ok(
-                        ::core::task::Poll::Ready(::core::result::Result::Err(
+    let try_bind = match (&ap.try_ok, &ap.kind) {
+        (
+            Some((name, ok_ty)),
+            SuspendKind::TryBlock {
+                bind_name,
+                bind_ty,
+                ..
+            },
+        ) => {
+            let tmp = &ap.tmp;
+            let join_caps = effective_join_caps(ap, join_caps);
+            let var = after_if_variant(index);
+            let fields = join_caps.iter().map(|b| {
+                let n = &b.name;
+                quote! { #n }
+            });
+            quote! {
+                let #name: #ok_ty = match #tmp {
+                    ::core::result::Result::Ok(v) => v,
+                    ::core::result::Result::Err(e) => {
+                        let #bind_name: #bind_ty = ::core::result::Result::Err(
                             ::core::convert::From::from(e),
-                        )),
-                    );
-                }
-            };
+                        );
+                        *self = Self::#var {
+                            #(#fields,)*
+                        };
+                        continue 'step;
+                    }
+                };
+            }
         }
-    } else {
-        quote! {}
+        (Some((name, ok_ty)), _) => {
+            let tmp = &ap.tmp;
+            quote! {
+                let #name: #ok_ty = match #tmp {
+                    ::core::result::Result::Ok(v) => v,
+                    ::core::result::Result::Err(e) => {
+                        *self = Self::Finished;
+                        break 'step ::core::result::Result::Ok(
+                            ::core::task::Poll::Ready(::core::result::Result::Err(
+                                ::core::convert::From::from(e),
+                            )),
+                        );
+                    }
+                };
+            }
+        }
+        (None, _) => quote! {},
     };
 
     let rest = match &ap.kind {
@@ -3818,6 +4279,40 @@ fn gen_after_resume(
             quote! {
                 #body
                 let #bind_name: #bind_ty = #value;
+            }
+        }
+        SuspendKind::TryBlock {
+            bind_name,
+            bind_ty,
+            after_await,
+            ..
+        } => {
+            let join_caps = effective_join_caps(ap, join_caps);
+            let (body_stmts, trailing) = split_block_trailing(after_await);
+            let body = rewrite_try_block_stmts(
+                &body_stmts,
+                index,
+                bind_name,
+                bind_ty,
+                &join_caps,
+                ready_ok,
+            );
+            let value = match trailing {
+                Some(e) => rewrite_try_block_expr(
+                    e,
+                    &TryBlockRewriteCtx {
+                        index,
+                        bind_name,
+                        bind_ty,
+                        join_caps: &join_caps,
+                        ready_ok,
+                    },
+                ),
+                None => quote! { () },
+            };
+            quote! {
+                #body
+                let #bind_name: #bind_ty = ::core::result::Result::Ok(#value);
             }
         }
     };
@@ -4083,6 +4578,245 @@ fn rewrite_labeled_block_expr(
             quote! { (#inner) }
         }
         Expr::Group(g) => rewrite_labeled_block_expr(&g.expr, ctx, in_nested),
+        other => emit_expr_rewrite_returns(other, ctx.ready_ok),
+    }
+}
+
+struct TryBlockRewriteCtx<'a> {
+    index: usize,
+    bind_name: &'a Ident,
+    bind_ty: &'a Type,
+    join_caps: &'a [Binding],
+    ready_ok: &'a proc_macro2::TokenStream,
+}
+
+fn rewrite_try_block_stmts(
+    stmts: &[Stmt],
+    index: usize,
+    bind_name: &Ident,
+    bind_ty: &Type,
+    join_caps: &[Binding],
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let ctx = TryBlockRewriteCtx {
+        index,
+        bind_name,
+        bind_ty,
+        join_caps,
+        ready_ok,
+    };
+    let parts = stmts
+        .iter()
+        .map(|stmt| rewrite_try_block_stmt(stmt, &ctx));
+    quote! { #(#parts)* }
+}
+
+fn emit_try_block_err_join(
+    ctx: &TryBlockRewriteCtx<'_>,
+    err_expr: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let bind_name = ctx.bind_name;
+    let bind_ty = ctx.bind_ty;
+    let var = after_if_variant(ctx.index);
+    let fields = ctx.join_caps.iter().map(|b| {
+        let n = &b.name;
+        quote! { #n }
+    });
+    quote! {
+        let #bind_name: #bind_ty = ::core::result::Result::Err(
+            ::core::convert::From::from(#err_expr),
+        );
+        *self = Self::#var {
+            #(#fields,)*
+        };
+        continue 'step;
+    }
+}
+
+fn rewrite_try_block_stmt(
+    stmt: &Stmt,
+    ctx: &TryBlockRewriteCtx<'_>,
+) -> proc_macro2::TokenStream {
+    match stmt {
+        Stmt::Local(local) => {
+            let attrs = &local.attrs;
+            let pat = &local.pat;
+            if let Some(init) = &local.init {
+                let expr = rewrite_try_block_expr(&init.expr, ctx);
+                if let Some((_, diverge)) = &init.diverge {
+                    let else_body = rewrite_try_block_expr(diverge, ctx);
+                    return quote! {
+                        #(#attrs)*
+                        let #pat = #expr else #else_body;
+                    };
+                }
+                return quote! {
+                    #(#attrs)*
+                    let #pat = #expr;
+                };
+            }
+            quote! { #stmt }
+        }
+        Stmt::Expr(Expr::Return(ret), _) => {
+            emit_return_finish(ret.expr.as_deref(), ctx.ready_ok)
+        }
+        Stmt::Expr(expr, semi) => {
+            let e = rewrite_try_block_expr(expr, ctx);
+            match semi {
+                Some(_) => quote! { #e; },
+                None => quote! { #e },
+            }
+        }
+        other => emit_stmt_rewrite_returns(other, ctx.ready_ok),
+    }
+}
+
+fn rewrite_try_block_expr(
+    expr: &Expr,
+    ctx: &TryBlockRewriteCtx<'_>,
+) -> proc_macro2::TokenStream {
+    match expr {
+        Expr::Try(t) => {
+            let inner = rewrite_try_block_expr(&t.expr, ctx);
+            let on_err = emit_try_block_err_join(ctx, quote! { __e });
+            quote! {
+                match #inner {
+                    ::core::result::Result::Ok(__v) => __v,
+                    ::core::result::Result::Err(__e) => {
+                        #on_err
+                    }
+                }
+            }
+        }
+        Expr::Return(ret) => emit_return_finish(ret.expr.as_deref(), ctx.ready_ok),
+        Expr::TryBlock(tb) => emit_sync_try_block(&tb.block.stmts, ctx.ready_ok),
+        Expr::Block(b) => {
+            let parts = b
+                .block
+                .stmts
+                .iter()
+                .map(|s| rewrite_try_block_stmt(s, ctx));
+            let label = &b.label;
+            quote! { #label { #(#parts)* } }
+        }
+        Expr::If(expr_if) => {
+            let cond = rewrite_try_block_expr(&expr_if.cond, ctx);
+            let then_parts = expr_if
+                .then_branch
+                .stmts
+                .iter()
+                .map(|s| rewrite_try_block_stmt(s, ctx));
+            match &expr_if.else_branch {
+                None => quote! {
+                    if #cond {
+                        #(#then_parts)*
+                    }
+                },
+                Some((_, else_expr)) => {
+                    let else_body = rewrite_try_block_expr(else_expr, ctx);
+                    quote! {
+                        if #cond {
+                            #(#then_parts)*
+                        } else #else_body
+                    }
+                }
+            }
+        }
+        Expr::Match(m) => {
+            let scrut = rewrite_try_block_expr(&m.expr, ctx);
+            let arms = m.arms.iter().map(|arm| {
+                let attrs = &arm.attrs;
+                let pat = &arm.pat;
+                let guard = match &arm.guard {
+                    Some((_, g)) => {
+                        let g = rewrite_try_block_expr(g, ctx);
+                        quote! { if #g }
+                    }
+                    None => quote! {},
+                };
+                let body = rewrite_try_block_expr(&arm.body, ctx);
+                quote! {
+                    #(#attrs)*
+                    #pat #guard => #body,
+                }
+            });
+            quote! {
+                match #scrut {
+                    #(#arms)*
+                }
+            }
+        }
+        Expr::Loop(l) => {
+            let body = l
+                .body
+                .stmts
+                .iter()
+                .map(|s| rewrite_try_block_stmt(s, ctx));
+            let label = &l.label;
+            quote! {
+                #label loop {
+                    #(#body)*
+                }
+            }
+        }
+        Expr::While(w) => {
+            let cond = rewrite_try_block_expr(&w.cond, ctx);
+            let body = w
+                .body
+                .stmts
+                .iter()
+                .map(|s| rewrite_try_block_stmt(s, ctx));
+            let label = &w.label;
+            quote! {
+                #label while #cond {
+                    #(#body)*
+                }
+            }
+        }
+        Expr::ForLoop(f) => {
+            let pat = &f.pat;
+            let iter = rewrite_try_block_expr(&f.expr, ctx);
+            let body = f
+                .body
+                .stmts
+                .iter()
+                .map(|s| rewrite_try_block_stmt(s, ctx));
+            let label = &f.label;
+            quote! {
+                #label for #pat in #iter {
+                    #(#body)*
+                }
+            }
+        }
+        Expr::Call(c) => {
+            let func = rewrite_try_block_expr(&c.func, ctx);
+            let args = c.args.iter().map(|a| rewrite_try_block_expr(a, ctx));
+            quote! { #func(#(#args),*) }
+        }
+        Expr::MethodCall(m) => {
+            let receiver = rewrite_try_block_expr(&m.receiver, ctx);
+            let method = &m.method;
+            let turbofish = &m.turbofish;
+            let args = m.args.iter().map(|a| rewrite_try_block_expr(a, ctx));
+            quote! { #receiver.#method #turbofish (#(#args),*) }
+        }
+        Expr::Binary(b) => {
+            let left = rewrite_try_block_expr(&b.left, ctx);
+            let op = &b.op;
+            let right = rewrite_try_block_expr(&b.right, ctx);
+            quote! { #left #op #right }
+        }
+        Expr::Unary(u) => {
+            let op = &u.op;
+            let expr = rewrite_try_block_expr(&u.expr, ctx);
+            quote! { #op #expr }
+        }
+        Expr::Paren(p) => {
+            let inner = rewrite_try_block_expr(&p.expr, ctx);
+            quote! { (#inner) }
+        }
+        Expr::Group(g) => rewrite_try_block_expr(&g.expr, ctx),
+        Expr::Closure(_) | Expr::Async(_) => quote! { #expr },
         other => emit_expr_rewrite_returns(other, ctx.ready_ok),
     }
 }
