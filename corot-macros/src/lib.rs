@@ -45,9 +45,9 @@ use syn::{
 /// - `let v: T = if … { … await …; value } else { … }` / `let v: T = match …`
 ///   (expression-position if/match with await; arm/branch values bind before join)
 /// - `let…else`: await in the initializer or in the `else` block
-/// - `match`: scrutinee, one arm body, one guard, or guard+body (dual-region);
-///   suspending arms may use `Some`/`Ok`/`Err`/tuple/`@`/`|` patterns
-///   (scrutinee via literals or `val::<T>`)
+/// - `match`: scrutinee, arm bodies (including **multiple exclusive suspending
+///   arms**), one guard, or guard+body (dual-region); suspending arms may use
+///   `Some`/`Ok`/`Err`/tuple/`@`/`|` patterns (scrutinee via literals or `val::<T>`)
 /// - `for`: range literal or `iter::<I>(…)`, optional body await; item pattern may
 ///   be a tuple / `Some` / `Ok` / `Err` when `I`'s item type is known (`Vec`, ranges, …);
 ///   iterable await + body awaits (dual-region) supported
@@ -265,22 +265,37 @@ enum SuspendKind {
     MatchScrutinee {
         arms: Vec<syn::Arm>,
     },
-    /// Await inside exactly one match arm body.
+    /// Await inside one or more match arm bodies (exclusive siblings share
+    /// `AfterMatch`; multiple awaits in one arm stay a sequential body chain).
     MatchArm {
         scrutinee: Expr,
         #[allow(dead_code)]
         scrut_ty: Type,
-        /// Bindings from the suspending arm's pattern (typed from `scrut_ty`).
+        /// Bindings from this suspending arm's pattern (typed from `scrut_ty`).
         pat_binds: Vec<Binding>,
+        /// Sync arms before this suspending arm (single-arm / `arm_len == 1` only).
         arms_before: Vec<syn::Arm>,
         sus_pat: Pat,
         sus_guard: Option<Box<Expr>>,
+        /// Absolute index of the first await of the first suspending arm.
         chain_head: usize,
+        /// Flattened offset among all awaits in this match (exclusive + sequential).
         chain_pos: usize,
         chain_len: usize,
+        /// Index of this suspending arm among exclusive suspending arms.
+        arm_pos: usize,
+        arm_len: usize,
+        /// Sequential position within this arm's body await chain.
+        body_pos: usize,
+        body_len: usize,
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
+        /// Sync arms after this suspending arm (`arm_len == 1` only).
         arms_after: Vec<syn::Arm>,
+        /// When `arm_len > 1`, head point lists every arm in order.
+        all_arms: Vec<syn::Arm>,
+        /// Absolute await indices of each suspending arm's first wait (`arm_len > 1`).
+        multi_sus_heads: Vec<usize>,
         join_stmts: Vec<Stmt>,
         entry_gate: Option<EntryGate>,
         /// `let name: T = match …` — arm values assign to this before AfterMatch.
@@ -626,9 +641,24 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 },
             );
         }
-        // Loop/block expression value is live for join_stmts and later awaits.
+        // Loop/block/if/match expression value is live for join_stmts and later awaits.
         if let Some(b) = join_value_binding(ap) {
             upsert_binding(&mut live, b);
+        }
+        // Exclusive match arms must not leak pattern/body locals into sibling arms.
+        if let SuspendKind::MatchArm {
+            arm_len,
+            body_pos,
+            body_len,
+            chain_head,
+            chain_pos,
+            chain_len,
+            ..
+        } = &ap.kind
+        {
+            if *arm_len > 1 && *body_pos + 1 == *body_len && *chain_pos + 1 < *chain_len {
+                live = join_caps_at[*chain_head].clone();
+            }
         }
         // Bindings introduced in join_stmts become live before the next await.
         if let Some(join) = join_stmts_of(ap) {
@@ -1372,8 +1402,32 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         &effective_join_caps(ap, &join_caps_at[join_i]),
                     )
                 }
+                SuspendKind::MatchArm {
+                    body_pos,
+                    body_len,
+                    ..
+                } => {
+                    if *body_pos + 1 < *body_len {
+                        gen_join_tail(
+                            i,
+                            &awaits,
+                            &captures_at_await,
+                            &join_caps_at,
+                            &after_last,
+                            &ready_ok,
+                            &effect_enum,
+                        )
+                    } else {
+                        // End of this arm (possibly one of several exclusive arms).
+                        let join_i = join_caps_index(ap, i);
+                        gen_goto_join(
+                            ap,
+                            join_i,
+                            &effective_join_caps(ap, &join_caps_at[join_i]),
+                        )
+                    }
+                }
                 SuspendKind::IfThen { ..}
-                | SuspendKind::MatchArm { ..}
                 | SuspendKind::MatchGuard { .. }
                 | SuspendKind::LabeledBlock { ..}
                 | SuspendKind::TryBlock { ..} => {
@@ -3367,19 +3421,20 @@ fn expand_match_stmt(
             )));
         }
     }
-    // Find single arm with body awaits (no guard await — guard+body handled above).
-    let mut arm_idx = None;
+    // Collect arms with body awaits (no guard await — guard+body handled above).
+    let mut sus_indices = Vec::new();
+    let mut any_guard_await = false;
     for (i, arm) in expr_match.arms.iter().enumerate() {
         let guard_await = arm
             .guard
             .as_ref()
             .is_some_and(|(_, g)| contains_await(g));
-        let body_await = contains_await(&arm.body);
         if guard_await {
-            continue;
+            any_guard_await = true;
         }
-        if body_await {
-            if arm_idx.is_some() || contains_await(&expr_match.expr) {
+        if contains_await(&arm.body) {
+            if guard_await {
+                // Dual-region single-arm should have been handled above.
                 if expr_bind.is_some() {
                     return Err(syn::Error::new_spanned(
                         stmt,
@@ -3388,21 +3443,41 @@ fn expand_match_stmt(
                 }
                 return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
             }
-            arm_idx = Some(i);
+            sus_indices.push(i);
         }
     }
-    let Some(ai) = arm_idx else {
+    if sus_indices.is_empty() {
         if expr_bind.is_some() {
             return Err(syn::Error::new_spanned(
                 stmt,
-                "#[corot] `let name: T = match` requires await in exactly one arm body \
+                "#[corot] `let name: T = match` requires await in an arm body \
                  (scrutinee/guard-only expression match is not supported yet)",
             ));
         }
         return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
-    };
-    let sus = &expr_match.arms[ai];
-    if sus.guard.as_ref().is_some_and(|(_, g)| contains_await(g)) {
+    }
+    if contains_await(&expr_match.expr) {
+        if expr_bind.is_some() {
+            return Err(syn::Error::new_spanned(
+                stmt,
+                "#[corot] `let name: T = match` with scrutinee await is not supported yet",
+            ));
+        }
+        return Err(syn::Error::new_spanned(
+            stmt,
+            "#[corot] await in match scrutinee plus arm bodies is not supported",
+        ));
+    }
+    if any_guard_await && sus_indices.len() > 1 {
+        return Err(syn::Error::new_spanned(
+            stmt,
+            "#[corot] await in a match guard plus multiple suspending arm bodies \
+             is not supported yet",
+        ));
+    }
+    if any_guard_await {
+        // Guard-only or mixed shapes still go through as_await_match_stmt /
+        // dual-region path above; a lone body+other-guard shouldn't reach here.
         if expr_bind.is_some() {
             return Err(syn::Error::new_spanned(
                 stmt,
@@ -3411,65 +3486,133 @@ fn expand_match_stmt(
         }
         return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
     }
-    check_supported_pat(&sus.pat)?;
-    let body_stmts = expr_as_stmts(&sus.body);
-    if !body_stmts.iter().any(stmt_contains_await) {
-        if expr_bind.is_some() {
-            return Err(syn::Error::new_spanned(
-                stmt,
-                "#[corot] `let name: T = match` with this await shape is not supported yet",
-            ));
-        }
-        return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
-    }
+
     let scrut_ty = infer_match_scrutinee_ty(&expr_match.expr, &expr_match.arms)?;
-    let pat_binds = bindings_from_pat(&sus.pat, &scrut_ty)?;
-    let (units, trailing) = extract_body_units(&body_stmts, err_ty)?;
     let scrutinee = expr_match.expr.as_ref().clone();
-    let arms_before = expr_match.arms[..ai].to_vec();
-    let arms_after = expr_match.arms[ai + 1..].to_vec();
-    let sus_pat = sus.pat.clone();
-    let sus_guard = sus.guard.as_ref().map(|(_, g)| g.clone());
     let expr_bind_c = expr_bind.clone();
-    Ok(Some(body_units_to_points(
-        index,
-        units,
-        trailing,
-        |pos, len, before_await, after_await, entry_gate| SuspendKind::MatchArm {
-            scrutinee: scrutinee.clone(),
-            scrut_ty: scrut_ty.clone(),
-            pat_binds: if pos == 0 {
-                pat_binds.clone()
-            } else {
-                Vec::new()
+    let arm_len = sus_indices.len();
+    let all_arms = expr_match.arms.clone();
+
+    // Pre-parse each suspending arm body so we know total chain length / heads.
+    let mut arm_parts = Vec::with_capacity(arm_len);
+    for &ai in &sus_indices {
+        let sus = &expr_match.arms[ai];
+        check_supported_pat(&sus.pat)?;
+        let body_stmts = expr_as_stmts(&sus.body);
+        if !body_stmts.iter().any(stmt_contains_await) {
+            return Err(syn::Error::new_spanned(
+                sus,
+                "#[corot] internal: suspending match arm has no await",
+            ));
+        }
+        let pat_binds = bindings_from_pat(&sus.pat, &scrut_ty)?;
+        let (units, trailing) = extract_body_units(&body_stmts, err_ty)?;
+        let body_len = units_await_count(&units);
+        arm_parts.push((
+            ai,
+            sus.pat.clone(),
+            sus.guard.as_ref().map(|(_, g)| g.clone()),
+            pat_binds,
+            units,
+            trailing,
+            body_len,
+        ));
+    }
+    let chain_len: usize = arm_parts.iter().map(|p| p.6).sum();
+    let mut multi_sus_heads = Vec::with_capacity(arm_len);
+    let mut off = 0usize;
+    for part in &arm_parts {
+        multi_sus_heads.push(index + off);
+        off += part.6;
+    }
+
+    let mut out = Vec::with_capacity(chain_len);
+    let mut chain_pos = 0usize;
+    for (arm_pos, (ai, sus_pat, sus_guard, pat_binds, units, trailing, body_len)) in
+        arm_parts.into_iter().enumerate()
+    {
+        let arms_before = if arm_len == 1 {
+            expr_match.arms[..ai].to_vec()
+        } else {
+            Vec::new()
+        };
+        let arms_after = if arm_len == 1 {
+            expr_match.arms[ai + 1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        let head_all_arms = if arm_pos == 0 {
+            all_arms.clone()
+        } else {
+            Vec::new()
+        };
+        let head_sus_heads = if arm_pos == 0 {
+            multi_sus_heads.clone()
+        } else {
+            Vec::new()
+        };
+        let points = body_units_to_points(
+            index + chain_pos,
+            units,
+            trailing,
+            |pos, len, before_await, after_await, entry_gate| SuspendKind::MatchArm {
+                scrutinee: scrutinee.clone(),
+                scrut_ty: scrut_ty.clone(),
+                pat_binds: if pos == 0 {
+                    pat_binds.clone()
+                } else {
+                    Vec::new()
+                },
+                arms_before: if arm_pos == 0 && pos == 0 {
+                    arms_before.clone()
+                } else {
+                    Vec::new()
+                },
+                sus_pat: sus_pat.clone(),
+                sus_guard: if pos == 0 {
+                    sus_guard.clone()
+                } else {
+                    None
+                },
+                chain_head: index,
+                chain_pos: chain_pos + pos,
+                chain_len,
+                arm_pos,
+                arm_len,
+                body_pos: pos,
+                body_len: len,
+                before_await,
+                after_await,
+                arms_after: if arm_pos == 0 && pos == 0 {
+                    arms_after.clone()
+                } else {
+                    Vec::new()
+                },
+                all_arms: if arm_pos == 0 && pos == 0 {
+                    head_all_arms.clone()
+                } else {
+                    Vec::new()
+                },
+                multi_sus_heads: if arm_pos == 0 && pos == 0 {
+                    head_sus_heads.clone()
+                } else {
+                    Vec::new()
+                },
+                join_stmts: Vec::new(),
+                entry_gate,
+                expr_bind: expr_bind_c.clone(),
             },
-            arms_before: if pos == 0 {
-                arms_before.clone()
-            } else {
-                Vec::new()
-            },
-            sus_pat: sus_pat.clone(),
-            sus_guard: if pos == 0 {
-                sus_guard.clone()
-            } else {
-                None
-            },
-            chain_head: index,
-            chain_pos: pos,
-            chain_len: len,
-            before_await,
-            after_await,
-            arms_after: if pos == 0 {
-                arms_after.clone()
-            } else {
-                Vec::new()
-            },
-            join_stmts: Vec::new(),
-            entry_gate,
-            expr_bind: expr_bind_c.clone(),
-        },
-    )))
+        );
+        // body_units_to_points uses make_kind's chain via pos; body_len from callback is
+        // units count for this arm — ensure it matches.
+        let _ = body_len;
+        chain_pos += points.len();
+        out.extend(points);
+    }
+    debug_assert_eq!(out.len(), chain_len);
+    Ok(Some(out))
 }
+
 
 fn as_await_while_stmt(
     stmt: &Stmt,
@@ -4960,7 +5103,7 @@ fn as_await_match_stmt(
             if arm_await_idx.is_some() {
                 return Err(syn::Error::new_spanned(
                     arm,
-                    "#[corot] supports at most one await in a match",
+                    "#[corot] internal: multi-arm match body awaits should use expand_match_stmt",
                 ));
             }
             arm_await_idx = Some(i);
@@ -5025,6 +5168,12 @@ fn as_await_match_stmt(
                    chain_head: index,
                    chain_pos: 0,
                    chain_len: 1,
+                   arm_pos: 0,
+                   arm_len: 1,
+                   body_pos: 0,
+                   body_len: 1,
+                   all_arms: Vec::new(),
+                   multi_sus_heads: Vec::new(),
                     scrutinee: expr_match.expr.as_ref().clone(),
                     scrut_ty,
                     pat_binds,
@@ -5838,6 +5987,12 @@ fn is_mid_chain_kind(kind: &SuspendKind) -> bool {
     match kind {
         // Exclusive else-if leaves share AfterIf but are not a sequential body chain.
         SuspendKind::IfElse { .. } => false,
+        // Exclusive match arms share AfterMatch; only sequential awaits within one arm.
+        SuspendKind::MatchArm {
+            body_pos,
+            body_len,
+            ..
+        } => *body_pos + 1 < *body_len,
         SuspendKind::IfThen {
             chain_pos,
             chain_len,
@@ -5851,10 +6006,6 @@ fn is_mid_chain_kind(kind: &SuspendKind) -> bool {
             chain_len,
             ..}
         | SuspendKind::For {
-            chain_pos,
-            chain_len,
-            ..}
-        | SuspendKind::MatchArm {
             chain_pos,
             chain_len,
             ..}
@@ -6928,20 +7079,84 @@ fn gen_enter_await(
         }
         SuspendKind::MatchArm {
             chain_pos,
+            arm_pos,
+            arm_len,
+            body_pos,
             scrutinee,
             arms_before,
             sus_pat,
             sus_guard,
             before_await,
             arms_after,
+            all_arms,
+            multi_sus_heads,
             expr_bind,
             ..} => {
             let before_await = emit_stmts_rewrite_returns(before_await, ready_ok);
-            if *chain_pos > 0 {
+            if *body_pos > 0 {
                 quote! {
                     #before
                     #before_await
                     #go_wait
+                }
+            } else if *arm_pos > 0 {
+                // Exclusive sibling: only resumed via Waiting, not re-entered.
+                quote! {
+                    #before
+                    #go_wait
+                }
+            } else if *arm_len > 1 {
+                let bind = expr_bind.as_ref();
+                let mut sus_i = 0usize;
+                let arm_tokens: Vec<_> = all_arms
+                    .iter()
+                    .map(|arm| {
+                        if contains_await(&arm.body) {
+                            let head_i = multi_sus_heads
+                                .get(sus_i)
+                                .copied()
+                                .unwrap_or(index);
+                            sus_i += 1;
+                            let sib = if head_i < awaits.len() {
+                                &awaits[head_i]
+                            } else {
+                                ap
+                            };
+                            let sib_before = match &sib.kind {
+                                SuspendKind::MatchArm { before_await, .. } => {
+                                    emit_stmts_rewrite_returns(before_await, ready_ok)
+                                }
+                                _ => quote! {},
+                            };
+                            let sib_go = gen_enter_wait(
+                                sib,
+                                &waiting_variant(&sib.name),
+                                &captures_at_await[head_i.min(captures_at_await.len().saturating_sub(1))],
+                                effect_enum,
+                            );
+                            let attrs = &arm.attrs;
+                            let pat = &arm.pat;
+                            let guard = match &arm.guard {
+                                Some((_, g)) => quote! { if #g },
+                                None => quote! {},
+                            };
+                            quote! {
+                                #(#attrs)*
+                                #pat #guard => {
+                                    #sib_before
+                                    #sib_go
+                                }
+                            }
+                        } else {
+                            emit_sync_arm_with_join(arm, &non_suspend, ready_ok, bind)
+                        }
+                    })
+                    .collect();
+                quote! {
+                    #before
+                    match #scrutinee {
+                        #(#arm_tokens)*
+                    }
                 }
             } else {
                 let bind = expr_bind.as_ref();
@@ -6955,6 +7170,7 @@ fn gen_enter_await(
                     Some(g) => quote! { if #g },
                     None => quote! {},
                 };
+                let _ = chain_pos;
                 quote! {
                     #before
                     match #scrutinee {
@@ -7274,15 +7490,26 @@ fn gen_after_resume(
             chain_pos,
             chain_len,
             ..
-        }
-        | SuspendKind::MatchArm {
-            after_await,
-            expr_bind,
-            chain_pos,
-            chain_len,
-            ..
         } => {
             if *chain_pos + 1 < *chain_len || expr_bind.is_none() {
+                emit_stmts_rewrite_returns(after_await, ready_ok)
+            } else {
+                emit_stmts_bind_assign(
+                    expr_bind.as_ref().expect("expr_bind"),
+                    after_await,
+                    ready_ok,
+                )
+            }
+        }
+        SuspendKind::MatchArm {
+            after_await,
+            expr_bind,
+            body_pos,
+            body_len,
+            ..
+        } => {
+            // Assign expression bind when finishing this arm (not mid-body).
+            if *body_pos + 1 < *body_len || expr_bind.is_none() {
                 emit_stmts_rewrite_returns(after_await, ready_ok)
             } else {
                 emit_stmts_bind_assign(
