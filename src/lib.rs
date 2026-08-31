@@ -10,6 +10,24 @@
 
 pub use corot_macros::corot;
 
+/// Type ascription helper for `#[corot]` `for` loops over arbitrary iterables.
+///
+/// Proc macros cannot infer `IntoIterator` types, so write:
+///
+/// ```ignore
+/// for x in corot_rs::iter::<Vec<i32>>(v) { … }
+/// for x in corot_rs::iter::<Vec<i32>>(fetch().await) { … }
+/// ```
+///
+/// `I` is the type of the `in` expression (and of `settle_wait` when the
+/// iterable is awaited). Range literals (`0..3`) still work without this wrapper.
+///
+/// This function is the identity: it exists only so the macro can read `I`.
+#[inline(always)]
+pub fn iter<I: IntoIterator>(iterable: I) -> I {
+    iterable
+}
+
 /// Marker wrapper: captured across await, omitted from serde.
 ///
 /// - [`SkipSerde::new`] / [`SkipSerde::set`]: hydrated value

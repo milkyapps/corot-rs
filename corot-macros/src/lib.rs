@@ -10,7 +10,7 @@ use syn::{
 ///
 /// - `if`: condition (`expr.await` → bool), then, or else
 /// - `match`: scrutinee (`expr.await`), one arm body, or one guard (`expr.await` → bool)
-/// - `for`: range literal / `(range).await`, optional body await
+/// - `for`: range literal or `iter::<I>(…)` (`I: IntoIterator`), optional body await
 ///
 /// Locals that live across an await must be type-annotated.
 /// Match scrutinee types are inferred from arm pattern literals when possible.
@@ -75,12 +75,15 @@ enum SuspendKind {
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
     },
-    /// `for x in start..end { … }` or `for x in (start..end).await { … }`
-    /// (ranges only for now). Optional await on the iterable; optional await in the body.
+    /// `for x in ITER { … }` with optional await on the iterable and/or body.
+    ///
+    /// `ITER` is a range literal (`0..3`, `(0..3).await`) or
+    /// `corot_rs::iter::<I>(…)` / `iter::<I>(…)` where `I: IntoIterator`
+    /// (the type of the `in` expression / settle value).
     For {
         item: Ident,
-        item_ty: Type,
-        iter_ty: Type,
+        /// Type of the `in` expression (`IntoIterator`), e.g. `Vec<i32>` or `Range<i32>`.
+        into_ty: Type,
         /// `None` ⇒ iterable is awaited (`iter_await_base`); `Some` ⇒ sync expr.
         iter_expr: Option<Expr>,
         iter_await_base: Option<Expr>,
@@ -180,16 +183,17 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             }
             SuspendKind::For {
                 item,
-                item_ty,
-                iter_ty,
+                into_ty,
                 before_await,
                 ..
             } => {
+                let iter_ty = into_iter_ty(into_ty);
+                let item_ty = into_item_ty(into_ty);
                 upsert_binding(
                     &mut live,
                     Binding {
                         name: format_ident!("__iter"),
-                        ty: iter_ty.clone(),
+                        ty: iter_ty,
                         mutable: true,
                     },
                 );
@@ -197,7 +201,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     &mut live,
                     Binding {
                         name: item.clone(),
-                        ty: item_ty.clone(),
+                        ty: item_ty,
                         mutable: false,
                     },
                 );
@@ -262,16 +266,16 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         if for_has_iter_await(&ap.kind) {
             let iter_var = waiting_iter_variant(i);
             let join_fields = join_caps_at[i].iter().map(|b| field_tokens(b));
-            let iter_ty = for_iter_ty(&ap.kind).expect("for iter await");
-            let wait_skip = cfg!(feature = "serde") && is_skip_serde(iter_ty);
+            let into_ty = for_into_ty(&ap.kind).expect("for iter await");
+            let wait_skip = cfg!(feature = "serde") && is_skip_serde(into_ty);
             let wait_field = if wait_skip {
                 quote! {
                     #[serde(skip)]
-                    __wait: ::core::option::Option<#iter_ty>,
+                    __wait: ::core::option::Option<#into_ty>,
                 }
             } else {
                 quote! {
-                    __wait: ::core::option::Option<#iter_ty>,
+                    __wait: ::core::option::Option<#into_ty>,
                 }
             };
             variants.push(quote! {
@@ -332,12 +336,12 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     for (i, ap) in awaits.iter().enumerate() {
         if for_has_iter_await(&ap.kind) {
             let iter_var = waiting_iter_variant(i);
-            let iter_ty = for_iter_ty(&ap.kind).unwrap();
+            let into_ty = for_into_ty(&ap.kind).unwrap();
             settle_arms.push(quote! {
                 Self::#iter_var { __wait, .. } => {
                     let value = value
-                        .downcast_ref::<#iter_ty>()
-                        .unwrap_or_else(|| panic!("settle_wait: expected {}", ::core::any::type_name::<#iter_ty>()));
+                        .downcast_ref::<#into_ty>()
+                        .unwrap_or_else(|| panic!("settle_wait: expected {}", ::core::any::type_name::<#into_ty>()));
                     *__wait = ::core::option::Option::Some(::core::clone::Clone::clone(value));
                 }
             });
@@ -856,21 +860,10 @@ fn as_await_for_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
     }
 
     let item = pat_ident(&expr_for.pat)?;
-
-    let (iter_expr, iter_await_base, item_ty, iter_ty) = if let Some(base) =
-        bare_await_base(&expr_for.expr)
-    {
-        let (item_ty, iter_ty) = range_types(&base)?;
-        // Drop outer parens so `let _ = 0..3` isn't warned as unused_parens.
-        (None, Some(unwrap_parens(base)), item_ty, iter_ty)
-    } else {
-        let (item_ty, iter_ty) = range_types(&expr_for.expr)?;
-        (
-            Some(expr_for.expr.as_ref().clone()),
-            None,
-            item_ty,
-            iter_ty,
-        )
+    let (into_ty, source) = resolve_for_iterable(&expr_for.expr)?;
+    let (iter_expr, iter_await_base) = match source {
+        ForIterSource::Sync(expr) => (Some(expr), None),
+        ForIterSource::Await(base) => (None, Some(base)),
     };
 
     let (before_await, plain, after_await) = if has_body_await {
@@ -881,7 +874,7 @@ fn as_await_for_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
             PlainAwait {
                 name: format_ident!("iter"),
                 tmp: format_ident!("__await_iter"),
-                wait_ty: iter_ty.clone(),
+                wait_ty: into_ty.clone(),
                 base: iter_await_base
                     .clone()
                     .unwrap_or_else(|| syn::parse_quote!(())),
@@ -899,8 +892,7 @@ fn as_await_for_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
         before: Vec::new(),
         kind: SuspendKind::For {
             item,
-            item_ty,
-            iter_ty,
+            into_ty,
             iter_expr,
             iter_await_base,
             has_body_await,
@@ -913,6 +905,114 @@ fn as_await_for_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
             join_stmts: Vec::new(),
         },
     }))
+}
+
+enum ForIterSource {
+    Sync(Expr),
+    Await(Expr),
+}
+
+/// Resolve `for x in EXPR` into the `IntoIterator` type and the sync/await source.
+fn resolve_for_iterable(expr: &Expr) -> syn::Result<(Type, ForIterSource)> {
+    // `something.await` (whole `in` expression)
+    if let Some(base) = bare_await_base(expr) {
+        let (into_ty, inner) = into_ty_from_expr(&base)?;
+        return Ok((into_ty, ForIterSource::Await(inner)));
+    }
+
+    // `iter::<I>(arg.await)` or `iter::<I>(arg)`
+    if let Some((into_ty, arg)) = as_corot_iter_call(expr) {
+        if let Some(base) = bare_await_base(&arg) {
+            return Ok((into_ty, ForIterSource::Await(unwrap_parens(base))));
+        }
+        if contains_await(&arg) {
+            return Err(syn::Error::new_spanned(
+                &arg,
+                "#[corot] await inside `iter::<I>(…)` must be a bare `expr.await`",
+            ));
+        }
+        return Ok((into_ty, ForIterSource::Sync(arg)));
+    }
+
+    // Range literal sugar: `0..3`
+    if let Some(into_ty) = try_range_into_ty(expr) {
+        return Ok((into_ty, ForIterSource::Sync(expr.clone())));
+    }
+
+    Err(syn::Error::new_spanned(
+        expr,
+        "#[corot] for-await needs a range literal (`0..3`) or \
+         `iter::<I>(…)` / `corot_rs::iter::<I>(…)` where `I` is the IntoIterator \
+         type (e.g. `iter::<Vec<i32>>(v)`)",
+    ))
+}
+
+fn into_ty_from_expr(expr: &Expr) -> syn::Result<(Type, Expr)> {
+    if let Some((into_ty, arg)) = as_corot_iter_call(expr) {
+        return Ok((into_ty, arg));
+    }
+    if let Some(into_ty) = try_range_into_ty(expr) {
+        return Ok((into_ty, unwrap_parens(expr.clone())));
+    }
+    Err(syn::Error::new_spanned(
+        expr,
+        "#[corot] awaited for-iterable must be a range or `iter::<I>(…)`",
+    ))
+}
+
+/// `iter::<I>(arg)` or `path::iter::<I>(arg)` — identity wrapper for type ascription.
+fn as_corot_iter_call(expr: &Expr) -> Option<(Type, Expr)> {
+    let expr = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        Expr::Group(g) => g.expr.as_ref(),
+        other => other,
+    };
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    if call.args.len() != 1 {
+        return None;
+    }
+    let Expr::Path(path) = call.func.as_ref() else {
+        return None;
+    };
+    let seg = path.path.segments.last()?;
+    if seg.ident != "iter" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    let syn::GenericArgument::Type(ty) = args.args.first()? else {
+        return None;
+    };
+    Some((ty.clone(), call.args.first().unwrap().clone()))
+}
+
+fn into_item_ty(into_ty: &Type) -> Type {
+    syn::parse_quote!(<#into_ty as ::core::iter::IntoIterator>::Item)
+}
+
+fn into_iter_ty(into_ty: &Type) -> Type {
+    syn::parse_quote!(<#into_ty as ::core::iter::IntoIterator>::IntoIter)
+}
+
+fn try_range_into_ty(expr: &Expr) -> Option<Type> {
+    let expr = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        Expr::Group(g) => g.expr.as_ref(),
+        other => other,
+    };
+    let Expr::Range(range) = expr else {
+        return None;
+    };
+    let ty = int_lit_type(range.start.as_deref())
+        .or_else(|| int_lit_type(range.end.as_deref()))
+        .unwrap_or_else(|| syn::parse_quote!(i32));
+    Some(syn::parse_quote!(::std::ops::Range<#ty>))
 }
 
 fn as_await_match_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>> {
@@ -1184,25 +1284,6 @@ fn int_lit_suffix_type(lit: &syn::LitInt) -> Type {
     }
 }
 
-fn range_types(expr: &Expr) -> syn::Result<(Type, Type)> {
-    let expr = match expr {
-        Expr::Paren(p) => p.expr.as_ref(),
-        Expr::Group(g) => g.expr.as_ref(),
-        other => other,
-    };
-    let Expr::Range(range) = expr else {
-        return Err(syn::Error::new_spanned(
-            expr,
-            "#[corot] for-await currently only supports range literals like `0..3` \
-             or `(0..3).await`",
-        ));
-    };
-    let ty = int_lit_type(range.start.as_deref())
-        .or_else(|| int_lit_type(range.end.as_deref()))
-        .unwrap_or_else(|| syn::parse_quote!(i32));
-    Ok((ty.clone(), syn::parse_quote!(::std::ops::Range<#ty>)))
-}
-
 fn int_lit_type(expr: Option<&Expr>) -> Option<Type> {
     let Expr::Lit(syn::ExprLit {
         lit: syn::Lit::Int(lit),
@@ -1338,9 +1419,9 @@ fn for_has_iter_await(kind: &SuspendKind) -> bool {
     )
 }
 
-fn for_iter_ty(kind: &SuspendKind) -> Option<&Type> {
+fn for_into_ty(kind: &SuspendKind) -> Option<&Type> {
     match kind {
-        SuspendKind::For { iter_ty, .. } => Some(iter_ty),
+        SuspendKind::For { into_ty, .. } => Some(into_ty),
         _ => None,
     }
 }
@@ -1385,11 +1466,11 @@ fn join_stmts_of(ap: &AwaitPoint) -> Option<&[Stmt]> {
 
 fn loop_head_caps(ap: &AwaitPoint, join_caps: &[Binding]) -> Vec<Binding> {
     match &ap.kind {
-        SuspendKind::For { iter_ty, .. } => {
+        SuspendKind::For { into_ty, .. } => {
             let mut caps = join_caps.to_vec();
             caps.push(Binding {
                 name: format_ident!("__iter"),
-                ty: iter_ty.clone(),
+                ty: into_iter_ty(into_ty),
                 mutable: true,
             });
             caps
@@ -1534,11 +1615,12 @@ fn gen_enter_await(
             }
         }
         SuspendKind::For {
-            iter_ty,
+            into_ty,
             iter_expr,
             iter_await_base,
             ..
         } => {
+            let iter_ty = into_iter_ty(into_ty);
             let goto_head = gen_goto_loop_head(index, ap, join_caps);
             if let Some(base) = iter_await_base {
                 let iter_var = waiting_iter_variant(index);
