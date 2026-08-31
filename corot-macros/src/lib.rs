@@ -12,8 +12,9 @@ use syn::{
 ///   `Result<T, E>`; `Err` finishes with `Poll::Ready(Err(...))`)
 /// - `return` / `return <expr>` before or after an await (rewritten to finish the
 ///   coroutine with `Poll::Ready(...)`)
-/// - `loop` / `for`: optional label; `break` / `continue` (unlabeled or `'label`);
-///   unlabeled `break`/`continue` inside nested sync loops stay native
+/// - `loop` / `for`: optional label; `break` / `continue` before or after the
+///   await (unlabeled or `'label`); unlabeled `break`/`continue` inside nested
+///   sync loops stay native
 /// - `if` / `if let`: condition/scrutinee, then, else, or else-if chain
 /// - `let…else`: await in the initializer or in the `else` block
 /// - `match`: scrutinee, one arm body, or one guard
@@ -540,11 +541,18 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     item,
                     before_await,
                     has_body_await,
+                    label,
                     ..
                 } => {
                     let goto_after = gen_goto_join(ap, i, &join_caps_at[i]);
-                    let before_await_toks =
-                        emit_stmts_rewrite_returns(before_await, &ready_ok);
+                    let before_await_toks = rewrite_loop_body_stmts(
+                        i,
+                        before_await,
+                        &join_caps_at[i],
+                        label.as_ref(),
+                        true,
+                        &ready_ok,
+                    );
                     let some_body = if *has_body_await {
                         let go_wait = gen_go_waiting(&var, caps, &ap.base);
                         quote! {
@@ -571,10 +579,20 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         }
                     });
                 }
-                SuspendKind::Loop { before_await, .. } => {
+                SuspendKind::Loop {
+                    before_await,
+                    label,
+                    ..
+                } => {
                     let go_wait = gen_go_waiting(&var, caps, &ap.base);
-                    let before_await_toks =
-                        emit_stmts_rewrite_returns(before_await, &ready_ok);
+                    let before_await_toks = rewrite_loop_body_stmts(
+                        i,
+                        before_await,
+                        &join_caps_at[i],
+                        label.as_ref(),
+                        false,
+                        &ready_ok,
+                    );
                     step_arms.push(quote! {
                         Self::#head_var { #(#head_pats,)* } => {
                             #before_await_toks
@@ -3039,7 +3057,7 @@ fn gen_after_resume(
             ..
         } => {
             let is_for = matches!(&ap.kind, SuspendKind::For { .. });
-            rewrite_loop_after_await(
+            rewrite_loop_body_stmts(
                 index,
                 after_await,
                 join_caps,
@@ -3056,7 +3074,7 @@ fn gen_after_resume(
     }
 }
 
-fn rewrite_loop_after_await(
+fn rewrite_loop_body_stmts(
     index: usize,
     stmts: &[Stmt],
     join_caps: &[Binding],
@@ -3683,30 +3701,41 @@ fn make_rehydration(
     });
 
     for (i, (ap, caps)) in awaits.iter().zip(captures_at_await.iter()).enumerate() {
-        let var = waiting_variant(&ap.name);
-        let skip_in_var: Vec<_> = caps.iter().filter(|b| is_skip_serde(&b.ty)).collect();
+        let has_waiting_var =
+            !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. });
+        if has_waiting_var {
+            let var = waiting_variant(&ap.name);
+            let skip_in_var: Vec<_> = caps.iter().filter(|b| is_skip_serde(&b.ty)).collect();
 
-        if skip_in_var.is_empty() {
-            arms.push(quote! {
-                Self::#var { .. } => #rehyd_name::Ok
-            });
-        } else {
-            let skip_pats: Vec<_> = skip_in_var.iter().map(|b| &b.name).collect();
-            let checks = skip_in_var.iter().map(|b| {
-                let n = &b.name;
-                let needs_var = needs_rehydration_variant(n);
-                quote! {
-                    if #n.needs_rehydration() {
-                        return #rehyd_name::#needs_var { #n };
+            if skip_in_var.is_empty() {
+                arms.push(quote! {
+                    Self::#var { .. } => #rehyd_name::Ok
+                });
+            } else {
+                let skip_pats: Vec<_> = skip_in_var.iter().map(|b| &b.name).collect();
+                let checks = skip_in_var.iter().map(|b| {
+                    let n = &b.name;
+                    let needs_var = needs_rehydration_variant(n);
+                    quote! {
+                        if #n.needs_rehydration() {
+                            return #rehyd_name::#needs_var { #n };
+                        }
                     }
-                }
-            });
+                });
 
+                arms.push(quote! {
+                    Self::#var { #(#skip_pats,)* .. } => {
+                        #(#checks)*
+                        #rehyd_name::Ok
+                    }
+                });
+            }
+        }
+
+        if for_has_iter_await(&ap.kind) {
+            let iter_var = waiting_iter_variant(i);
             arms.push(quote! {
-                Self::#var { #(#skip_pats,)* .. } => {
-                    #(#checks)*
-                    #rehyd_name::Ok
-                }
+                Self::#iter_var { .. } => #rehyd_name::Ok
             });
         }
 
@@ -3785,10 +3814,20 @@ fn make_getters(
 
         let mut arms = Vec::new();
         for (i, (ap, caps)) in awaits.iter().zip(captures_at_await.iter()).enumerate() {
-            if caps.iter().any(|c| c.name == *name) {
+            let has_waiting_var =
+                !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. });
+            if has_waiting_var && caps.iter().any(|c| c.name == *name) {
                 let var = waiting_variant(&ap.name);
                 arms.push(quote! {
                     Self::#var { #name, .. } => ::core::option::Option::Some(#name),
+                });
+            }
+            if for_has_iter_await(&ap.kind)
+                && join_caps_at[i].iter().any(|c| c.name == *name)
+            {
+                let iter_var = waiting_iter_variant(i);
+                arms.push(quote! {
+                    Self::#iter_var { #name, .. } => ::core::option::Option::Some(#name),
                 });
             }
             let join_caps = effective_join_caps(ap, &join_caps_at[i]);

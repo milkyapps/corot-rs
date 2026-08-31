@@ -1,10 +1,11 @@
 //! Labeled `loop` / `for` with `break` / `continue` (labeled or not).
 //!
+//! `continue` works before and after the await, and in sync `for` bodies.
 //! Unlabeled `break`/`continue` inside nested sync loops stay native.
 //!
 //! Run: `cargo run -p corot-rs --example labeled_loop_await`
 
-#![allow(unused_mut)]
+#![allow(unused_mut, unreachable_code)]
 
 use corot_macros::corot;
 use std::task::Poll;
@@ -98,6 +99,41 @@ async fn labeled_for_break() {
     println!("for: done");
 }
 
+#[corot]
+async fn continue_before_await() {
+    println!("pre: start");
+    let mut skips: i32 = 0;
+    let mut hits: i32 = 0;
+    loop {
+        skips += 1;
+        println!("pre: skips={skips}");
+        if skips < 3 {
+            continue; // skip await
+        }
+        let n: i32 = ().await;
+        hits += 1;
+        println!("pre: hit n={n} hits={hits}");
+        if n > 0 {
+            break;
+        }
+    }
+    println!("pre: done skips={skips} hits={hits}");
+}
+
+#[corot]
+async fn continue_in_sync_for() {
+    println!("syncfor: start");
+    // Await only on the iterable; body is sync — `continue` must still hit LoopHead.
+    for i in (0..4).await {
+        if i % 2 == 0 {
+            println!("syncfor: skip {i}");
+            continue;
+        }
+        println!("syncfor: take {i}");
+    }
+    println!("syncfor: done");
+}
+
 fn main() {
     println!("=== labeled break ===");
     let mut c = labeled_break();
@@ -151,5 +187,20 @@ fn main() {
     c.settle_wait(&0i32);
     assert!(matches!(c.step(), Ok(Poll::Pending)));
     c.settle_wait(&4i32);
+    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    println!();
+
+    println!("=== continue before await ===");
+    let mut c = continue_before_await();
+    // two LoopHead iterations that continue without suspending
+    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    c.settle_wait(&42i32);
+    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    println!();
+
+    println!("=== continue in sync for body ===");
+    let mut c = continue_in_sync_for();
+    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    c.settle_wait(&(0..4));
     assert!(matches!(c.step(), Ok(Poll::Ready(()))));
 }
