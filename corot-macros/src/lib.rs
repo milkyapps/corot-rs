@@ -12,6 +12,8 @@ use syn::{
 ///   `Result<T, E>`; `Err` finishes with `Poll::Ready(Err(...))`)
 /// - `return` / `return <expr>` before or after an await (rewritten to finish the
 ///   coroutine with `Poll::Ready(...)`)
+/// - `loop` / `for`: optional label; `break` / `continue` (unlabeled or `'label`);
+///   unlabeled `break`/`continue` inside nested sync loops stay native
 /// - `if` / `if let`: condition/scrutinee, then, else, or else-if chain
 /// - `let…else`: await in the initializer or in the `else` block
 /// - `match`: scrutinee, one arm body, or one guard
@@ -94,8 +96,10 @@ enum SuspendKind {
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
     },
-    /// `loop { before; let name: Ty = ….await; after; }` with optional `break`.
+    /// `loop { before; let name: Ty = ….await; after; }` with optional label /
+    /// `break` / `continue` (including `'label`).
     Loop {
+        label: Option<Ident>,
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
@@ -106,6 +110,7 @@ enum SuspendKind {
     /// `corot_rs::iter::<I>(…)` / `iter::<I>(…)` where `I: IntoIterator`
     /// (the type of the `in` expression / settle value).
     For {
+        label: Option<Ident>,
         item: Ident,
         /// Type of the `in` expression (`IntoIterator`), e.g. `Vec<i32>` or `Range<i32>`.
         into_ty: Type,
@@ -1105,18 +1110,16 @@ fn as_await_loop_stmt(
     let Stmt::Expr(Expr::Loop(expr_loop), _) = stmt else {
         return Ok(None);
     };
-    if expr_loop.label.is_some() {
-        return Err(syn::Error::new_spanned(
-            stmt,
-            "#[corot] labeled loops are not supported yet",
-        ));
-    }
     if !expr_loop.body.stmts.iter().any(stmt_contains_await) {
         return Ok(None);
     }
+    let label = expr_loop
+        .label
+        .as_ref()
+        .map(|l| l.name.ident.clone());
     let (before_await, plain, after_await) =
         extract_single_await_from_stmts(&expr_loop.body.stmts, err_ty)?;
-        Ok(Some(AwaitPoint {
+    Ok(Some(AwaitPoint {
         name: plain.name,
         tmp: plain.tmp,
         wait_ty: plain.wait_ty,
@@ -1124,6 +1127,7 @@ fn as_await_loop_stmt(
         before: Vec::new(),
         try_ok: plain.try_ok,
         kind: SuspendKind::Loop {
+            label,
             before_await,
             after_await: {
                 let mut v = plain.after_resume;
@@ -1183,6 +1187,7 @@ fn as_await_for_stmt(
         before: Vec::new(),
         try_ok: plain.try_ok,
         kind: SuspendKind::For {
+            label: expr_for.label.as_ref().map(|l| l.name.ident.clone()),
             item,
             into_ty,
             iter_expr,
@@ -3023,8 +3028,25 @@ fn gen_after_resume(
                 }
             }
         }
-        SuspendKind::Loop { after_await, .. } | SuspendKind::For { after_await, .. } => {
-            rewrite_loop_after_await(index, after_await, join_caps, ready_ok)
+        SuspendKind::Loop {
+            after_await,
+            label,
+            ..
+        }
+        | SuspendKind::For {
+            after_await,
+            label,
+            ..
+        } => {
+            let is_for = matches!(&ap.kind, SuspendKind::For { .. });
+            rewrite_loop_after_await(
+                index,
+                after_await,
+                join_caps,
+                label.as_ref(),
+                is_for,
+                ready_ok,
+            )
         }
     };
 
@@ -3038,87 +3060,251 @@ fn rewrite_loop_after_await(
     index: usize,
     stmts: &[Stmt],
     join_caps: &[Binding],
+    label: Option<&Ident>,
+    is_for: bool,
     ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
+    let ctx = LoopRewriteCtx {
+        index,
+        join_caps,
+        label,
+        is_for,
+        ready_ok,
+    };
     let parts = stmts
         .iter()
-        .map(|stmt| rewrite_loop_stmt(stmt, index, join_caps, ready_ok));
+        .map(|stmt| rewrite_loop_stmt(stmt, &ctx, false));
     quote! { #(#parts)* }
+}
+
+struct LoopRewriteCtx<'a> {
+    index: usize,
+    join_caps: &'a [Binding],
+    label: Option<&'a Ident>,
+    is_for: bool,
+    ready_ok: &'a proc_macro2::TokenStream,
+}
+
+fn emit_loop_break(ctx: &LoopRewriteCtx<'_>) -> proc_macro2::TokenStream {
+    let var = after_loop_variant(ctx.index);
+    let fields = ctx.join_caps.iter().map(|b| {
+        let n = &b.name;
+        quote! { #n }
+    });
+    quote! {
+        *self = Self::#var {
+            #(#fields,)*
+        };
+        continue 'step;
+    }
+}
+
+fn emit_loop_continue(ctx: &LoopRewriteCtx<'_>) -> proc_macro2::TokenStream {
+    let var = loop_head_variant(ctx.index);
+    let fields = ctx.join_caps.iter().map(|b| {
+        let n = &b.name;
+        quote! { #n }
+    });
+    if ctx.is_for {
+        quote! {
+            *self = Self::#var {
+                __iter,
+                #(#fields,)*
+            };
+            continue 'step;
+        }
+    } else {
+        quote! {
+            *self = Self::#var {
+                #(#fields,)*
+            };
+            continue 'step;
+        }
+    }
+}
+
+fn label_matches(ctx: &LoopRewriteCtx<'_>, life: &syn::Lifetime) -> bool {
+    ctx.label.is_some_and(|l| l == &life.ident)
+}
+
+fn rewrite_break_expr(
+    brk: &syn::ExprBreak,
+    ctx: &LoopRewriteCtx<'_>,
+    in_nested: bool,
+) -> proc_macro2::TokenStream {
+    if brk.expr.is_some() {
+        return quote! {
+            ::core::compile_error!("#[corot] `break` with a value is not supported yet")
+        };
+    }
+    match &brk.label {
+        None if !in_nested => emit_loop_break(ctx),
+        None => quote! { break },
+        Some(life) if label_matches(ctx, life) => emit_loop_break(ctx),
+        Some(life) if in_nested => quote! { break #life },
+        Some(life) => {
+            let msg = format!(
+                "#[corot] `break '{0}` does not match this suspending loop's label",
+                life.ident
+            );
+            quote! { ::core::compile_error!(#msg) }
+        }
+    }
+}
+
+fn rewrite_continue_expr(
+    cont: &syn::ExprContinue,
+    ctx: &LoopRewriteCtx<'_>,
+    in_nested: bool,
+) -> proc_macro2::TokenStream {
+    match &cont.label {
+        None if !in_nested => emit_loop_continue(ctx),
+        None => quote! { continue },
+        Some(life) if label_matches(ctx, life) => emit_loop_continue(ctx),
+        Some(life) if in_nested => quote! { continue #life },
+        Some(life) => {
+            let msg = format!(
+                "#[corot] `continue '{0}` does not match this suspending loop's label",
+                life.ident
+            );
+            quote! { ::core::compile_error!(#msg) }
+        }
+    }
 }
 
 fn rewrite_loop_stmt(
     stmt: &Stmt,
-    index: usize,
-    join_caps: &[Binding],
-    ready_ok: &proc_macro2::TokenStream,
+    ctx: &LoopRewriteCtx<'_>,
+    in_nested: bool,
 ) -> proc_macro2::TokenStream {
     match stmt {
         Stmt::Expr(Expr::Return(ret), _) => {
-            emit_return_finish(ret.expr.as_deref(), ready_ok)
+            emit_return_finish(ret.expr.as_deref(), ctx.ready_ok)
         }
-        Stmt::Expr(Expr::Break(brk), _) if brk.label.is_none() && brk.expr.is_none() => {
-            let var = after_loop_variant(index);
-            let fields = join_caps.iter().map(|b| {
-                let n = &b.name;
-                quote! { #n }
-            });
-            quote! {
-                *self = Self::#var {
-                    #(#fields,)*
-                };
-                continue 'step;
+        Stmt::Expr(Expr::Break(brk), _) => rewrite_break_expr(brk, ctx, in_nested),
+        Stmt::Expr(Expr::Continue(cont), _) => rewrite_continue_expr(cont, ctx, in_nested),
+        Stmt::Expr(expr, semi) => {
+            let e = rewrite_loop_expr(expr, ctx, in_nested);
+            match semi {
+                Some(_) => quote! { #e; },
+                None => quote! { #e },
             }
         }
-        Stmt::Expr(Expr::If(expr_if), _) => {
+        other => emit_stmt_rewrite_returns(other, ctx.ready_ok),
+    }
+}
+
+fn rewrite_loop_expr(
+    expr: &Expr,
+    ctx: &LoopRewriteCtx<'_>,
+    in_nested: bool,
+) -> proc_macro2::TokenStream {
+    match expr {
+        Expr::Return(ret) => emit_return_finish(ret.expr.as_deref(), ctx.ready_ok),
+        Expr::Break(brk) => rewrite_break_expr(brk, ctx, in_nested),
+        Expr::Continue(cont) => rewrite_continue_expr(cont, ctx, in_nested),
+        Expr::Block(b) => {
+            let parts = b
+                .block
+                .stmts
+                .iter()
+                .map(|s| rewrite_loop_stmt(s, ctx, in_nested));
+            quote! {{ #(#parts)* }}
+        }
+        Expr::If(expr_if) => {
             let cond = &expr_if.cond;
             let then_parts = expr_if
                 .then_branch
                 .stmts
                 .iter()
-                .map(|s| rewrite_loop_stmt(s, index, join_caps, ready_ok));
+                .map(|s| rewrite_loop_stmt(s, ctx, in_nested));
             match &expr_if.else_branch {
                 None => quote! {
                     if #cond {
                         #(#then_parts)*
                     }
                 },
-                Some((_, else_expr)) => match else_expr.as_ref() {
-                    Expr::Block(b) => {
-                        let else_parts = b
-                            .block
-                            .stmts
-                            .iter()
-                            .map(|s| rewrite_loop_stmt(s, index, join_caps, ready_ok));
-                        quote! {
-                            if #cond {
-                                #(#then_parts)*
-                            } else {
-                                #(#else_parts)*
-                            }
-                        }
+                Some((_, else_expr)) => {
+                    let else_body = rewrite_loop_expr(else_expr, ctx, in_nested);
+                    quote! {
+                        if #cond {
+                            #(#then_parts)*
+                        } else #else_body
                     }
-                    other => {
-                        let else_body = emit_expr_rewrite_returns(other, ready_ok);
-                        quote! {
-                            if #cond {
-                                #(#then_parts)*
-                            } else #else_body;
-                        }
-                    }
-                },
+                }
             }
         }
-        Stmt::Expr(Expr::Block(b), _) => {
-            let parts = b
-                .block
+        Expr::Match(m) => {
+            let scrut = &m.expr;
+            let arms = m.arms.iter().map(|arm| {
+                let attrs = &arm.attrs;
+                let pat = &arm.pat;
+                let guard = match &arm.guard {
+                    Some((_, g)) => quote! { if #g },
+                    None => quote! {},
+                };
+                let body = rewrite_loop_expr(&arm.body, ctx, in_nested);
+                quote! {
+                    #(#attrs)*
+                    #pat #guard => #body,
+                }
+            });
+            quote! {
+                match #scrut {
+                    #(#arms)*
+                }
+            }
+        }
+        // Nested sync loops: unlabeled break/continue stay native; labeled ones
+        // targeting the suspending loop still rewrite.
+        Expr::Loop(l) => {
+            let body = l
+                .body
                 .stmts
                 .iter()
-                .map(|s| rewrite_loop_stmt(s, index, join_caps, ready_ok));
-            quote! {{
-                #(#parts)*
-            }}
+                .map(|s| rewrite_loop_stmt(s, ctx, true));
+            let label = &l.label;
+            quote! {
+                #label loop {
+                    #(#body)*
+                }
+            }
         }
-        other => emit_stmt_rewrite_returns(other, ready_ok),
+        Expr::While(w) => {
+            let cond = &w.cond;
+            let body = w
+                .body
+                .stmts
+                .iter()
+                .map(|s| rewrite_loop_stmt(s, ctx, true));
+            let label = &w.label;
+            quote! {
+                #label while #cond {
+                    #(#body)*
+                }
+            }
+        }
+        Expr::ForLoop(f) => {
+            let pat = &f.pat;
+            let iter = &f.expr;
+            let body = f
+                .body
+                .stmts
+                .iter()
+                .map(|s| rewrite_loop_stmt(s, ctx, true));
+            let label = &f.label;
+            quote! {
+                #label for #pat in #iter {
+                    #(#body)*
+                }
+            }
+        }
+        Expr::Paren(p) => {
+            let inner = rewrite_loop_expr(&p.expr, ctx, in_nested);
+            quote! { (#inner) }
+        }
+        Expr::Group(g) => rewrite_loop_expr(&g.expr, ctx, in_nested),
+        other => emit_expr_rewrite_returns(other, ctx.ready_ok),
     }
 }
 
