@@ -22,6 +22,7 @@ use syn::{
 /// - `match`: scrutinee, one arm body, or one guard
 /// - `for`: range literal or `iter::<I>(…)`, optional body await
 /// - `while` / `while let`: await in the condition/scrutinee **or** the body (not both)
+/// - labeled blocks: `let x: T = 'a: { …; break 'a value }` (await in the block)
 ///
 /// Locals that live across an await must be type-annotated.
 /// Scrutinee types for `if let` / `let…else` use pattern literals or
@@ -180,6 +181,19 @@ enum SuspendKind {
         sus_pat: Pat,
         sus_body: Box<Expr>,
         arms_after: Vec<syn::Arm>,
+        join_stmts: Vec<Stmt>,
+    },
+    /// `'label: { …; let x: T = ….await; …; break 'label value }` as a `let` init
+    /// or as a statement (unit value).
+    LabeledBlock {
+        label: Ident,
+        /// Binding that receives the block value (`break 'label expr` / fallthrough).
+        bind_name: Ident,
+        bind_ty: Type,
+        /// Statement form `'a: { … }` (no outer `let`); fallthrough is `()`.
+        is_stmt: bool,
+        before_await: Vec<Stmt>,
+        after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
     },
 }
@@ -375,6 +389,13 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         mutable: false,
                     },
                 );
+            }
+            SuspendKind::LabeledBlock { before_await, .. } => {
+                for stmt in before_await {
+                    if let Some(b) = typed_let_binding(stmt) {
+                        upsert_binding(&mut live, b);
+                    }
+                }
             }
             _ => {}
         }
@@ -722,7 +743,8 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 SuspendKind::IfThen { .. }
                 | SuspendKind::IfElse { .. }
                 | SuspendKind::MatchArm { .. }
-                | SuspendKind::MatchGuard { .. } => {
+                | SuspendKind::MatchGuard { .. }
+                | SuspendKind::LabeledBlock { .. } => {
                     gen_goto_join(ap, i, &effective_join_caps(ap, &join_caps_at[i]))
                 }
                 // Else-path of let…else diverges after resume (see gen_after_resume).
@@ -913,7 +935,7 @@ fn split_awaits(
         } else if stmt_contains_await(stmt) {
             return Err(syn::Error::new_spanned(
                 stmt,
-                "#[corot] unsupported await placement (supported: typed let; if; match; loop; while; for)",
+                "#[corot] unsupported await placement (supported: typed let; if; match; loop; while; for; labeled block)",
             ));
         } else {
             current.push(stmt.clone());
@@ -928,6 +950,9 @@ fn as_await_stmt(
     index: usize,
     err_ty: Option<&Type>,
 ) -> syn::Result<Option<AwaitPoint>> {
+    if let Some(ap) = as_await_labeled_block_stmt(stmt, index, err_ty)? {
+        return Ok(Some(ap));
+    }
     if let Some(plain) = as_plain_await_let(stmt, err_ty, index)? {
         return Ok(Some(AwaitPoint {
             name: plain.name,
@@ -1443,6 +1468,106 @@ fn as_await_while_stmt(
             }
         }
     }
+}
+
+fn as_await_labeled_block_stmt(
+    stmt: &Stmt,
+    index: usize,
+    err_ty: Option<&Type>,
+) -> syn::Result<Option<AwaitPoint>> {
+    // `let name: Ty = 'lab: { … }`
+    if let Stmt::Local(Local {
+        pat,
+        init: Some(LocalInit { expr, diverge, .. }),
+        ..
+    }) = stmt
+    {
+        if diverge.is_some() {
+            return Ok(None);
+        }
+        let Expr::Block(expr_block) = unwrap_parens_ref(expr) else {
+            return Ok(None);
+        };
+        let Some(label) = expr_block.label.as_ref() else {
+            return Ok(None);
+        };
+        if !expr_block.block.stmts.iter().any(stmt_contains_await) {
+            return Ok(None);
+        }
+        let Pat::Type(PatType { pat: inner, ty, .. }) = pat else {
+            return Err(syn::Error::new_spanned(
+                pat,
+                "labeled-block await bindings must be `let name: Type = 'label: { … }`",
+            ));
+        };
+        let bind_name = pat_ident_or_discard(inner)?;
+        let bind_name = if bind_name == "_unit" {
+            format_ident!("_blk{}", index)
+        } else {
+            bind_name
+        };
+        let bind_ty = ty.as_ref().clone();
+        let (before_await, plain, after_await) =
+            extract_single_await_from_stmts(&expr_block.block.stmts, err_ty)?;
+        return Ok(Some(AwaitPoint {
+            name: plain.name,
+            tmp: plain.tmp,
+            wait_ty: plain.wait_ty,
+            base: plain.base,
+            before: Vec::new(),
+            try_ok: plain.try_ok,
+            nested_child: plain.nested_child,
+            kind: SuspendKind::LabeledBlock {
+                label: label.name.ident.clone(),
+                bind_name,
+                bind_ty,
+                is_stmt: false,
+                before_await,
+                after_await: {
+                    let mut v = plain.after_resume;
+                    v.extend(after_await);
+                    v
+                },
+                join_stmts: Vec::new(),
+            },
+        }));
+    }
+
+    // `'lab: { … };` as a statement
+    if let Stmt::Expr(Expr::Block(expr_block), _) = stmt {
+        let Some(label) = expr_block.label.as_ref() else {
+            return Ok(None);
+        };
+        if !expr_block.block.stmts.iter().any(stmt_contains_await) {
+            return Ok(None);
+        }
+        let (before_await, plain, after_await) =
+            extract_single_await_from_stmts(&expr_block.block.stmts, err_ty)?;
+        return Ok(Some(AwaitPoint {
+            name: plain.name,
+            tmp: plain.tmp,
+            wait_ty: plain.wait_ty,
+            base: plain.base,
+            before: Vec::new(),
+            try_ok: plain.try_ok,
+            nested_child: plain.nested_child,
+            kind: SuspendKind::LabeledBlock {
+                label: label.name.ident.clone(),
+                bind_name: format_ident!("_blk{}", index),
+                bind_ty: syn::parse_quote!(()),
+                is_stmt: true,
+                before_await,
+                after_await: {
+                    let mut v = plain.after_resume;
+                    v.extend(after_await);
+                    v
+                },
+                join_stmts: Vec::new(),
+            },
+        }));
+    }
+
+    Ok(None)
 }
 
 fn as_await_for_stmt(
@@ -2685,7 +2810,7 @@ fn extract_single_await_from_stmts(
             } else if stmt_contains_await(stmt) {
                 return Err(syn::Error::new_spanned(
                     stmt,
-                    "#[corot] await inside if branches must be a typed let binding",
+                    "#[corot] await inside a suspending block must be a typed let binding",
                 ));
             } else {
                 before.push(stmt.clone());
@@ -2693,7 +2818,7 @@ fn extract_single_await_from_stmts(
         } else if stmt_contains_await(stmt) {
             return Err(syn::Error::new_spanned(
                 stmt,
-                "#[corot] only one await is supported inside an if branch",
+                "#[corot] only one await is supported inside this suspending block",
             ));
         } else {
             after.push(stmt.clone());
@@ -2718,7 +2843,8 @@ fn after_resume_stmts(ap: &AwaitPoint) -> Vec<&Stmt> {
         | SuspendKind::While { after_await, .. }
         | SuspendKind::For { after_await, .. }
         | SuspendKind::MatchArm { after_await, .. }
-        | SuspendKind::LetElseAwait { after_await, .. } => after_await.iter().collect(),
+        | SuspendKind::LetElseAwait { after_await, .. }
+        | SuspendKind::LabeledBlock { after_await, .. } => after_await.iter().collect(),
         SuspendKind::IfCondition { .. }
         | SuspendKind::IfLetScrutinee { .. }
         | SuspendKind::MatchScrutinee { .. }
@@ -2766,6 +2892,7 @@ fn needs_join(kind: &SuspendKind) -> bool {
             | SuspendKind::MatchArm { .. }
             | SuspendKind::MatchGuard { .. }
             | SuspendKind::LetElseAwait { .. }
+            | SuspendKind::LabeledBlock { .. }
     )
 }
 
@@ -2839,7 +2966,8 @@ fn join_stmts_of(ap: &AwaitPoint) -> Option<&[Stmt]> {
         | SuspendKind::For { join_stmts, .. }
         | SuspendKind::MatchArm { join_stmts, .. }
         | SuspendKind::MatchGuard { join_stmts, .. }
-        | SuspendKind::LetElseAwait { join_stmts, .. } => Some(join_stmts.as_slice()),
+        | SuspendKind::LetElseAwait { join_stmts, .. }
+        | SuspendKind::LabeledBlock { join_stmts, .. } => Some(join_stmts.as_slice()),
         _ => None,
     }
 }
@@ -2851,6 +2979,22 @@ fn effective_join_caps(ap: &AwaitPoint, join_caps: &[Binding]) -> Vec<Binding> {
             for b in pat_binds {
                 upsert_binding(&mut caps, b.clone());
             }
+            caps
+        }
+        SuspendKind::LabeledBlock {
+            bind_name,
+            bind_ty,
+            ..
+        } => {
+            let mut caps = join_caps.to_vec();
+            upsert_binding(
+                &mut caps,
+                Binding {
+                    name: bind_name.clone(),
+                    ty: bind_ty.clone(),
+                    mutable: false,
+                },
+            );
             caps
         }
         _ => join_caps.to_vec(),
@@ -2890,7 +3034,8 @@ fn assign_join_stmts(awaits: &mut [AwaitPoint], after_last: &mut Vec<Stmt>) {
             | SuspendKind::For { join_stmts, .. }
             | SuspendKind::MatchArm { join_stmts, .. }
             | SuspendKind::MatchGuard { join_stmts, .. }
-            | SuspendKind::LetElseAwait { join_stmts, .. } => {
+            | SuspendKind::LetElseAwait { join_stmts, .. }
+            | SuspendKind::LabeledBlock { join_stmts, .. } => {
                 *join_stmts = join;
             }
             _ => {}
@@ -3196,6 +3341,28 @@ fn gen_enter_await(
                 }
             }
         }
+        SuspendKind::LabeledBlock {
+            label,
+            bind_name,
+            bind_ty,
+            before_await,
+            ..
+        } => {
+            let before_await = rewrite_labeled_block_stmts(
+                before_await,
+                index,
+                label,
+                bind_name,
+                bind_ty,
+                &join_caps,
+                ready_ok,
+            );
+            quote! {
+                #before
+                #before_await
+                #go_wait
+            }
+        }
     }
 }
 
@@ -3478,11 +3645,315 @@ fn gen_after_resume(
             false,
             ready_ok,
         ),
+        SuspendKind::LabeledBlock {
+            label,
+            bind_name,
+            bind_ty,
+            is_stmt,
+            after_await,
+            ..
+        } => {
+            let join_caps = effective_join_caps(ap, join_caps);
+            let (body_stmts, trailing) = split_block_trailing(after_await);
+            let body = rewrite_labeled_block_stmts(
+                &body_stmts,
+                index,
+                label,
+                bind_name,
+                bind_ty,
+                &join_caps,
+                ready_ok,
+            );
+            let value = match trailing {
+                Some(e) => rewrite_labeled_block_expr(
+                    e,
+                    &LabeledBlockRewriteCtx {
+                        index,
+                        label,
+                        bind_name,
+                        bind_ty,
+                        join_caps: &join_caps,
+                        ready_ok,
+                    },
+                    false,
+                ),
+                None if *is_stmt || is_unit_ty(bind_ty) => quote! { () },
+                // Unreachable if every path `break`s; still type-checked by rustc.
+                None => quote! {
+                    ::core::unreachable!(
+                        "#[corot] labeled block exited without a value"
+                    )
+                },
+            };
+            quote! {
+                #body
+                let #bind_name: #bind_ty = #value;
+            }
+        }
     };
 
     quote! {
         #try_bind
         #rest
+    }
+}
+
+fn split_block_trailing(stmts: &[Stmt]) -> (Vec<Stmt>, Option<&Expr>) {
+    match stmts.split_last() {
+        Some((Stmt::Expr(e, None), rest))
+            if !matches!(
+                e,
+                Expr::Break(_) | Expr::Return(_) | Expr::Continue(_)
+            ) =>
+        {
+            (rest.to_vec(), Some(e))
+        }
+        _ => (stmts.to_vec(), None),
+    }
+}
+
+struct LabeledBlockRewriteCtx<'a> {
+    index: usize,
+    label: &'a Ident,
+    bind_name: &'a Ident,
+    bind_ty: &'a Type,
+    join_caps: &'a [Binding],
+    ready_ok: &'a proc_macro2::TokenStream,
+}
+
+fn rewrite_labeled_block_stmts(
+    stmts: &[Stmt],
+    index: usize,
+    label: &Ident,
+    bind_name: &Ident,
+    bind_ty: &Type,
+    join_caps: &[Binding],
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let ctx = LabeledBlockRewriteCtx {
+        index,
+        label,
+        bind_name,
+        bind_ty,
+        join_caps,
+        ready_ok,
+    };
+    let parts = stmts
+        .iter()
+        .map(|stmt| rewrite_labeled_block_stmt(stmt, &ctx, false));
+    quote! { #(#parts)* }
+}
+
+fn emit_labeled_block_break(
+    ctx: &LabeledBlockRewriteCtx<'_>,
+    value: Option<&Expr>,
+    in_nested: bool,
+) -> proc_macro2::TokenStream {
+    let bind_name = ctx.bind_name;
+    let bind_ty = ctx.bind_ty;
+    let val = match value {
+        Some(e) => rewrite_labeled_block_expr(e, ctx, in_nested),
+        None => quote! { () },
+    };
+    let var = after_if_variant(ctx.index);
+    let fields = ctx.join_caps.iter().map(|b| {
+        let n = &b.name;
+        quote! { #n }
+    });
+    quote! {
+        let #bind_name: #bind_ty = #val;
+        *self = Self::#var {
+            #(#fields,)*
+        };
+        continue 'step;
+    }
+}
+
+fn rewrite_labeled_block_break(
+    brk: &syn::ExprBreak,
+    ctx: &LabeledBlockRewriteCtx<'_>,
+    in_nested: bool,
+) -> proc_macro2::TokenStream {
+    match &brk.label {
+        Some(life) if life.ident == *ctx.label => {
+            emit_labeled_block_break(ctx, brk.expr.as_deref(), in_nested)
+        }
+        None if !in_nested => quote! {
+            ::core::compile_error!("#[corot] unlabeled `break` is not valid in a labeled block")
+        },
+        None => quote! { break },
+        Some(life) if in_nested => match &brk.expr {
+            Some(e) => quote! { break #life #e },
+            None => quote! { break #life },
+        },
+        Some(life) => {
+            let msg = format!(
+                "#[corot] `break '{0}` does not match this labeled block's label",
+                life.ident
+            );
+            quote! { ::core::compile_error!(#msg) }
+        }
+    }
+}
+
+fn rewrite_labeled_block_continue(
+    cont: &syn::ExprContinue,
+    ctx: &LabeledBlockRewriteCtx<'_>,
+    in_nested: bool,
+) -> proc_macro2::TokenStream {
+    match &cont.label {
+        Some(life) if life.ident == *ctx.label => quote! {
+            ::core::compile_error!("#[corot] `continue` cannot target a labeled block")
+        },
+        None if !in_nested => quote! {
+            ::core::compile_error!("#[corot] unlabeled `continue` is not valid in a labeled block")
+        },
+        None => quote! { continue },
+        Some(life) if in_nested => quote! { continue #life },
+        Some(life) => {
+            let msg = format!(
+                "#[corot] `continue '{0}` does not match a loop label in this labeled block",
+                life.ident
+            );
+            quote! { ::core::compile_error!(#msg) }
+        }
+    }
+}
+
+fn rewrite_labeled_block_stmt(
+    stmt: &Stmt,
+    ctx: &LabeledBlockRewriteCtx<'_>,
+    in_nested: bool,
+) -> proc_macro2::TokenStream {
+    match stmt {
+        Stmt::Expr(Expr::Return(ret), _) => {
+            emit_return_finish(ret.expr.as_deref(), ctx.ready_ok)
+        }
+        Stmt::Expr(Expr::Break(brk), _) => rewrite_labeled_block_break(brk, ctx, in_nested),
+        Stmt::Expr(Expr::Continue(cont), _) => {
+            rewrite_labeled_block_continue(cont, ctx, in_nested)
+        }
+        Stmt::Expr(expr, semi) => {
+            let e = rewrite_labeled_block_expr(expr, ctx, in_nested);
+            match semi {
+                Some(_) => quote! { #e; },
+                None => quote! { #e },
+            }
+        }
+        other => emit_stmt_rewrite_returns(other, ctx.ready_ok),
+    }
+}
+
+fn rewrite_labeled_block_expr(
+    expr: &Expr,
+    ctx: &LabeledBlockRewriteCtx<'_>,
+    in_nested: bool,
+) -> proc_macro2::TokenStream {
+    match expr {
+        Expr::Return(ret) => emit_return_finish(ret.expr.as_deref(), ctx.ready_ok),
+        Expr::Break(brk) => rewrite_labeled_block_break(brk, ctx, in_nested),
+        Expr::Continue(cont) => rewrite_labeled_block_continue(cont, ctx, in_nested),
+        Expr::Block(b) => {
+            let parts = b
+                .block
+                .stmts
+                .iter()
+                .map(|s| rewrite_labeled_block_stmt(s, ctx, in_nested));
+            let label = &b.label;
+            quote! { #label { #(#parts)* } }
+        }
+        Expr::If(expr_if) => {
+            let cond = &expr_if.cond;
+            let then_parts = expr_if
+                .then_branch
+                .stmts
+                .iter()
+                .map(|s| rewrite_labeled_block_stmt(s, ctx, in_nested));
+            match &expr_if.else_branch {
+                None => quote! {
+                    if #cond {
+                        #(#then_parts)*
+                    }
+                },
+                Some((_, else_expr)) => {
+                    let else_body = rewrite_labeled_block_expr(else_expr, ctx, in_nested);
+                    quote! {
+                        if #cond {
+                            #(#then_parts)*
+                        } else #else_body
+                    }
+                }
+            }
+        }
+        Expr::Match(m) => {
+            let scrut = &m.expr;
+            let arms = m.arms.iter().map(|arm| {
+                let attrs = &arm.attrs;
+                let pat = &arm.pat;
+                let guard = match &arm.guard {
+                    Some((_, g)) => quote! { if #g },
+                    None => quote! {},
+                };
+                let body = rewrite_labeled_block_expr(&arm.body, ctx, in_nested);
+                quote! {
+                    #(#attrs)*
+                    #pat #guard => #body,
+                }
+            });
+            quote! {
+                match #scrut {
+                    #(#arms)*
+                }
+            }
+        }
+        Expr::Loop(l) => {
+            let body = l
+                .body
+                .stmts
+                .iter()
+                .map(|s| rewrite_labeled_block_stmt(s, ctx, true));
+            let label = &l.label;
+            quote! {
+                #label loop {
+                    #(#body)*
+                }
+            }
+        }
+        Expr::While(w) => {
+            let cond = &w.cond;
+            let body = w
+                .body
+                .stmts
+                .iter()
+                .map(|s| rewrite_labeled_block_stmt(s, ctx, true));
+            let label = &w.label;
+            quote! {
+                #label while #cond {
+                    #(#body)*
+                }
+            }
+        }
+        Expr::ForLoop(f) => {
+            let pat = &f.pat;
+            let iter = &f.expr;
+            let body = f
+                .body
+                .stmts
+                .iter()
+                .map(|s| rewrite_labeled_block_stmt(s, ctx, true));
+            let label = &f.label;
+            quote! {
+                #label for #pat in #iter {
+                    #(#body)*
+                }
+            }
+        }
+        Expr::Paren(p) => {
+            let inner = rewrite_labeled_block_expr(&p.expr, ctx, in_nested);
+            quote! { (#inner) }
+        }
+        Expr::Group(g) => rewrite_labeled_block_expr(&g.expr, ctx, in_nested),
+        other => emit_expr_rewrite_returns(other, ctx.ready_ok),
     }
 }
 
