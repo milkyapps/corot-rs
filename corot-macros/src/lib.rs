@@ -1,17 +1,19 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse_macro_input, Expr, ExprPath, Ident, ItemFn, Local, LocalInit, Pat, PatIdent, PatType,
+    parse_macro_input, Expr, ExprPath, Ident, ItemFn, Lit, Local, LocalInit, Pat, PatIdent, PatType,
     Path, Stmt, Type,
 };
 
-/// Suspension points: `let name: Type = <expr with await>`, or an `if` with a
-/// single await in the condition, the `then` branch, or the `else` branch.
+/// Suspension points: typed `let` awaits; `if` / `loop` / `for` / `match` with a
+/// single await in a supported position.
 ///
-/// Await-in-condition must be a bare `expr.await` whose output type is `bool`.
-/// Await inside then/else must be a typed `let name: Type = … .await`.
+/// - `if`: condition (`expr.await` → bool), then, or else
+/// - `match`: scrutinee (`expr.await`), one arm body, or one guard (`expr.await` → bool)
+/// - `for`: range literal / `(range).await`, optional body await
 ///
 /// Locals that live across an await must be type-annotated.
+/// Match scrutinee types are inferred from arm pattern literals when possible.
 ///
 /// With the `serde` feature, wrap non-serializable captures in `SkipSerde<T>`
 /// (from the `corot-rs` crate). The macro matches that type name and emits
@@ -85,6 +87,34 @@ enum SuspendKind {
         has_body_await: bool,
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
+        join_stmts: Vec<Stmt>,
+    },
+    /// `match EXPR.await { arms… }` — settle value is the scrutinee.
+    MatchScrutinee {
+        arms: Vec<syn::Arm>,
+    },
+    /// Await inside exactly one match arm body.
+    MatchArm {
+        scrutinee: Expr,
+        scrut_ty: Type,
+        pat_binds: Vec<Ident>,
+        arms_before: Vec<syn::Arm>,
+        sus_pat: Pat,
+        sus_guard: Option<Box<Expr>>,
+        before_await: Vec<Stmt>,
+        after_await: Vec<Stmt>,
+        arms_after: Vec<syn::Arm>,
+        join_stmts: Vec<Stmt>,
+    },
+    /// Await in exactly one match guard (`if expr.await`, bool).
+    /// Scrutinee must be `Clone` (stored across the guard await for fallthrough).
+    MatchGuard {
+        scrutinee: Expr,
+        scrut_ty: Type,
+        arms_before: Vec<syn::Arm>,
+        sus_pat: Pat,
+        sus_body: Box<Expr>,
+        arms_after: Vec<syn::Arm>,
         join_stmts: Vec<Stmt>,
     },
 }
@@ -176,6 +206,38 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         upsert_binding(&mut live, b);
                     }
                 }
+            }
+            SuspendKind::MatchArm {
+                scrut_ty,
+                pat_binds,
+                before_await,
+                ..
+            } => {
+                for name in pat_binds {
+                    upsert_binding(
+                        &mut live,
+                        Binding {
+                            name: name.clone(),
+                            ty: scrut_ty.clone(),
+                            mutable: false,
+                        },
+                    );
+                }
+                for stmt in before_await {
+                    if let Some(b) = typed_let_binding(stmt) {
+                        upsert_binding(&mut live, b);
+                    }
+                }
+            }
+            SuspendKind::MatchGuard { scrut_ty, .. } => {
+                upsert_binding(
+                    &mut live,
+                    Binding {
+                        name: format_ident!("__scrut"),
+                        ty: scrut_ty.clone(),
+                        mutable: false,
+                    },
+                );
             }
             _ => {}
         }
@@ -416,7 +478,10 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 SuspendKind::Loop { .. } | SuspendKind::For { .. } => {
                     gen_goto_loop_head(i, ap, &join_caps_at[i])
                 }
-                SuspendKind::IfThen { .. } | SuspendKind::IfElse { .. } => {
+                SuspendKind::IfThen { .. }
+                | SuspendKind::IfElse { .. }
+                | SuspendKind::MatchArm { .. }
+                | SuspendKind::MatchGuard { .. } => {
                     gen_goto_join(ap, i, &join_caps_at[i])
                 }
                 _ => gen_join_tail(i, &awaits, &captures_at_await, &join_caps_at, &after_last),
@@ -551,7 +616,7 @@ fn split_awaits(stmts: &[Stmt]) -> syn::Result<(Vec<AwaitPoint>, Vec<Stmt>)> {
         } else if stmt_contains_await(stmt) {
             return Err(syn::Error::new_spanned(
                 stmt,
-                "#[corot] unsupported await placement (supported: typed let; if; loop; for range)",
+                "#[corot] unsupported await placement (supported: typed let; if; match; loop; for range)",
             ));
         } else {
             current.push(stmt.clone());
@@ -580,7 +645,10 @@ fn as_await_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>> {
     if let Some(ap) = as_await_loop_stmt(stmt)? {
         return Ok(Some(ap));
     }
-    as_await_for_stmt(stmt)
+    if let Some(ap) = as_await_for_stmt(stmt)? {
+        return Ok(Some(ap));
+    }
+    as_await_match_stmt(stmt, index)
 }
 
 fn as_plain_await_let(stmt: &Stmt) -> syn::Result<Option<PlainAwait>> {
@@ -847,6 +915,275 @@ fn as_await_for_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
     }))
 }
 
+fn as_await_match_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>> {
+    let Stmt::Expr(Expr::Match(expr_match), _) = stmt else {
+        return Ok(None);
+    };
+
+    let scrut_has = contains_await(&expr_match.expr);
+    let mut arm_await_idx: Option<usize> = None;
+    let mut guard_await_idx: Option<usize> = None;
+
+    for (i, arm) in expr_match.arms.iter().enumerate() {
+        if arm
+            .guard
+            .as_ref()
+            .is_some_and(|(_, g)| contains_await(g))
+        {
+            if guard_await_idx.is_some() {
+                return Err(syn::Error::new_spanned(
+                    arm,
+                    "#[corot] supports at most one await in a match (including guards)",
+                ));
+            }
+            guard_await_idx = Some(i);
+        }
+        if contains_await(&arm.body) {
+            if arm_await_idx.is_some() {
+                return Err(syn::Error::new_spanned(
+                    arm,
+                    "#[corot] supports at most one await in a match",
+                ));
+            }
+            arm_await_idx = Some(i);
+        }
+    }
+
+    match (scrut_has, arm_await_idx, guard_await_idx) {
+        (false, None, None) => Ok(None),
+        (true, None, None) => {
+            let Some(base) = bare_await_base(&expr_match.expr) else {
+                return Err(syn::Error::new_spanned(
+                    &expr_match.expr,
+                    "await in match scrutinee must be a bare `expr.await`",
+                ));
+            };
+            let scrut_ty = infer_match_scrut_ty(&expr_match.arms)?;
+            let name = format_ident!("scrut{}", index);
+            let tmp = format_ident!("__await_{}", name);
+            Ok(Some(AwaitPoint {
+                name,
+                tmp: tmp.clone(),
+                wait_ty: scrut_ty,
+                base,
+                before: Vec::new(),
+                kind: SuspendKind::MatchScrutinee {
+                    arms: expr_match.arms.clone(),
+                },
+            }))
+        }
+        (false, Some(ai), None) => {
+            let scrut_ty = infer_match_scrut_ty(&expr_match.arms)?;
+            let sus = &expr_match.arms[ai];
+            if sus
+                .guard
+                .as_ref()
+                .is_some_and(|(_, g)| contains_await(g))
+            {
+                return Err(syn::Error::new_spanned(
+                    sus,
+                    "#[corot] await in both a match guard and arm body is not supported",
+                ));
+            }
+            check_simple_match_pat(&sus.pat)?;
+            let pat_binds = simple_pat_idents(&sus.pat);
+            let stmts = expr_as_stmts(&sus.body);
+            let (before_await, plain, after_await) = extract_single_await_from_stmts(&stmts)?;
+            let sus_guard = sus.guard.as_ref().map(|(_, g)| g.clone());
+            Ok(Some(AwaitPoint {
+                name: plain.name,
+                tmp: plain.tmp,
+                wait_ty: plain.wait_ty,
+                base: plain.base,
+                before: Vec::new(),
+                kind: SuspendKind::MatchArm {
+                    scrutinee: expr_match.expr.as_ref().clone(),
+                    scrut_ty,
+                    pat_binds,
+                    arms_before: expr_match.arms[..ai].to_vec(),
+                    sus_pat: sus.pat.clone(),
+                    sus_guard,
+                    before_await,
+                    after_await: {
+                        let mut v = plain.after_resume;
+                        v.extend(after_await);
+                        v
+                    },
+                    arms_after: expr_match.arms[ai + 1..].to_vec(),
+                    join_stmts: Vec::new(),
+                },
+            }))
+        }
+        (false, None, Some(gi)) => {
+            let scrut_ty = infer_match_scrut_ty(&expr_match.arms)?;
+            let sus = &expr_match.arms[gi];
+            if contains_await(&sus.body) {
+                return Err(syn::Error::new_spanned(
+                    sus,
+                    "#[corot] await in both a match guard and arm body is not supported",
+                ));
+            }
+            check_simple_match_pat(&sus.pat)?;
+            let (_, guard_expr) = sus.guard.as_ref().expect("guard await index");
+            let Some(base) = bare_await_base(guard_expr) else {
+                return Err(syn::Error::new_spanned(
+                    guard_expr,
+                    "await in match guard must be a bare `expr.await` (result type: bool)",
+                ));
+            };
+            let name = format_ident!("guard{}", index);
+            let tmp = format_ident!("__await_{}", name);
+            Ok(Some(AwaitPoint {
+                name,
+                tmp,
+                wait_ty: syn::parse_quote!(bool),
+                base,
+                before: Vec::new(),
+                kind: SuspendKind::MatchGuard {
+                    scrutinee: expr_match.expr.as_ref().clone(),
+                    scrut_ty,
+                    arms_before: expr_match.arms[..gi].to_vec(),
+                    sus_pat: sus.pat.clone(),
+                    sus_body: sus.body.clone(),
+                    arms_after: expr_match.arms[gi + 1..].to_vec(),
+                    join_stmts: Vec::new(),
+                },
+            }))
+        }
+        _ => Err(syn::Error::new_spanned(
+            stmt,
+            "#[corot] supports at most one await in a match, and only in the scrutinee, \
+             or only in one arm body, or only in one guard",
+        )),
+    }
+}
+
+fn expr_as_stmts(expr: &Expr) -> Vec<Stmt> {
+    match expr {
+        Expr::Block(b) => b.block.stmts.clone(),
+        other => vec![Stmt::Expr(other.clone(), None)],
+    }
+}
+
+fn check_simple_match_pat(pat: &Pat) -> syn::Result<()> {
+    match pat {
+        Pat::Ident(p) => {
+            if let Some((_, sub)) = &p.subpat {
+                check_simple_match_pat(sub)?;
+            }
+            Ok(())
+        }
+        Pat::Wild(_) | Pat::Lit(_) => Ok(()),
+        Pat::Path(p) if p.qself.is_none() => Ok(()),
+        Pat::Or(p) => {
+            for case in &p.cases {
+                check_simple_match_pat(case)?;
+            }
+            Ok(())
+        }
+        other => Err(syn::Error::new_spanned(
+            other,
+            "#[corot] match-await currently only supports simple patterns \
+             (ident, `ident @ lit`, literal, path, `_`, or `|` of those)",
+        )),
+    }
+}
+
+fn simple_pat_idents(pat: &Pat) -> Vec<Ident> {
+    match pat {
+        Pat::Ident(p) => vec![p.ident.clone()],
+        Pat::Or(p) => {
+            let mut out = Vec::new();
+            for case in &p.cases {
+                for id in simple_pat_idents(case) {
+                    if !out.iter().any(|x| x == &id) {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn infer_match_scrut_ty(arms: &[syn::Arm]) -> syn::Result<Type> {
+    let mut found: Option<Type> = None;
+    for arm in arms {
+        if let Some(ty) = pattern_type_hint(&arm.pat)? {
+            if let Some(prev) = &found {
+                if !types_eq(prev, &ty) {
+                    return Err(syn::Error::new_spanned(
+                        &arm.pat,
+                        "#[corot] conflicting pattern type hints in match arms",
+                    ));
+                }
+            } else {
+                found = Some(ty);
+            }
+        }
+    }
+    found.ok_or_else(|| {
+        syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[corot] cannot infer match scrutinee type; use a literal pattern \
+             (e.g. `0`, `true`) in at least one arm",
+        )
+    })
+}
+
+fn types_eq(a: &Type, b: &Type) -> bool {
+    quote!(#a).to_string() == quote!(#b).to_string()
+}
+
+fn pattern_type_hint(pat: &Pat) -> syn::Result<Option<Type>> {
+    match pat {
+        Pat::Lit(p) => match &p.lit {
+            Lit::Int(lit) => Ok(Some(int_lit_suffix_type(lit))),
+            Lit::Bool(_) => Ok(Some(syn::parse_quote!(bool))),
+            Lit::Char(_) => Ok(Some(syn::parse_quote!(char))),
+            other => Err(syn::Error::new_spanned(
+                other,
+                "#[corot] unsupported literal pattern for match type inference",
+            )),
+        },
+        Pat::Or(p) => {
+            let mut found = None;
+            for case in &p.cases {
+                if let Some(ty) = pattern_type_hint(case)? {
+                    found = Some(ty);
+                    break;
+                }
+            }
+            Ok(found)
+        }
+        Pat::Ident(p) => {
+            if let Some((_, sub)) = &p.subpat {
+                pattern_type_hint(sub)
+            } else {
+                Ok(None)
+            }
+        }
+        Pat::Wild(_) | Pat::Path(_) => Ok(None),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "#[corot] cannot infer type from this match pattern",
+        )),
+    }
+}
+
+fn int_lit_suffix_type(lit: &syn::LitInt) -> Type {
+    match lit.suffix() {
+        "" | "i32" => syn::parse_quote!(i32),
+        "i64" => syn::parse_quote!(i64),
+        "u32" => syn::parse_quote!(u32),
+        "u64" => syn::parse_quote!(u64),
+        "usize" => syn::parse_quote!(usize),
+        "isize" => syn::parse_quote!(isize),
+        _ => syn::parse_quote!(i32),
+    }
+}
+
 fn range_types(expr: &Expr) -> syn::Result<(Type, Type)> {
     let expr = match expr {
         Expr::Paren(p) => p.expr.as_ref(),
@@ -956,8 +1293,11 @@ fn after_resume_stmts(ap: &AwaitPoint) -> Vec<&Stmt> {
         SuspendKind::IfThen { after_await, .. }
         | SuspendKind::IfElse { after_await, .. }
         | SuspendKind::Loop { after_await, .. }
-        | SuspendKind::For { after_await, .. } => after_await.iter().collect(),
-        SuspendKind::IfCondition { .. } => Vec::new(),
+        | SuspendKind::For { after_await, .. }
+        | SuspendKind::MatchArm { after_await, .. } => after_await.iter().collect(),
+        SuspendKind::IfCondition { .. }
+        | SuspendKind::MatchScrutinee { .. }
+        | SuspendKind::MatchGuard { .. } => Vec::new(),
     }
 }
 
@@ -968,11 +1308,20 @@ fn needs_join(kind: &SuspendKind) -> bool {
             | SuspendKind::IfElse { .. }
             | SuspendKind::Loop { .. }
             | SuspendKind::For { .. }
+            | SuspendKind::MatchArm { .. }
+            | SuspendKind::MatchGuard { .. }
     )
 }
 
 fn is_loop_kind(kind: &SuspendKind) -> bool {
     matches!(kind, SuspendKind::Loop { .. } | SuspendKind::For { .. })
+}
+
+fn is_match_join_kind(kind: &SuspendKind) -> bool {
+    matches!(
+        kind,
+        SuspendKind::MatchArm { .. } | SuspendKind::MatchGuard { .. }
+    )
 }
 
 fn waiting_iter_variant(index: usize) -> Ident {
@@ -1004,6 +1353,10 @@ fn after_loop_variant(index: usize) -> Ident {
     format_ident!("AfterLoop{}", index)
 }
 
+fn after_match_variant(index: usize) -> Ident {
+    format_ident!("AfterMatch{}", index)
+}
+
 fn loop_head_variant(index: usize) -> Ident {
     format_ident!("LoopHead{}", index)
 }
@@ -1011,6 +1364,8 @@ fn loop_head_variant(index: usize) -> Ident {
 fn join_variant(kind: &SuspendKind, index: usize) -> Ident {
     if is_loop_kind(kind) {
         after_loop_variant(index)
+    } else if is_match_join_kind(kind) {
+        after_match_variant(index)
     } else {
         after_if_variant(index)
     }
@@ -1021,7 +1376,9 @@ fn join_stmts_of(ap: &AwaitPoint) -> Option<&[Stmt]> {
         SuspendKind::IfThen { join_stmts, .. }
         | SuspendKind::IfElse { join_stmts, .. }
         | SuspendKind::Loop { join_stmts, .. }
-        | SuspendKind::For { join_stmts, .. } => Some(join_stmts.as_slice()),
+        | SuspendKind::For { join_stmts, .. }
+        | SuspendKind::MatchArm { join_stmts, .. }
+        | SuspendKind::MatchGuard { join_stmts, .. } => Some(join_stmts.as_slice()),
         _ => None,
     }
 }
@@ -1055,7 +1412,9 @@ fn assign_join_stmts(awaits: &mut [AwaitPoint], after_last: &mut Vec<Stmt>) {
             SuspendKind::IfThen { join_stmts, .. }
             | SuspendKind::IfElse { join_stmts, .. }
             | SuspendKind::Loop { join_stmts, .. }
-            | SuspendKind::For { join_stmts, .. } => {
+            | SuspendKind::For { join_stmts, .. }
+            | SuspendKind::MatchArm { join_stmts, .. }
+            | SuspendKind::MatchGuard { join_stmts, .. } => {
                 *join_stmts = join;
             }
             _ => {}
@@ -1161,7 +1520,9 @@ fn gen_enter_await(
     let non_suspend = gen_goto_join(ap, index, join_caps);
 
     match &ap.kind {
-        SuspendKind::Plain { .. } | SuspendKind::IfCondition { .. } => quote! {
+        SuspendKind::Plain { .. }
+        | SuspendKind::IfCondition { .. }
+        | SuspendKind::MatchScrutinee { .. } => quote! {
             #(#before)*
             #go_wait
         },
@@ -1241,6 +1602,114 @@ fn gen_enter_await(
                 }
             }
         }
+        SuspendKind::MatchArm {
+            scrutinee,
+            arms_before,
+            sus_pat,
+            sus_guard,
+            before_await,
+            arms_after,
+            ..
+        } => {
+            let before_arms = arms_before
+                .iter()
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend));
+            let after_arms = arms_after
+                .iter()
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend));
+            let guard = match sus_guard {
+                Some(g) => quote! { if #g },
+                None => quote! {},
+            };
+            quote! {
+                #(#before)*
+                match #scrutinee {
+                    #(#before_arms)*
+                    #sus_pat #guard => {
+                        #(#before_await)*
+                        #go_wait
+                    }
+                    #(#after_arms)*
+                }
+            }
+        }
+        SuspendKind::MatchGuard {
+            scrutinee,
+            scrut_ty,
+            arms_before,
+            sus_pat,
+            arms_after,
+            ..
+        } => {
+            let before_arms = arms_before
+                .iter()
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend));
+            let after_arms = arms_after
+                .iter()
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend));
+            // Two-phase match so an irrefutable suspending pattern (e.g. `n`) does not
+            // make later arms unreachable when the await-guard is stripped for enter.
+            quote! {
+                #(#before)*
+                let __scrut: #scrut_ty = #scrutinee;
+                match ::core::clone::Clone::clone(&__scrut) {
+                    #(#before_arms)*
+                    _ => {
+                        match ::core::clone::Clone::clone(&__scrut) {
+                            #sus_pat => {
+                                #go_wait
+                            }
+                            #(#after_arms)*
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn emit_sync_arm_with_join(
+    arm: &syn::Arm,
+    goto_join: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let attrs = &arm.attrs;
+    let pat = &arm.pat;
+    let guard = match &arm.guard {
+        Some((_, g)) => quote! { if #g },
+        None => quote! {},
+    };
+    match arm.body.as_ref() {
+        Expr::Block(b) => {
+            let stmts = &b.block.stmts;
+            quote! {
+                #(#attrs)*
+                #pat #guard => {
+                    #(#stmts)*
+                    #goto_join
+                }
+            }
+        }
+        body => quote! {
+            #(#attrs)*
+            #pat #guard => {
+                #body;
+                #goto_join
+            }
+        },
+    }
+}
+
+fn emit_arm_body(arm: &syn::Arm) -> proc_macro2::TokenStream {
+    let attrs = &arm.attrs;
+    let pat = &arm.pat;
+    let guard = match &arm.guard {
+        Some((_, g)) => quote! { if #g },
+        None => quote! {},
+    };
+    let body = &arm.body;
+    quote! {
+        #(#attrs)*
+        #pat #guard => #body,
     }
 }
 
@@ -1270,8 +1739,47 @@ fn gen_after_resume(
                 },
             }
         }
-        SuspendKind::IfThen { after_await, .. } | SuspendKind::IfElse { after_await, .. } => {
+        SuspendKind::MatchScrutinee { arms } => {
+            let tmp = &ap.tmp;
+            let arm_tokens = arms.iter().map(emit_arm_body);
+            quote! {
+                match #tmp {
+                    #(#arm_tokens)*
+                }
+            }
+        }
+        SuspendKind::IfThen { after_await, .. }
+        | SuspendKind::IfElse { after_await, .. }
+        | SuspendKind::MatchArm { after_await, .. } => {
             quote! { #(#after_await)* }
+        }
+        SuspendKind::MatchGuard {
+            sus_pat,
+            sus_body,
+            arms_after,
+            ..
+        } => {
+            let tmp = &ap.tmp;
+            let else_branch = if arms_after.is_empty() {
+                quote! {}
+            } else {
+                let after_tokens = arms_after.iter().map(emit_arm_body);
+                quote! {
+                    match __scrut {
+                        #(#after_tokens)*
+                    }
+                }
+            };
+            quote! {
+                if #tmp {
+                    match __scrut {
+                        #sus_pat => #sus_body,
+                        _ => ::core::unreachable!("match guard passed but pattern failed"),
+                    }
+                } else {
+                    #else_branch
+                }
+            }
         }
         SuspendKind::Loop { after_await, .. } | SuspendKind::For { after_await, .. } => {
             rewrite_loop_after_await(index, after_await, join_caps)
@@ -1401,7 +1909,13 @@ fn contains_await(expr: &Expr) -> bool {
         Expr::Let(e) => contains_await(&e.expr),
         Expr::Loop(e) => e.body.stmts.iter().any(stmt_contains_await),
         Expr::Match(e) => {
-            contains_await(&e.expr) || e.arms.iter().any(|a| contains_await(&a.body))
+            contains_await(&e.expr)
+                || e.arms.iter().any(|a| {
+                    contains_await(&a.body)
+                        || a.guard
+                            .as_ref()
+                            .is_some_and(|(_, g)| contains_await(g))
+                })
         }
         Expr::MethodCall(e) => contains_await(&e.receiver) || e.args.iter().any(contains_await),
         Expr::Paren(e) => contains_await(&e.expr),
