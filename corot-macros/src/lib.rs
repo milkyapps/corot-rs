@@ -10,6 +10,8 @@ use syn::{
 ///
 /// - `let name: T = expr.await?` when the fn returns `Result<(), E>` (settle
 ///   `Result<T, E>`; `Err` finishes with `Poll::Ready(Err(...))`)
+/// - `return` / `return <expr>` before or after an await (rewritten to finish the
+///   coroutine with `Poll::Ready(...)`)
 /// - `if` / `if let`: condition/scrutinee, then, else, or else-if chain
 /// - `let…else`: await in the initializer or in the `else` block
 /// - `match`: scrutinee, one arm body, or one guard
@@ -487,6 +489,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             &waiting_variant(&awaits[0].name),
             &captures_at_await[0],
             &join_caps_at[0],
+            &ready_ok,
         );
         step_arms.push(quote! {
             Self::NotStarted => {
@@ -535,16 +538,18 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     ..
                 } => {
                     let goto_after = gen_goto_join(ap, i, &join_caps_at[i]);
+                    let before_await_toks =
+                        emit_stmts_rewrite_returns(before_await, &ready_ok);
                     let some_body = if *has_body_await {
                         let go_wait = gen_go_waiting(&var, caps, &ap.base);
                         quote! {
-                            #(#before_await)*
+                            #before_await_toks
                             #go_wait
                         }
                     } else {
                         let goto_head = gen_goto_loop_head(i, ap, &join_caps_at[i]);
                         quote! {
-                            #(#before_await)*
+                            #before_await_toks
                             #goto_head
                         }
                     };
@@ -563,9 +568,11 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 }
                 SuspendKind::Loop { before_await, .. } => {
                     let go_wait = gen_go_waiting(&var, caps, &ap.base);
+                    let before_await_toks =
+                        emit_stmts_rewrite_returns(before_await, &ready_ok);
                     step_arms.push(quote! {
                         Self::#head_var { #(#head_pats,)* } => {
-                            #(#before_await)*
+                            #before_await_toks
                             #go_wait
                         }
                     });
@@ -615,6 +622,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             let join_caps = effective_join_caps(ap, &join_caps_at[i]);
             let join_pats: Vec<_> = join_caps.iter().map(cap_pat).collect();
             let join_stmts = join_stmts_of(ap).unwrap_or(&[]);
+            let join_toks = emit_stmts_rewrite_returns(join_stmts, &ready_ok);
             let after_join = gen_join_tail(
                 i,
                 &awaits,
@@ -625,7 +633,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             );
             step_arms.push(quote! {
                 Self::#after_var { #(#join_pats,)* } => {
-                    #(#join_stmts)*
+                    #join_toks
                     #after_join
                 }
             });
@@ -1532,6 +1540,16 @@ fn result_arg(ty: &Type, idx: usize) -> Option<Type> {
     }
 }
 
+fn emit_stmts_rewrite_returns(
+    stmts: &[Stmt],
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let parts = stmts
+        .iter()
+        .map(|s| emit_stmt_rewrite_returns(s, ready_ok));
+    quote! { #(#parts)* }
+}
+
 fn emit_stmt_rewrite_returns(
     stmt: &Stmt,
     ready_ok: &proc_macro2::TokenStream,
@@ -1568,29 +1586,74 @@ fn emit_expr_rewrite_returns(
     ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     match expr {
-        Expr::Return(ret) => match &ret.expr {
-            None => quote! {{
-                *self = Self::Finished;
-                break 'step ::core::result::Result::Ok(#ready_ok);
-            }},
-            Some(e) => {
-                if let Some(finish) = as_result_finish_expr(e, ready_ok) {
-                    finish
-                } else {
-                    quote! { #expr }
+        Expr::Return(ret) => emit_return_finish(ret.expr.as_deref(), ready_ok),
+        Expr::Block(b) => {
+            let stmts = emit_stmts_rewrite_returns(&b.block.stmts, ready_ok);
+            quote! {{ #stmts }}
+        }
+        Expr::If(expr_if) => {
+            let cond = &expr_if.cond;
+            let then_stmts = emit_stmts_rewrite_returns(&expr_if.then_branch.stmts, ready_ok);
+            match &expr_if.else_branch {
+                None => quote! {
+                    if #cond {
+                        #then_stmts
+                    }
+                },
+                Some((_, else_expr)) => {
+                    let else_body = emit_expr_rewrite_returns(else_expr, ready_ok);
+                    quote! {
+                        if #cond {
+                            #then_stmts
+                        } else #else_body
+                    }
                 }
             }
-        },
-        Expr::Block(b) => {
-            let stmts = b
-                .block
-                .stmts
-                .iter()
-                .map(|s| emit_stmt_rewrite_returns(s, ready_ok));
-            quote! {{
-                #(#stmts)*
-            }}
         }
+        Expr::Match(m) => {
+            let scrut = &m.expr;
+            let arms = m.arms.iter().map(|a| emit_arm_body(a, ready_ok));
+            quote! {
+                match #scrut {
+                    #(#arms)*
+                }
+            }
+        }
+        Expr::Loop(l) => {
+            let body = emit_stmts_rewrite_returns(&l.body.stmts, ready_ok);
+            let label = &l.label;
+            quote! {
+                #label loop {
+                    #body
+                }
+            }
+        }
+        Expr::While(w) => {
+            let cond = &w.cond;
+            let body = emit_stmts_rewrite_returns(&w.body.stmts, ready_ok);
+            let label = &w.label;
+            quote! {
+                #label while #cond {
+                    #body
+                }
+            }
+        }
+        Expr::ForLoop(f) => {
+            let pat = &f.pat;
+            let iter = &f.expr;
+            let body = emit_stmts_rewrite_returns(&f.body.stmts, ready_ok);
+            let label = &f.label;
+            quote! {
+                #label for #pat in #iter {
+                    #body
+                }
+            }
+        }
+        Expr::Paren(p) => {
+            let inner = emit_expr_rewrite_returns(&p.expr, ready_ok);
+            quote! { (#inner) }
+        }
+        Expr::Group(g) => emit_expr_rewrite_returns(&g.expr, ready_ok),
         other => {
             if let Some(finish) = as_result_finish_expr(other, ready_ok) {
                 finish
@@ -1598,6 +1661,23 @@ fn emit_expr_rewrite_returns(
                 quote! { #other }
             }
         }
+    }
+}
+
+/// Rewrite `return` / `return <expr>` into coroutine completion inside `step`.
+fn emit_return_finish(
+    value: Option<&Expr>,
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match value {
+        None => quote! {{
+            *self = Self::Finished;
+            break 'step ::core::result::Result::Ok(#ready_ok);
+        }},
+        Some(e) => quote! {{
+            *self = Self::Finished;
+            break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(#e));
+        }},
     }
 }
 
@@ -1617,18 +1697,16 @@ fn emit_completion_stmts(
     }
     let last = stmts.last().unwrap();
     let prefix = &stmts[..stmts.len() - 1];
-    let prefix_toks = prefix
-        .iter()
-        .map(|s| emit_stmt_rewrite_returns(s, ready_ok));
+    let prefix_toks = emit_stmts_rewrite_returns(prefix, ready_ok);
     if let Some(finish) = as_result_finish_stmt(last, ready_ok) {
         quote! {
-            #(#prefix_toks)*
+            #prefix_toks
             #finish
         }
     } else {
         let last_tok = emit_stmt_rewrite_returns(last, ready_ok);
         quote! {
-            #(#prefix_toks)*
+            #prefix_toks
             #last_tok
             #default_finish
         }
@@ -1640,13 +1718,9 @@ fn as_result_finish_stmt(
     ready_ok: &proc_macro2::TokenStream,
 ) -> Option<proc_macro2::TokenStream> {
     match stmt {
-        Stmt::Expr(Expr::Return(ret), _) => match &ret.expr {
-            None => Some(quote! {{
-                *self = Self::Finished;
-                break 'step ::core::result::Result::Ok(#ready_ok);
-            }}),
-            Some(e) => as_result_finish_expr(e, ready_ok),
-        },
+        Stmt::Expr(Expr::Return(ret), _) => {
+            Some(emit_return_finish(ret.expr.as_deref(), ready_ok))
+        }
         // Trailing expression (no `;`) — typical `Ok(())` / `Err(e)` fn tail.
         Stmt::Expr(expr, None) => as_result_finish_expr(expr, ready_ok),
         _ => None,
@@ -2198,21 +2272,26 @@ fn emit_else_suspend(
     es: &ElseSuspend,
     go_wait: &proc_macro2::TokenStream,
     non_suspend: &proc_macro2::TokenStream,
+    ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     match es {
-        ElseSuspend::FinalBlock { before_await } => quote! {
-            #(#before_await)*
-            #go_wait
-        },
+        ElseSuspend::FinalBlock { before_await } => {
+            let before = emit_stmts_rewrite_returns(before_await, ready_ok);
+            quote! {
+                #before
+                #go_wait
+            }
+        }
         ElseSuspend::ElseIfThen {
             cond,
             before_await,
             rest_else,
         } => {
-            let else_body = else_expr_tokens(rest_else);
+            let before = emit_stmts_rewrite_returns(before_await, ready_ok);
+            let else_body = else_expr_tokens(rest_else, ready_ok);
             quote! {
                 if #cond {
-                    #(#before_await)*
+                    #before
                     #go_wait
                 } else {
                     #else_body
@@ -2225,11 +2304,11 @@ fn emit_else_suspend(
             then_branch,
             rest,
         } => {
-            let then_stmts = &then_branch.stmts;
-            let rest_code = emit_else_suspend(rest, go_wait, non_suspend);
+            let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
+            let rest_code = emit_else_suspend(rest, go_wait, non_suspend, ready_ok);
             quote! {
                 if #cond {
-                    #(#then_stmts)*
+                    #then_stmts
                     #non_suspend
                 } else {
                     #rest_code
@@ -2487,9 +2566,12 @@ fn cap_pat(b: &Binding) -> proc_macro2::TokenStream {
     }
 }
 
-fn else_expr_tokens(else_branch: &Option<Box<Expr>>) -> proc_macro2::TokenStream {
+fn else_expr_tokens(
+    else_branch: &Option<Box<Expr>>,
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     match else_branch {
-        Some(e) => quote! { #e },
+        Some(e) => emit_expr_rewrite_returns(e, ready_ok),
         None => quote! { {} },
     }
 }
@@ -2556,8 +2638,9 @@ fn gen_enter_await(
     waiting_var: &Ident,
     caps: &[Binding],
     join_caps: &[Binding],
+    ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
-    let before = &ap.before;
+    let before = emit_stmts_rewrite_returns(&ap.before, ready_ok);
     let go_wait = gen_go_waiting(waiting_var, caps, &ap.base);
     let join_caps = effective_join_caps(ap, join_caps);
     let non_suspend = gen_goto_join(ap, index, &join_caps);
@@ -2567,13 +2650,13 @@ fn gen_enter_await(
         | SuspendKind::IfCondition { .. }
         | SuspendKind::IfLetScrutinee { .. }
         | SuspendKind::MatchScrutinee { .. } => quote! {
-            #(#before)*
+            #before
             #go_wait
         },
         SuspendKind::Loop { .. } => {
             let goto_head = gen_goto_loop_head(index, ap, &join_caps);
             quote! {
-                #(#before)*
+                #before
                 #goto_head
             }
         }
@@ -2592,7 +2675,7 @@ fn gen_enter_await(
                     quote! { #n }
                 });
                 quote! {
-                    #(#before)*
+                    #before
                     let _ = #base;
                     *self = Self::#iter_var {
                         #(#join_moves,)*
@@ -2605,7 +2688,7 @@ fn gen_enter_await(
                     .as_ref()
                     .expect("sync for must have iter_expr");
                 quote! {
-                    #(#before)*
+                    #before
                     let mut __iter: #iter_ty = ::core::iter::IntoIterator::into_iter(#expr);
                     #goto_head
                 }
@@ -2617,11 +2700,12 @@ fn gen_enter_await(
             else_branch,
             ..
         } => {
-            let else_body = else_expr_tokens(else_branch);
+            let before_await = emit_stmts_rewrite_returns(before_await, ready_ok);
+            let else_body = else_expr_tokens(else_branch, ready_ok);
             quote! {
-                #(#before)*
+                #before
                 if #cond {
-                    #(#before_await)*
+                    #before_await
                     #go_wait
                 } else {
                     #else_body
@@ -2635,12 +2719,12 @@ fn gen_enter_await(
             else_suspend,
             ..
         } => {
-            let then_stmts = &then_branch.stmts;
-            let else_body = emit_else_suspend(else_suspend, &go_wait, &non_suspend);
+            let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
+            let else_body = emit_else_suspend(else_suspend, &go_wait, &non_suspend, ready_ok);
             quote! {
-                #(#before)*
+                #before
                 if #cond {
-                    #(#then_stmts)*
+                    #then_stmts
                     #non_suspend
                 } else {
                     #else_body
@@ -2653,12 +2737,13 @@ fn gen_enter_await(
             before_await,
             ..
         } => {
+            let before_await = emit_stmts_rewrite_returns(before_await, ready_ok);
             quote! {
-                #(#before)*
+                #before
                 if let #pat = #init {
                     #non_suspend
                 } else {
-                    #(#before_await)*
+                    #before_await
                     #go_wait
                 }
             }
@@ -2674,20 +2759,21 @@ fn gen_enter_await(
         } => {
             let before_arms = arms_before
                 .iter()
-                .map(|a| emit_sync_arm_with_join(a, &non_suspend));
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok));
             let after_arms = arms_after
                 .iter()
-                .map(|a| emit_sync_arm_with_join(a, &non_suspend));
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok));
+            let before_await = emit_stmts_rewrite_returns(before_await, ready_ok);
             let guard = match sus_guard {
                 Some(g) => quote! { if #g },
                 None => quote! {},
             };
             quote! {
-                #(#before)*
+                #before
                 match #scrutinee {
                     #(#before_arms)*
                     #sus_pat #guard => {
-                        #(#before_await)*
+                        #before_await
                         #go_wait
                     }
                     #(#after_arms)*
@@ -2704,12 +2790,12 @@ fn gen_enter_await(
         } => {
             let before_arms = arms_before
                 .iter()
-                .map(|a| emit_sync_arm_with_join(a, &non_suspend));
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok));
             let after_arms = arms_after
                 .iter()
-                .map(|a| emit_sync_arm_with_join(a, &non_suspend));
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok));
             quote! {
-                #(#before)*
+                #before
                 let __scrut: #scrut_ty = #scrutinee;
                 match ::core::clone::Clone::clone(&__scrut) {
                     #(#before_arms)*
@@ -2730,6 +2816,7 @@ fn gen_enter_await(
 fn emit_sync_arm_with_join(
     arm: &syn::Arm,
     goto_join: &proc_macro2::TokenStream,
+    ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     let attrs = &arm.attrs;
     let pat = &arm.pat;
@@ -2739,33 +2826,39 @@ fn emit_sync_arm_with_join(
     };
     match arm.body.as_ref() {
         Expr::Block(b) => {
-            let stmts = &b.block.stmts;
+            let stmts = emit_stmts_rewrite_returns(&b.block.stmts, ready_ok);
             quote! {
                 #(#attrs)*
                 #pat #guard => {
-                    #(#stmts)*
+                    #stmts
                     #goto_join
                 }
             }
         }
-        body => quote! {
-            #(#attrs)*
-            #pat #guard => {
-                #body;
-                #goto_join
+        body => {
+            let body = emit_expr_rewrite_returns(body, ready_ok);
+            quote! {
+                #(#attrs)*
+                #pat #guard => {
+                    #body;
+                    #goto_join
+                }
             }
-        },
+        }
     }
 }
 
-fn emit_arm_body(arm: &syn::Arm) -> proc_macro2::TokenStream {
+fn emit_arm_body(
+    arm: &syn::Arm,
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     let attrs = &arm.attrs;
     let pat = &arm.pat;
     let guard = match &arm.guard {
         Some((_, g)) => quote! { if #g },
         None => quote! {},
     };
-    let body = &arm.body;
+    let body = emit_expr_rewrite_returns(&arm.body, ready_ok);
     quote! {
         #(#attrs)*
         #pat #guard => #body,
@@ -2799,26 +2892,26 @@ fn gen_after_resume(
 
     let rest = match &ap.kind {
         SuspendKind::Plain { after_resume } => {
-            let parts = after_resume
-                .iter()
-                .map(|s| emit_stmt_rewrite_returns(s, ready_ok));
-            quote! { #(#parts)* }
+            emit_stmts_rewrite_returns(after_resume, ready_ok)
         }
         SuspendKind::IfCondition {
             resume_cond,
             then_branch,
             else_branch,
         } => {
-            let then_stmts = &then_branch.stmts;
+            let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
             match else_branch {
-                Some(e) => quote! {
-                    if #resume_cond {
-                        #(#then_stmts)*
-                    } else #e;
-                },
+                Some(e) => {
+                    let else_body = emit_expr_rewrite_returns(e, ready_ok);
+                    quote! {
+                        if #resume_cond {
+                            #then_stmts
+                        } else #else_body;
+                    }
+                }
                 None => quote! {
                     if #resume_cond {
-                        #(#then_stmts)*
+                        #then_stmts
                     }
                 },
             }
@@ -2829,23 +2922,26 @@ fn gen_after_resume(
             else_branch,
         } => {
             let tmp = &ap.tmp;
-            let then_stmts = &then_branch.stmts;
+            let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
             match else_branch {
-                Some(e) => quote! {
-                    if let #pat = #tmp {
-                        #(#then_stmts)*
-                    } else #e;
-                },
+                Some(e) => {
+                    let else_body = emit_expr_rewrite_returns(e, ready_ok);
+                    quote! {
+                        if let #pat = #tmp {
+                            #then_stmts
+                        } else #else_body;
+                    }
+                }
                 None => quote! {
                     if let #pat = #tmp {
-                        #(#then_stmts)*
+                        #then_stmts
                     }
                 },
             }
         }
         SuspendKind::MatchScrutinee { arms } => {
             let tmp = &ap.tmp;
-            let arm_tokens = arms.iter().map(emit_arm_body);
+            let arm_tokens = arms.iter().map(|a| emit_arm_body(a, ready_ok));
             quote! {
                 match #tmp {
                     #(#arm_tokens)*
@@ -2854,7 +2950,7 @@ fn gen_after_resume(
         }
         SuspendKind::IfThen { after_await, .. }
         | SuspendKind::MatchArm { after_await, .. } => {
-            quote! { #(#after_await)* }
+            emit_stmts_rewrite_returns(after_await, ready_ok)
         }
         SuspendKind::IfElse {
             else_suspend,
@@ -2866,32 +2962,33 @@ fn gen_after_resume(
                 rest_else,
             } => {
                 let tmp = &ap.tmp;
-                let then_stmts = &then_branch.stmts;
+                let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
                 match rest_else {
-                    Some(e) => quote! {
-                        if #tmp {
-                            #(#then_stmts)*
-                        } else #e;
-                    },
+                    Some(e) => {
+                        let else_body = emit_expr_rewrite_returns(e, ready_ok);
+                        quote! {
+                            if #tmp {
+                                #then_stmts
+                            } else #else_body;
+                        }
+                    }
                     None => quote! {
                         if #tmp {
-                            #(#then_stmts)*
+                            #then_stmts
                         }
                     },
                 }
             }
-            _ => quote! { #(#after_await)* },
+            _ => emit_stmts_rewrite_returns(after_await, ready_ok),
         },
         SuspendKind::LetElseAwait { after_await, .. } => {
-            let parts = after_await
-                .iter()
-                .map(|s| emit_stmt_rewrite_returns(s, ready_ok));
+            let parts = emit_stmts_rewrite_returns(after_await, ready_ok);
             let has_return = after_await.iter().any(stmt_has_return);
             if has_return {
-                quote! { #(#parts)* }
+                parts
             } else {
                 quote! {
-                    #(#parts)*
+                    #parts
                     *self = Self::Finished;
                     break 'step ::core::result::Result::Ok(#ready_ok);
                 }
@@ -2904,10 +3001,11 @@ fn gen_after_resume(
             ..
         } => {
             let tmp = &ap.tmp;
+            let sus_body = emit_expr_rewrite_returns(sus_body, ready_ok);
             let else_branch = if arms_after.is_empty() {
                 quote! {}
             } else {
-                let after_tokens = arms_after.iter().map(emit_arm_body);
+                let after_tokens = arms_after.iter().map(|a| emit_arm_body(a, ready_ok));
                 quote! {
                     match __scrut {
                         #(#after_tokens)*
@@ -2926,7 +3024,7 @@ fn gen_after_resume(
             }
         }
         SuspendKind::Loop { after_await, .. } | SuspendKind::For { after_await, .. } => {
-            rewrite_loop_after_await(index, after_await, join_caps)
+            rewrite_loop_after_await(index, after_await, join_caps, ready_ok)
         }
     };
 
@@ -2940,8 +3038,11 @@ fn rewrite_loop_after_await(
     index: usize,
     stmts: &[Stmt],
     join_caps: &[Binding],
+    ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
-    let parts = stmts.iter().map(|stmt| rewrite_loop_stmt(stmt, index, join_caps));
+    let parts = stmts
+        .iter()
+        .map(|stmt| rewrite_loop_stmt(stmt, index, join_caps, ready_ok));
     quote! { #(#parts)* }
 }
 
@@ -2949,8 +3050,12 @@ fn rewrite_loop_stmt(
     stmt: &Stmt,
     index: usize,
     join_caps: &[Binding],
+    ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     match stmt {
+        Stmt::Expr(Expr::Return(ret), _) => {
+            emit_return_finish(ret.expr.as_deref(), ready_ok)
+        }
         Stmt::Expr(Expr::Break(brk), _) if brk.label.is_none() && brk.expr.is_none() => {
             let var = after_loop_variant(index);
             let fields = join_caps.iter().map(|b| {
@@ -2970,7 +3075,7 @@ fn rewrite_loop_stmt(
                 .then_branch
                 .stmts
                 .iter()
-                .map(|s| rewrite_loop_stmt(s, index, join_caps));
+                .map(|s| rewrite_loop_stmt(s, index, join_caps, ready_ok));
             match &expr_if.else_branch {
                 None => quote! {
                     if #cond {
@@ -2983,7 +3088,7 @@ fn rewrite_loop_stmt(
                             .block
                             .stmts
                             .iter()
-                            .map(|s| rewrite_loop_stmt(s, index, join_caps));
+                            .map(|s| rewrite_loop_stmt(s, index, join_caps, ready_ok));
                         quote! {
                             if #cond {
                                 #(#then_parts)*
@@ -2992,15 +3097,28 @@ fn rewrite_loop_stmt(
                             }
                         }
                     }
-                    other => quote! {
-                        if #cond {
-                            #(#then_parts)*
-                        } else #other;
-                    },
+                    other => {
+                        let else_body = emit_expr_rewrite_returns(other, ready_ok);
+                        quote! {
+                            if #cond {
+                                #(#then_parts)*
+                            } else #else_body;
+                        }
+                    }
                 },
             }
         }
-        other => quote! { #other },
+        Stmt::Expr(Expr::Block(b), _) => {
+            let parts = b
+                .block
+                .stmts
+                .iter()
+                .map(|s| rewrite_loop_stmt(s, index, join_caps, ready_ok));
+            quote! {{
+                #(#parts)*
+            }}
+        }
+        other => emit_stmt_rewrite_returns(other, ready_ok),
     }
 }
 
@@ -3026,6 +3144,7 @@ fn gen_join_tail(
             &next_var,
             next_caps,
             &join_caps_at[next_i],
+            ready_ok,
         )
     }
 }
