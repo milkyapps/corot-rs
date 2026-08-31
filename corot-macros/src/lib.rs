@@ -67,12 +67,19 @@ enum SuspendKind {
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
     },
+    /// `loop { before; let name: Ty = ….await; after; }` with optional `break`.
+    Loop {
+        before_await: Vec<Stmt>,
+        after_await: Vec<Stmt>,
+        join_stmts: Vec<Stmt>,
+    },
 }
 
 #[derive(Clone)]
 struct Binding {
     name: Ident,
     ty: Type,
+    mutable: bool,
 }
 
 struct PlainAwait {
@@ -119,7 +126,8 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
         match &ap.kind {
             SuspendKind::IfThen { before_await, .. }
-            | SuspendKind::IfElse { before_await, .. } => {
+            | SuspendKind::IfElse { before_await, .. }
+            | SuspendKind::Loop { before_await, .. } => {
                 for stmt in before_await {
                     if let Some(b) = typed_let_binding(stmt) {
                         upsert_binding(&mut live, b);
@@ -167,8 +175,18 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             }
         });
 
-        if needs_after_if(&ap.kind) {
-            let after_var = after_if_variant(i);
+        if is_loop_kind(&ap.kind) {
+            let head_var = loop_head_variant(i);
+            let head_fields = join_caps_at[i].iter().map(|b| field_tokens(b));
+            variants.push(quote! {
+                #head_var {
+                    #(#head_fields,)*
+                }
+            });
+        }
+
+        if needs_join(&ap.kind) {
+            let after_var = join_variant(&ap.kind, i);
             let join_fields = join_caps_at[i].iter().map(|b| field_tokens(b));
             variants.push(quote! {
                 #after_var {
@@ -213,16 +231,12 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             }
         });
     } else {
-        let non_suspend = if needs_after_if(&awaits[0].kind) {
-            gen_goto_after_if(0, &join_caps_at[0])
-        } else {
-            quote! { ::core::unreachable!("no non-suspend path") }
-        };
         let enter = gen_enter_await(
+            0,
             &awaits[0],
             &waiting_variant(&awaits[0].name),
             &captures_at_await[0],
-            non_suspend,
+            &join_caps_at[0],
         );
         step_arms.push(quote! {
             Self::NotStarted => {
@@ -237,20 +251,29 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         let caps = &captures_at_await[i];
         let tmp = &ap.tmp;
 
-        let cap_pats: Vec<_> = caps
-            .iter()
-            .map(|b| {
-                let n = &b.name;
-                quote! { #n }
-            })
-            .collect();
+        let cap_pats: Vec<_> = caps.iter().map(cap_pat).collect();
+
+        if is_loop_kind(&ap.kind) {
+            let head_var = loop_head_variant(i);
+            let head_pats: Vec<_> = join_caps_at[i].iter().map(cap_pat).collect();
+            let before_await = loop_before_await(ap);
+            let go_wait = gen_go_waiting(&var, caps, &ap.base);
+            step_arms.push(quote! {
+                Self::#head_var { #(#head_pats,)* } => {
+                    #(#before_await)*
+                    #go_wait
+                }
+            });
+        }
 
         let guard = rehydration_guard(&rehyd_name, &var, caps);
-        let after_resume = gen_after_resume(ap);
-        let tail = if needs_after_if(&ap.kind) {
-            gen_goto_after_if(i, &join_caps_at[i])
-        } else {
-            gen_join_tail(i, &awaits, &captures_at_await, &join_caps_at, &after_last)
+        let after_resume = gen_after_resume(i, ap, &join_caps_at[i]);
+        let tail = match &ap.kind {
+            SuspendKind::Loop { .. } => gen_goto_loop_head(i, &join_caps_at[i]),
+            SuspendKind::IfThen { .. } | SuspendKind::IfElse { .. } => {
+                gen_goto_join(ap, i, &join_caps_at[i])
+            }
+            _ => gen_join_tail(i, &awaits, &captures_at_await, &join_caps_at, &after_last),
         };
 
         step_arms.push(quote! {
@@ -262,13 +285,10 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             }
         });
 
-        if needs_after_if(&ap.kind) {
-            let after_var = after_if_variant(i);
+        if needs_join(&ap.kind) {
+            let after_var = join_variant(&ap.kind, i);
             let join_caps = &join_caps_at[i];
-            let join_pats = join_caps.iter().map(|b| {
-                let n = &b.name;
-                quote! { #n }
-            });
+            let join_pats: Vec<_> = join_caps.iter().map(cap_pat).collect();
             let join_stmts = join_stmts_of(ap).unwrap_or(&[]);
             let after_join =
                 gen_join_tail(i, &awaits, &captures_at_await, &join_caps_at, &after_last);
@@ -384,8 +404,8 @@ fn split_awaits(stmts: &[Stmt]) -> syn::Result<(Vec<AwaitPoint>, Vec<Stmt>)> {
         } else if stmt_contains_await(stmt) {
             return Err(syn::Error::new_spanned(
                 stmt,
-                "#[corot] unsupported await placement (supported: typed let, or if with await \
-                 in condition / then / else)",
+                "#[corot] unsupported await placement (supported: typed let; if with await \
+                 in condition / then / else; loop with one await)",
             ));
         } else {
             current.push(stmt.clone());
@@ -408,7 +428,10 @@ fn as_await_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>> {
             },
         }));
     }
-    as_await_if_stmt(stmt, index)
+    if let Some(ap) = as_await_if_stmt(stmt, index)? {
+        return Ok(Some(ap));
+    }
+    as_await_loop_stmt(stmt)
 }
 
 fn as_plain_await_let(stmt: &Stmt) -> syn::Result<Option<PlainAwait>> {
@@ -571,6 +594,39 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
     }
 }
 
+fn as_await_loop_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
+    let Stmt::Expr(Expr::Loop(expr_loop), _) = stmt else {
+        return Ok(None);
+    };
+    if expr_loop.label.is_some() {
+        return Err(syn::Error::new_spanned(
+            stmt,
+            "#[corot] labeled loops are not supported yet",
+        ));
+    }
+    if !expr_loop.body.stmts.iter().any(stmt_contains_await) {
+        return Ok(None);
+    }
+    let (before_await, plain, after_await) =
+        extract_single_await_from_stmts(&expr_loop.body.stmts)?;
+    Ok(Some(AwaitPoint {
+        name: plain.name,
+        tmp: plain.tmp,
+        wait_ty: plain.wait_ty,
+        base: plain.base,
+        before: Vec::new(),
+        kind: SuspendKind::Loop {
+            before_await,
+            after_await: {
+                let mut v = plain.after_resume;
+                v.extend(after_await);
+                v
+            },
+            join_stmts: Vec::new(),
+        },
+    }))
+}
+
 fn bare_await_base(cond: &Expr) -> Option<Expr> {
     match cond {
         Expr::Await(a) => Some(a.base.as_ref().clone()),
@@ -631,33 +687,63 @@ fn extract_single_await_from_stmts(
 fn after_resume_stmts(ap: &AwaitPoint) -> Vec<&Stmt> {
     match &ap.kind {
         SuspendKind::Plain { after_resume } => after_resume.iter().collect(),
-        SuspendKind::IfThen { after_await, .. } | SuspendKind::IfElse { after_await, .. } => {
-            after_await.iter().collect()
-        }
+        SuspendKind::IfThen { after_await, .. }
+        | SuspendKind::IfElse { after_await, .. }
+        | SuspendKind::Loop { after_await, .. } => after_await.iter().collect(),
         SuspendKind::IfCondition { .. } => Vec::new(),
     }
 }
 
-fn needs_after_if(kind: &SuspendKind) -> bool {
-    matches!(kind, SuspendKind::IfThen { .. } | SuspendKind::IfElse { .. })
+fn needs_join(kind: &SuspendKind) -> bool {
+    matches!(
+        kind,
+        SuspendKind::IfThen { .. } | SuspendKind::IfElse { .. } | SuspendKind::Loop { .. }
+    )
+}
+
+fn is_loop_kind(kind: &SuspendKind) -> bool {
+    matches!(kind, SuspendKind::Loop { .. })
 }
 
 fn after_if_variant(index: usize) -> Ident {
     format_ident!("AfterIf{}", index)
 }
 
+fn after_loop_variant(index: usize) -> Ident {
+    format_ident!("AfterLoop{}", index)
+}
+
+fn loop_head_variant(index: usize) -> Ident {
+    format_ident!("LoopHead{}", index)
+}
+
+fn join_variant(kind: &SuspendKind, index: usize) -> Ident {
+    if is_loop_kind(kind) {
+        after_loop_variant(index)
+    } else {
+        after_if_variant(index)
+    }
+}
+
 fn join_stmts_of(ap: &AwaitPoint) -> Option<&[Stmt]> {
     match &ap.kind {
-        SuspendKind::IfThen { join_stmts, .. } | SuspendKind::IfElse { join_stmts, .. } => {
-            Some(join_stmts.as_slice())
-        }
+        SuspendKind::IfThen { join_stmts, .. }
+        | SuspendKind::IfElse { join_stmts, .. }
+        | SuspendKind::Loop { join_stmts, .. } => Some(join_stmts.as_slice()),
         _ => None,
+    }
+}
+
+fn loop_before_await(ap: &AwaitPoint) -> &[Stmt] {
+    match &ap.kind {
+        SuspendKind::Loop { before_await, .. } => before_await.as_slice(),
+        _ => &[],
     }
 }
 
 fn assign_join_stmts(awaits: &mut [AwaitPoint], after_last: &mut Vec<Stmt>) {
     for i in 0..awaits.len() {
-        if !needs_after_if(&awaits[i].kind) {
+        if !needs_join(&awaits[i].kind) {
             continue;
         }
         let join = if i + 1 < awaits.len() {
@@ -666,7 +752,9 @@ fn assign_join_stmts(awaits: &mut [AwaitPoint], after_last: &mut Vec<Stmt>) {
             std::mem::take(after_last)
         };
         match &mut awaits[i].kind {
-            SuspendKind::IfThen { join_stmts, .. } | SuspendKind::IfElse { join_stmts, .. } => {
+            SuspendKind::IfThen { join_stmts, .. }
+            | SuspendKind::IfElse { join_stmts, .. }
+            | SuspendKind::Loop { join_stmts, .. } => {
                 *join_stmts = join;
             }
             _ => {}
@@ -688,6 +776,15 @@ fn field_tokens(b: &Binding) -> proc_macro2::TokenStream {
     }
 }
 
+fn cap_pat(b: &Binding) -> proc_macro2::TokenStream {
+    let n = &b.name;
+    if b.mutable {
+        quote! { mut #n }
+    } else {
+        quote! { #n }
+    }
+}
+
 fn else_expr_tokens(else_branch: &Option<Box<Expr>>) -> proc_macro2::TokenStream {
     match else_branch {
         Some(e) => quote! { #e },
@@ -695,8 +792,22 @@ fn else_expr_tokens(else_branch: &Option<Box<Expr>>) -> proc_macro2::TokenStream
     }
 }
 
-fn gen_goto_after_if(index: usize, join_caps: &[Binding]) -> proc_macro2::TokenStream {
-    let var = after_if_variant(index);
+fn gen_goto_join(ap: &AwaitPoint, index: usize, join_caps: &[Binding]) -> proc_macro2::TokenStream {
+    let var = join_variant(&ap.kind, index);
+    let fields = join_caps.iter().map(|b| {
+        let n = &b.name;
+        quote! { #n }
+    });
+    quote! {
+        *self = Self::#var {
+            #(#fields,)*
+        };
+        continue 'step;
+    }
+}
+
+fn gen_goto_loop_head(index: usize, join_caps: &[Binding]) -> proc_macro2::TokenStream {
+    let var = loop_head_variant(index);
     let fields = join_caps.iter().map(|b| {
         let n = &b.name;
         quote! { #n }
@@ -725,19 +836,28 @@ fn gen_go_waiting(var: &Ident, caps: &[Binding], base: &Expr) -> proc_macro2::To
 }
 
 fn gen_enter_await(
+    index: usize,
     ap: &AwaitPoint,
     waiting_var: &Ident,
     caps: &[Binding],
-    non_suspend_tail: proc_macro2::TokenStream,
+    join_caps: &[Binding],
 ) -> proc_macro2::TokenStream {
     let before = &ap.before;
     let go_wait = gen_go_waiting(waiting_var, caps, &ap.base);
+    let non_suspend = gen_goto_join(ap, index, join_caps);
 
     match &ap.kind {
         SuspendKind::Plain { .. } | SuspendKind::IfCondition { .. } => quote! {
             #(#before)*
             #go_wait
         },
+        SuspendKind::Loop { .. } => {
+            let goto_head = gen_goto_loop_head(index, join_caps);
+            quote! {
+                #(#before)*
+                #goto_head
+            }
+        }
         SuspendKind::IfThen {
             cond,
             before_await,
@@ -752,7 +872,7 @@ fn gen_enter_await(
                     #go_wait
                 } else {
                     #else_body
-                    #non_suspend_tail
+                    #non_suspend
                 }
             }
         }
@@ -767,7 +887,7 @@ fn gen_enter_await(
                 #(#before)*
                 if #cond {
                     #(#then_stmts)*
-                    #non_suspend_tail
+                    #non_suspend
                 } else {
                     #(#before_await)*
                     #go_wait
@@ -777,7 +897,11 @@ fn gen_enter_await(
     }
 }
 
-fn gen_after_resume(ap: &AwaitPoint) -> proc_macro2::TokenStream {
+fn gen_after_resume(
+    index: usize,
+    ap: &AwaitPoint,
+    join_caps: &[Binding],
+) -> proc_macro2::TokenStream {
     match &ap.kind {
         SuspendKind::Plain { after_resume } => quote! { #(#after_resume)* },
         SuspendKind::IfCondition {
@@ -802,10 +926,81 @@ fn gen_after_resume(ap: &AwaitPoint) -> proc_macro2::TokenStream {
         SuspendKind::IfThen { after_await, .. } | SuspendKind::IfElse { after_await, .. } => {
             quote! { #(#after_await)* }
         }
+        SuspendKind::Loop { after_await, .. } => {
+            rewrite_loop_after_await(index, after_await, join_caps)
+        }
     }
 }
 
-/// Continuation after await `completed_i` is fully done (including AfterIf join).
+fn rewrite_loop_after_await(
+    index: usize,
+    stmts: &[Stmt],
+    join_caps: &[Binding],
+) -> proc_macro2::TokenStream {
+    let parts = stmts.iter().map(|stmt| rewrite_loop_stmt(stmt, index, join_caps));
+    quote! { #(#parts)* }
+}
+
+fn rewrite_loop_stmt(
+    stmt: &Stmt,
+    index: usize,
+    join_caps: &[Binding],
+) -> proc_macro2::TokenStream {
+    match stmt {
+        Stmt::Expr(Expr::Break(brk), _) if brk.label.is_none() && brk.expr.is_none() => {
+            let var = after_loop_variant(index);
+            let fields = join_caps.iter().map(|b| {
+                let n = &b.name;
+                quote! { #n }
+            });
+            quote! {
+                *self = Self::#var {
+                    #(#fields,)*
+                };
+                continue 'step;
+            }
+        }
+        Stmt::Expr(Expr::If(expr_if), _) => {
+            let cond = &expr_if.cond;
+            let then_parts = expr_if
+                .then_branch
+                .stmts
+                .iter()
+                .map(|s| rewrite_loop_stmt(s, index, join_caps));
+            match &expr_if.else_branch {
+                None => quote! {
+                    if #cond {
+                        #(#then_parts)*
+                    }
+                },
+                Some((_, else_expr)) => match else_expr.as_ref() {
+                    Expr::Block(b) => {
+                        let else_parts = b
+                            .block
+                            .stmts
+                            .iter()
+                            .map(|s| rewrite_loop_stmt(s, index, join_caps));
+                        quote! {
+                            if #cond {
+                                #(#then_parts)*
+                            } else {
+                                #(#else_parts)*
+                            }
+                        }
+                    }
+                    other => quote! {
+                        if #cond {
+                            #(#then_parts)*
+                        } else #other;
+                    },
+                },
+            }
+        }
+        other => quote! { #other },
+    }
+}
+
+/// Continuation after await `completed_i` is fully done (including join).
 fn gen_join_tail(
     completed_i: usize,
     awaits: &[AwaitPoint],
@@ -824,12 +1019,13 @@ fn gen_join_tail(
         let next = &awaits[next_i];
         let next_var = waiting_variant(&next.name);
         let next_caps = &captures_at_await[next_i];
-        let non_suspend = if needs_after_if(&next.kind) {
-            gen_goto_after_if(next_i, &join_caps_at[next_i])
-        } else {
-            quote! { ::core::unreachable!("no non-suspend path") }
-        };
-        gen_enter_await(next, &next_var, next_caps, non_suspend)
+        gen_enter_await(
+            next_i,
+            next,
+            &next_var,
+            next_caps,
+            &join_caps_at[next_i],
+        )
     }
 }
 
@@ -982,13 +1178,16 @@ fn typed_let_binding(stmt: &Stmt) -> Option<Binding> {
     let Pat::Type(PatType { pat, ty, .. }) = pat else {
         return None;
     };
-    let name = match pat_ident(pat) {
-        Ok(n) => n,
-        Err(_) => return None,
+    let (name, mutable) = match pat.as_ref() {
+        Pat::Ident(PatIdent {
+            ident, mutability, ..
+        }) => (ident.clone(), mutability.is_some()),
+        _ => return None,
     };
     Some(Binding {
         name,
         ty: ty.as_ref().clone(),
+        mutable,
     })
 }
 
@@ -1005,6 +1204,7 @@ fn pat_ident(pat: &Pat) -> syn::Result<Ident> {
 fn upsert_binding(live: &mut Vec<Binding>, b: Binding) {
     if let Some(existing) = live.iter_mut().find(|x| x.name == b.name) {
         existing.ty = b.ty;
+        existing.mutable |= b.mutable;
     } else {
         live.push(b);
     }
@@ -1153,8 +1353,8 @@ fn make_rehydration(
             });
         }
 
-        if needs_after_if(&ap.kind) {
-            let after_var = after_if_variant(i);
+        if needs_join(&ap.kind) {
+            let after_var = join_variant(&ap.kind, i);
             let join_caps = &join_caps_at[i];
             let skip_in_join: Vec<_> = join_caps.iter().filter(|b| is_skip_serde(&b.ty)).collect();
             if skip_in_join.is_empty() {
@@ -1179,6 +1379,13 @@ fn make_rehydration(
                     }
                 });
             }
+        }
+
+        if is_loop_kind(&ap.kind) {
+            let head_var = loop_head_variant(i);
+            arms.push(quote! {
+                Self::#head_var { .. } => #rehyd_name::Ok
+            });
         }
     }
 
@@ -1222,10 +1429,16 @@ fn make_getters(
                     Self::#var { #name, .. } => ::core::option::Option::Some(#name),
                 });
             }
-            if needs_after_if(&ap.kind) && join_caps_at[i].iter().any(|c| c.name == *name) {
-                let after_var = after_if_variant(i);
+            if needs_join(&ap.kind) && join_caps_at[i].iter().any(|c| c.name == *name) {
+                let after_var = join_variant(&ap.kind, i);
                 arms.push(quote! {
                     Self::#after_var { #name, .. } => ::core::option::Option::Some(#name),
+                });
+            }
+            if is_loop_kind(&ap.kind) && join_caps_at[i].iter().any(|c| c.name == *name) {
+                let head_var = loop_head_variant(i);
+                arms.push(quote! {
+                    Self::#head_var { #name, .. } => ::core::option::Option::Some(#name),
                 });
             }
         }
