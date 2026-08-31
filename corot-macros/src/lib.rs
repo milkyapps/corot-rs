@@ -50,9 +50,12 @@ use syn::{
 /// - `let…else`: await in the initializer or in the `else` block
 /// - `match`: scrutinee, arm bodies (including **multiple exclusive suspending
 ///   arms**), one guard, or guard+body (dual-region); suspending arms may use
-///   `Some`/`Ok`/`Err`/tuple/`@`/`|` patterns (scrutinee via literals or `val::<T>`)
-/// - `for`: range literal or `iter::<I>(…)`, optional body await; item pattern may
-///   be a tuple / `Some` / `Ok` / `Err` when `I`'s item type is known (`Vec`, ranges, …);
+///   `Some`/`Ok`/`Err`/tuple/struct/tuple-struct/slice/`@`/`|` patterns
+///   (scrutinee via literals, `val::<T>`, or `val_fields::<T, Fields>` for
+///   struct/custom tuple-struct field types)
+/// - `for`: range literal, `iter::<I>(…)`, or `iter_fields::<I, Fields>(…)`;
+///   optional body await; item patterns may be tuple / `Some`/`Ok`/`Err` /
+///   struct / tuple-struct / slice when item (and field) types are known;
 ///   iterable await + body awaits (dual-region) supported
 /// - `while` / `while let`: await in the condition/scrutinee, the body, or **both**
 ///   (dual-region via `WaitingCond`)
@@ -3386,8 +3389,12 @@ fn expand_for_stmt(
     }
     if has_body_await {
         let item_pat = (*expr_for.pat).clone();
-        let (into_ty, source) = resolve_for_iterable(&expr_for.expr)?;
-        let item_binds = bindings_from_pat(&item_pat, &into_item_ty(&into_ty))?;
+        let (into_ty, field_tys, source) = resolve_for_iterable(&expr_for.expr)?;
+        let item_binds = bindings_from_pat_with_fields(
+            &item_pat,
+            &into_item_ty(&into_ty),
+            field_tys.as_ref(),
+        )?;
         let (iter_expr, iter_await_base) = match source {
             ForIterSource::Sync(e) => (Some(e), None),
             ForIterSource::Await(e) => (None, Some(e)),
@@ -3773,7 +3780,8 @@ fn expand_match_stmt(
         return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
     }
 
-    let scrut_ty = infer_match_scrutinee_ty(&expr_match.expr, &expr_match.arms)?;
+    let (scrut_ty, field_tys) =
+        infer_match_scrutinee_and_fields(&expr_match.expr, &expr_match.arms)?;
     let scrutinee = expr_match.expr.as_ref().clone();
     let expr_bind_c = expr_bind.clone();
     let arm_len = sus_indices.len();
@@ -3791,7 +3799,8 @@ fn expand_match_stmt(
                 "#[corot] internal: suspending match arm has no await",
             ));
         }
-        let pat_binds = bindings_from_pat(&sus.pat, &scrut_ty)?;
+        let pat_binds =
+            bindings_from_pat_with_fields(&sus.pat, &scrut_ty, field_tys.as_ref())?;
         let (units, trailing) = extract_body_units(&body_stmts, err_ty)?;
         let body_len = units_await_count(&units);
         arm_parts.push((
@@ -4066,8 +4075,12 @@ fn as_await_for_stmt(
     }
 
     let item_pat = (*expr_for.pat).clone();
-    let (into_ty, source) = resolve_for_iterable(&expr_for.expr)?;
-    let item_binds = bindings_from_pat(&item_pat, &into_item_ty(&into_ty))?;
+    let (into_ty, field_tys, source) = resolve_for_iterable(&expr_for.expr)?;
+    let item_binds = bindings_from_pat_with_fields(
+        &item_pat,
+        &into_item_ty(&into_ty),
+        field_tys.as_ref(),
+    )?;
     let (iter_expr, iter_await_base) = match source {
         ForIterSource::Sync(expr) => (Some(expr), None),
         ForIterSource::Await(base) => (None, Some(base)),
@@ -4131,18 +4144,34 @@ enum ForIterSource {
     Await(Expr),
 }
 
-/// Resolve `for x in EXPR` into the `IntoIterator` type and the sync/await source.
-fn resolve_for_iterable(expr: &Expr) -> syn::Result<(Type, ForIterSource)> {
-    // `something.await` (whole `in` expression)
+/// Resolve `for x in EXPR` into the `IntoIterator` type, optional field-type
+/// tuple (from `iter_fields`), and the sync/await source.
+fn resolve_for_iterable(expr: &Expr) -> syn::Result<(Type, Option<Type>, ForIterSource)> {
     if let Some(base) = bare_await_base(expr) {
-        let (into_ty, inner) = into_ty_from_expr(&base)?;
-        return Ok((into_ty, ForIterSource::Await(inner)));
+        let (into_ty, fields, inner) = into_ty_from_expr(&base)?;
+        return Ok((into_ty, fields, ForIterSource::Await(inner)));
     }
 
-    // `iter::<I>(arg.await)` or `iter::<I>(arg)`
+    if let Some((into_ty, fields, arg)) = as_corot_iter_fields_call(expr) {
+        if let Some(base) = bare_await_base(&arg) {
+            return Ok((
+                into_ty,
+                Some(fields),
+                ForIterSource::Await(unwrap_parens(base)),
+            ));
+        }
+        if contains_await(&arg) {
+            return Err(syn::Error::new_spanned(
+                &arg,
+                "#[corot] await inside `iter_fields::<I, Fields>(…)` must be a bare `expr.await`",
+            ));
+        }
+        return Ok((into_ty, Some(fields), ForIterSource::Sync(arg)));
+    }
+
     if let Some((into_ty, arg)) = as_corot_iter_call(expr) {
         if let Some(base) = bare_await_base(&arg) {
-            return Ok((into_ty, ForIterSource::Await(unwrap_parens(base))));
+            return Ok((into_ty, None, ForIterSource::Await(unwrap_parens(base))));
         }
         if contains_await(&arg) {
             return Err(syn::Error::new_spanned(
@@ -4150,32 +4179,34 @@ fn resolve_for_iterable(expr: &Expr) -> syn::Result<(Type, ForIterSource)> {
                 "#[corot] await inside `iter::<I>(…)` must be a bare `expr.await`",
             ));
         }
-        return Ok((into_ty, ForIterSource::Sync(arg)));
+        return Ok((into_ty, None, ForIterSource::Sync(arg)));
     }
 
-    // Range literal sugar: `0..3`
     if let Some(into_ty) = try_range_into_ty(expr) {
-        return Ok((into_ty, ForIterSource::Sync(expr.clone())));
+        return Ok((into_ty, None, ForIterSource::Sync(expr.clone())));
     }
 
     Err(syn::Error::new_spanned(
         expr,
         "#[corot] for-await needs a range literal (`0..3`) or \
-         `iter::<I>(…)` / `corot_rs::iter::<I>(…)` where `I` is the IntoIterator \
-         type (e.g. `iter::<Vec<i32>>(v)`)",
+         `iter::<I>(…)` / `iter_fields::<I, Fields>(…)` where `I` is the \
+         IntoIterator type (e.g. `iter::<Vec<i32>>(v)`)",
     ))
 }
 
-fn into_ty_from_expr(expr: &Expr) -> syn::Result<(Type, Expr)> {
+fn into_ty_from_expr(expr: &Expr) -> syn::Result<(Type, Option<Type>, Expr)> {
+    if let Some((into_ty, fields, arg)) = as_corot_iter_fields_call(expr) {
+        return Ok((into_ty, Some(fields), arg));
+    }
     if let Some((into_ty, arg)) = as_corot_iter_call(expr) {
-        return Ok((into_ty, arg));
+        return Ok((into_ty, None, arg));
     }
     if let Some(into_ty) = try_range_into_ty(expr) {
-        return Ok((into_ty, unwrap_parens(expr.clone())));
+        return Ok((into_ty, None, unwrap_parens(expr.clone())));
     }
     Err(syn::Error::new_spanned(
         expr,
-        "#[corot] awaited for-iterable must be a range or `iter::<I>(…)`",
+        "#[corot] awaited for-iterable must be a range or `iter::<I>(…)` / `iter_fields::<…>(…)`",
     ))
 }
 
@@ -4210,6 +4241,42 @@ fn as_corot_iter_call(expr: &Expr) -> Option<(Type, Expr)> {
     };
     Some((ty.clone(), call.args.first().unwrap().clone()))
 }
+
+/// `iter_fields::<I, Fields>(arg)` — field types for struct/tuple-struct `for` pats.
+fn as_corot_iter_fields_call(expr: &Expr) -> Option<(Type, Type, Expr)> {
+    let expr = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        Expr::Group(g) => g.expr.as_ref(),
+        other => other,
+    };
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    if call.args.len() != 1 {
+        return None;
+    }
+    let Expr::Path(path) = call.func.as_ref() else {
+        return None;
+    };
+    let seg = path.path.segments.last()?;
+    if seg.ident != "iter_fields" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    if args.args.len() != 2 {
+        return None;
+    }
+    let syn::GenericArgument::Type(ty) = args.args.first()? else {
+        return None;
+    };
+    let syn::GenericArgument::Type(fields) = args.args.iter().nth(1)? else {
+        return None;
+    };
+    Some((ty.clone(), fields.clone(), call.args.first().unwrap().clone()))
+}
+
 
 fn into_item_ty(into_ty: &Type) -> Type {
     concrete_into_item_ty(into_ty).unwrap_or_else(|| {
@@ -4318,7 +4385,9 @@ fn as_effect_call(expr: &Expr) -> syn::Result<Option<EffectCall>> {
     };
     if as_corot_call(expr).is_some()
         || as_val_call(expr).is_some()
+        || as_val_fields_call(expr).is_some()
         || as_corot_iter_call(expr).is_some()
+        || as_corot_iter_fields_call(expr).is_some()
     {
         return Ok(None);
     }
@@ -4331,7 +4400,7 @@ fn as_effect_call(expr: &Expr) -> syn::Result<Option<EffectCall>> {
     // Skip turbofish helpers we don't treat as effects.
     if matches!(
         seg.ident.to_string().as_str(),
-        "call" | "val" | "iter"
+        "call" | "val" | "val_fields" | "iter" | "iter_fields"
     ) {
         return Ok(None);
     }
@@ -4545,8 +4614,45 @@ fn as_val_call(expr: &Expr) -> Option<(Type, Expr)> {
     Some((ty.clone(), call.args.first().unwrap().clone()))
 }
 
+/// `val_fields::<T, Fields>(arg)` — field-type tuple for struct/tuple-struct patterns.
+fn as_val_fields_call(expr: &Expr) -> Option<(Type, Type, Expr)> {
+    let expr = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        Expr::Group(g) => g.expr.as_ref(),
+        other => other,
+    };
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    if call.args.len() != 1 {
+        return None;
+    }
+    let Expr::Path(path) = call.func.as_ref() else {
+        return None;
+    };
+    let seg = path.path.segments.last()?;
+    if seg.ident != "val_fields" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    if args.args.len() != 2 {
+        return None;
+    }
+    let syn::GenericArgument::Type(ty) = args.args.first()? else {
+        return None;
+    };
+    let syn::GenericArgument::Type(fields) = args.args.iter().nth(1)? else {
+        return None;
+    };
+    Some((ty.clone(), fields.clone(), call.args.first().unwrap().clone()))
+}
+
 fn strip_val_call(expr: Expr) -> Expr {
     if let Some((_, inner)) = as_val_call(&expr) {
+        inner
+    } else if let Some((_, _, inner)) = as_val_fields_call(&expr) {
         inner
     } else {
         expr
@@ -4628,6 +4734,14 @@ fn resolve_scrut_ty(pat: &Pat, scrut: &Expr) -> syn::Result<Type> {
 }
 
 fn bindings_from_pat(pat: &Pat, scrut_ty: &Type) -> syn::Result<Vec<Binding>> {
+    bindings_from_pat_with_fields(pat, scrut_ty, None)
+}
+
+fn bindings_from_pat_with_fields(
+    pat: &Pat,
+    scrut_ty: &Type,
+    field_tys: Option<&Type>,
+) -> syn::Result<Vec<Binding>> {
     match pat {
         Pat::Ident(p) if p.subpat.is_none() => Ok(vec![Binding {
             name: p.ident.clone(),
@@ -4638,17 +4752,16 @@ fn bindings_from_pat(pat: &Pat, scrut_ty: &Type) -> syn::Result<Vec<Binding>> {
             let Some((_, sub)) = &p.subpat else {
                 return Ok(Vec::new());
             };
-            // `x @ PAT` — x has scrut type; also recurse into PAT.
             let mut out = vec![Binding {
                 name: p.ident.clone(),
                 ty: scrut_ty.clone(),
                 mutable: p.mutability.is_some(),
             }];
-            out.extend(bindings_from_pat(sub, scrut_ty)?);
+            out.extend(bindings_from_pat_with_fields(sub, scrut_ty, field_tys)?);
             Ok(out)
         }
         Pat::Type(pt) => {
-            let inner = bindings_from_pat(&pt.pat, pt.ty.as_ref())?;
+            let inner = bindings_from_pat_with_fields(&pt.pat, pt.ty.as_ref(), field_tys)?;
             if inner.is_empty() {
                 if let Ok(name) = pat_ident(&pt.pat) {
                     return Ok(vec![Binding {
@@ -4668,7 +4781,7 @@ fn bindings_from_pat(pat: &Pat, scrut_ty: &Type) -> syn::Result<Vec<Binding>> {
                      (use `val::<Option<T>>(…)`)",
                 )
             })?;
-            bindings_from_pat(&p.elems[0], &inner_ty)
+            bindings_from_pat_with_fields(&p.elems[0], &inner_ty, None)
         }
         Pat::TupleStruct(p) if p.path.is_ident("Ok") && p.elems.len() == 1 => {
             let inner_ty = result_ok_ty(scrut_ty).ok_or_else(|| {
@@ -4677,7 +4790,7 @@ fn bindings_from_pat(pat: &Pat, scrut_ty: &Type) -> syn::Result<Vec<Binding>> {
                     "#[corot] `Ok(…)` pattern requires scrutinee type `Result<T, E>`",
                 )
             })?;
-            bindings_from_pat(&p.elems[0], &inner_ty)
+            bindings_from_pat_with_fields(&p.elems[0], &inner_ty, None)
         }
         Pat::TupleStruct(p) if p.path.is_ident("Err") && p.elems.len() == 1 => {
             let inner_ty = result_err_ty(scrut_ty).ok_or_else(|| {
@@ -4686,7 +4799,51 @@ fn bindings_from_pat(pat: &Pat, scrut_ty: &Type) -> syn::Result<Vec<Binding>> {
                     "#[corot] `Err(…)` pattern requires scrutinee type `Result<T, E>`",
                 )
             })?;
-            bindings_from_pat(&p.elems[0], &inner_ty)
+            bindings_from_pat_with_fields(&p.elems[0], &inner_ty, None)
+        }
+        Pat::TupleStruct(p) => {
+            // Custom tuple-struct: `Pair(a, b)` — types from `val_fields` / hints.
+            bindings_from_ordered_fields(
+                pat,
+                p.elems.iter().collect(),
+                field_tys,
+                "tuple-struct",
+            )
+        }
+        Pat::Struct(p) => {
+            let field_pats: Vec<&Pat> = p
+                .fields
+                .iter()
+                .map(|f| f.pat.as_ref())
+                .collect();
+            bindings_from_ordered_fields(pat, field_pats, field_tys, "struct")
+        }
+        Pat::Slice(p) => {
+            let elem_ty = array_or_slice_elem_ty(scrut_ty).ok_or_else(|| {
+                syn::Error::new_spanned(
+                    pat,
+                    "#[corot] slice/array pattern requires scrutinee/item type `[T; N]`, \
+                     `[T]`, or `&[T]` (use `val::<[T; N]>(…)` / `iter::<Vec<T>>(…)`)",
+                )
+            })?;
+            let mut out = Vec::new();
+            for elem in &p.elems {
+                if matches!(elem, Pat::Rest(_)) {
+                    continue;
+                }
+                // `xs @ ..`
+                if let Pat::Ident(id) = elem {
+                    if id.subpat.as_ref().is_some_and(|(_, s)| matches!(s.as_ref(), Pat::Rest(_)))
+                    {
+                        return Err(syn::Error::new_spanned(
+                            elem,
+                            "#[corot] `ident @ ..` rest bindings are not supported yet",
+                        ));
+                    }
+                }
+                out.extend(bindings_from_pat_with_fields(elem, &elem_ty, None)?);
+            }
+            Ok(out)
         }
         Pat::Tuple(p) => {
             let Type::Tuple(tt) = scrut_ty else {
@@ -4704,28 +4861,129 @@ fn bindings_from_pat(pat: &Pat, scrut_ty: &Type) -> syn::Result<Vec<Binding>> {
             }
             let mut out = Vec::new();
             for (elem_pat, elem_ty) in p.elems.iter().zip(tt.elems.iter()) {
-                out.extend(bindings_from_pat(elem_pat, elem_ty)?);
+                out.extend(bindings_from_pat_with_fields(elem_pat, elem_ty, None)?);
             }
             Ok(out)
         }
-        Pat::Paren(p) => bindings_from_pat(&p.pat, scrut_ty),
-        Pat::Reference(p) => bindings_from_pat(&p.pat, scrut_ty),
+        Pat::Paren(p) => bindings_from_pat_with_fields(&p.pat, scrut_ty, field_tys),
+        Pat::Reference(p) => bindings_from_pat_with_fields(&p.pat, scrut_ty, field_tys),
         Pat::Or(p) => {
-            // Bindings must be the same across arms; take from first case.
             if let Some(first) = p.cases.first() {
-                bindings_from_pat(first, scrut_ty)
+                bindings_from_pat_with_fields(first, scrut_ty, field_tys)
             } else {
                 Ok(Vec::new())
             }
         }
-        Pat::Wild(_) | Pat::Lit(_) | Pat::Path(_) | Pat::Const(_) => Ok(Vec::new()),
+        Pat::Wild(_) | Pat::Lit(_) | Pat::Path(_) | Pat::Const(_) | Pat::Rest(_) | Pat::Range(_) => {
+            Ok(Vec::new())
+        }
         other => Err(syn::Error::new_spanned(
             other,
             "#[corot] unsupported pattern for suspending match arm / for loop \
-             (supported: ident, `@`, `_`, literals, paths, `Some`/`Ok`/`Err`, tuples, `|`)",
+             (supported: ident, `@`, `_`, literals, paths, `Some`/`Ok`/`Err`, tuples, \
+             structs, custom tuple-structs, slices/arrays, `|`)",
         )),
     }
 }
+
+/// Bind each subpattern using `field_tys` tuple (pattern order) or `@`/nested hints.
+fn bindings_from_ordered_fields(
+    span_pat: &Pat,
+    field_pats: Vec<&Pat>,
+    field_tys: Option<&Type>,
+    kind: &str,
+) -> syn::Result<Vec<Binding>> {
+    let tys: Option<Vec<Type>> = match field_tys {
+        Some(Type::Tuple(t)) => Some(t.elems.iter().cloned().collect()),
+        Some(other) if field_pats.len() == 1 => Some(vec![other.clone()]),
+        Some(other) => {
+            return Err(syn::Error::new_spanned(
+                other,
+                format!(
+                    "#[corot] `val_fields`/`iter_fields` Fields must be a tuple of \
+                     {kind} binding types (pattern order)"
+                ),
+            ));
+        }
+        None => None,
+    };
+    if let Some(tys) = &tys {
+        if tys.len() != field_pats.len() {
+            return Err(syn::Error::new_spanned(
+                span_pat,
+                format!(
+                    "#[corot] Fields tuple arity ({}) does not match number of {kind} \
+                     fields in the pattern ({})",
+                    tys.len(),
+                    field_pats.len()
+                ),
+            ));
+        }
+    }
+    let mut out = Vec::new();
+    for (i, fp) in field_pats.iter().enumerate() {
+        if matches!(fp, Pat::Wild(_) | Pat::Lit(_) | Pat::Path(_) | Pat::Const(_) | Pat::Rest(_)) {
+            continue;
+        }
+        if let Some(tys) = &tys {
+            out.extend(bindings_from_pat_with_fields(fp, &tys[i], None)?);
+            continue;
+        }
+        if let Some(hint) = pattern_type_hint(fp)? {
+            out.extend(bindings_from_pat_with_fields(fp, &hint, None)?);
+            continue;
+        }
+        // Nested structures that can type themselves (Some/tuple/slice) still work
+        // when the field's own pattern carries enough info — try with a dummy and
+        // see; better: attempt without scrut for nested Option etc. only if path known.
+        if matches!(
+            fp,
+            Pat::TupleStruct(_) | Pat::Tuple(_) | Pat::Slice(_) | Pat::Struct(_)
+        ) {
+            return Err(syn::Error::new_spanned(
+                *fp,
+                format!(
+                    "#[corot] nested patterns in {kind} fields need `val_fields`/`iter_fields` \
+                     or a typed `@` hint on each binding"
+                ),
+            ));
+        }
+        return Err(syn::Error::new_spanned(
+            *fp,
+            format!(
+                "#[corot] {kind} field binding needs a type; use \
+                 `val_fields::<T, (FieldTys…)>(…)` / `iter_fields::<I, (FieldTys…)>(…)` \
+                 (tuple order = pattern field order) or an `@` literal hint (`x @ 0`)"
+            ),
+        ));
+    }
+    Ok(out)
+}
+
+fn array_or_slice_elem_ty(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Array(a) => Some(a.elem.as_ref().clone()),
+        Type::Slice(s) => Some(s.elem.as_ref().clone()),
+        Type::Reference(r) => array_or_slice_elem_ty(&r.elem),
+        Type::Path(p) => {
+            // `Vec<T>` / similar when used as for-item via concrete_into — not here.
+            let seg = p.path.segments.last()?;
+            if seg.ident == "Vec" || seg.ident == "VecDeque" || seg.ident == "Slice" {
+                let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+                    return None;
+                };
+                match args.args.first()? {
+                    syn::GenericArgument::Type(t) => Some(t.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 
 fn option_inner_ty(ty: &Type) -> Option<Type> {
     let Type::Path(p) = ty else {
@@ -5423,7 +5681,8 @@ fn as_await_match_stmt(
             }))
         }
         (false, Some(ai), None) => {
-            let scrut_ty = infer_match_scrutinee_ty(&expr_match.expr, &expr_match.arms)?;
+            let (scrut_ty, field_tys) =
+                infer_match_scrutinee_and_fields(&expr_match.expr, &expr_match.arms)?;
             let sus = &expr_match.arms[ai];
             if sus
                 .guard
@@ -5436,7 +5695,8 @@ fn as_await_match_stmt(
                 ));
             }
             check_supported_pat(&sus.pat)?;
-            let pat_binds = bindings_from_pat(&sus.pat, &scrut_ty)?;
+            let pat_binds =
+                bindings_from_pat_with_fields(&sus.pat, &scrut_ty, field_tys.as_ref())?;
             let stmts = expr_as_stmts(&sus.body);
             let (before_await, plain, after_await) =
                 extract_single_await_from_stmts(&stmts, err_ty)?;
@@ -5556,8 +5816,27 @@ fn check_supported_pat(pat: &Pat) -> syn::Result<()> {
             }
             Ok(())
         }
-        Pat::Wild(_) | Pat::Lit(_) | Pat::Const(_) => Ok(()),
+        Pat::Wild(_) | Pat::Lit(_) | Pat::Const(_) | Pat::Rest(_) => Ok(()),
         Pat::Path(p) if p.qself.is_none() => Ok(()),
+        Pat::Range(p) => {
+            if let Some(start) = &p.start {
+                if contains_await(start) {
+                    return Err(syn::Error::new_spanned(
+                        start,
+                        "#[corot] await in range patterns is not supported",
+                    ));
+                }
+            }
+            if let Some(end) = &p.end {
+                if contains_await(end) {
+                    return Err(syn::Error::new_spanned(
+                        end,
+                        "#[corot] await in range patterns is not supported",
+                    ));
+                }
+            }
+            Ok(())
+        }
         Pat::Type(p) => check_supported_pat(&p.pat),
         Pat::Paren(p) => check_supported_pat(&p.pat),
         Pat::Reference(p) => check_supported_pat(&p.pat),
@@ -5567,11 +5846,23 @@ fn check_supported_pat(pat: &Pat) -> syn::Result<()> {
             }
             Ok(())
         }
-        Pat::TupleStruct(p)
-            if (p.path.is_ident("Some") || p.path.is_ident("Ok") || p.path.is_ident("Err"))
-                && p.elems.len() == 1 =>
-        {
-            check_supported_pat(&p.elems[0])
+        Pat::TupleStruct(p) => {
+            for e in &p.elems {
+                check_supported_pat(e)?;
+            }
+            Ok(())
+        }
+        Pat::Struct(p) => {
+            for f in &p.fields {
+                check_supported_pat(&f.pat)?;
+            }
+            Ok(())
+        }
+        Pat::Slice(p) => {
+            for e in &p.elems {
+                check_supported_pat(e)?;
+            }
+            Ok(())
         }
         Pat::Or(p) => {
             for case in &p.cases {
@@ -5582,10 +5873,12 @@ fn check_supported_pat(pat: &Pat) -> syn::Result<()> {
         other => Err(syn::Error::new_spanned(
             other,
             "#[corot] unsupported pattern when match arm/guard or for loop suspends \
-             (supported: ident, `@`, `_`, literals, paths, `Some`/`Ok`/`Err`, tuples, `|`)",
+             (supported: ident, `@`, `_`, literals, paths, `Some`/`Ok`/`Err`, tuples, \
+             structs, custom tuple-structs, slices/arrays, `|`)",
         )),
     }
 }
+
 
 fn simple_pat_idents(pat: &Pat) -> Vec<Ident> {
     match pat {
@@ -5625,6 +5918,28 @@ fn simple_pat_idents(pat: &Pat) -> Vec<Ident> {
             }
             out
         }
+        Pat::Struct(p) => {
+            let mut out = Vec::new();
+            for f in &p.fields {
+                for id in simple_pat_idents(&f.pat) {
+                    if !out.iter().any(|x| x == &id) {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        }
+        Pat::Slice(p) => {
+            let mut out = Vec::new();
+            for e in &p.elems {
+                for id in simple_pat_idents(e) {
+                    if !out.iter().any(|x| x == &id) {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        }
         Pat::Or(p) => {
             let mut out = Vec::new();
             for case in &p.cases {
@@ -5641,15 +5956,28 @@ fn simple_pat_idents(pat: &Pat) -> Vec<Ident> {
 }
 
 fn infer_match_scrutinee_ty(scrutinee: &Expr, arms: &[syn::Arm]) -> syn::Result<Type> {
+    Ok(infer_match_scrutinee_and_fields(scrutinee, arms)?.0)
+}
+
+fn infer_match_scrutinee_and_fields(
+    scrutinee: &Expr,
+    arms: &[syn::Arm],
+) -> syn::Result<(Type, Option<Type>)> {
+    if let Some((ty, fields, _)) = as_val_fields_call(scrutinee) {
+        return Ok((ty, Some(fields)));
+    }
     if let Some((ty, _)) = as_val_call(scrutinee) {
-        return Ok(ty);
+        return Ok((ty, None));
     }
     if let Some(base) = bare_await_base(scrutinee) {
+        if let Some((ty, fields, _)) = as_val_fields_call(&base) {
+            return Ok((ty, Some(fields)));
+        }
         if let Some((ty, _)) = as_val_call(&base) {
-            return Ok(ty);
+            return Ok((ty, None));
         }
     }
-    infer_match_scrut_ty(arms)
+    Ok((infer_match_scrut_ty(arms)?, None))
 }
 
 fn infer_match_scrut_ty(arms: &[syn::Arm]) -> syn::Result<Type> {
@@ -5741,7 +6069,14 @@ fn pattern_type_hint(pat: &Pat) -> syn::Result<Option<Type>> {
                 Ok(None)
             }
         }
-        Pat::Wild(_) | Pat::Path(_) | Pat::Const(_) => Ok(None),
+        Pat::Wild(_) | Pat::Path(_) | Pat::Const(_) | Pat::Rest(_) => Ok(None),
+        Pat::Struct(_) | Pat::Slice(_) => Ok(None),
+        Pat::TupleStruct(_) => Ok(None),
+        Pat::Range(p) => {
+            // `0..=10` / `0..10` — treat as i32 when endpoints are unsuffixed ints.
+            let tip = p.start.as_ref().or(p.end.as_ref());
+            Ok(int_lit_type(tip.map(|e| e.as_ref())))
+        }
         other => Err(syn::Error::new_spanned(
             other,
             "#[corot] cannot infer type from this match pattern",
