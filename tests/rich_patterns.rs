@@ -1,8 +1,6 @@
 //! Richer patterns on suspending `match` arms and `for` loops.
-//!
-//! Run: `cargo run -p corot-rs --example rich_patterns`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -70,7 +68,8 @@ async fn for_option_items() {
     println!("for-opt: done");
 }
 
-fn main() {
+#[test]
+fn test_rich_patterns() {
     println!("=== match Some(x) ===");
     let mut c = match_some_arm();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

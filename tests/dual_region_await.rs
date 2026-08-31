@@ -1,10 +1,8 @@
 //! Await in two regions of one construct.
-//!
-//! Run: `cargo run -p corot-rs --example dual_region_await`
 
 #![allow(unused_mut)]
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -117,7 +115,8 @@ async fn else_if_multi_body() {
     println!("eimb: done");
 }
 
-fn main() {
+#[test]
+fn test_dual_region_await() {
     println!("=== while cond + body ===");
     let mut c = while_cond_and_body();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

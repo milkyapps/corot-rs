@@ -1,10 +1,8 @@
 //! `while` / `while let` with await in the condition or the body.
-//!
-//! Run: `cargo run -p corot-rs --example while_await`
 
 #![allow(unused_mut)]
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -76,7 +74,8 @@ async fn while_continue() {
     println!("cont: done seen={seen}");
 }
 
-fn main() {
+#[test]
+fn test_while_await() {
     println!("=== while body await ===");
     let mut c = while_body_await();
     for expected in [10, 20, 30] {

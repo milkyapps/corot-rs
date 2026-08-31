@@ -2,12 +2,10 @@
 //!
 //! Also covers labeled `break 'lab value` and using the break value after
 //! a later await.
-//!
-//! Run: `cargo run -p corot-rs --example loop_break_value_await`
 
 #![allow(unused_mut, unreachable_code)]
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -81,7 +79,8 @@ async fn break_from_nested_for() {
     println!("nest: x={x}");
 }
 
-fn main() {
+#[test]
+fn test_loop_break_value_await() {
     println!("=== break value ===");
     let mut c = break_value();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

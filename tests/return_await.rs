@@ -2,10 +2,8 @@
 //!
 //! Rewritten to finish the coroutine with `Poll::Ready(...)` instead of
 //! returning from `step()`.
-//!
-//! Run: `cargo run -p corot-rs --example return_await`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -63,7 +61,8 @@ async fn return_ok_early() -> Result<(), &'static str> {
     Err("non-positive")
 }
 
-fn main() {
+#[test]
+fn test_return_await() {
     println!("=== return after await ===");
     let mut c = return_after_await();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

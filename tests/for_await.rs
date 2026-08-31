@@ -1,8 +1,6 @@
 //! `for` over ranges or any `IntoIterator` via `corot_rs::iter::<I>(…)`.
-//!
-//! Run: `cargo run -p corot-rs --example for_await`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 // --- range sugar (still supported) ---
@@ -80,7 +78,8 @@ fn run_vec_sync() {
     println!();
 }
 
-fn main() {
+#[test]
+fn test_for_await() {
     run_range();
     run_vec();
     run_vec_sync();

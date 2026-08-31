@@ -2,10 +2,8 @@
 //!
 //! The async fn must return `Result<(), E>`. Settling an `Err` finishes the
 //! coroutine with `Poll::Ready(Err(...))` without running later statements.
-//!
-//! Run: `cargo run -p corot-rs --example try_await`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -37,7 +35,8 @@ async fn try_err_second() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn main() {
+#[test]
+fn test_try_await() {
     println!("=== Ok path ===");
     let mut c = try_ok_path();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

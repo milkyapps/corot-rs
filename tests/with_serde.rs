@@ -1,6 +1,6 @@
+#![cfg(feature = "serde")]
+
 //! Richer serde demo: checkpoint mid-flight, then rehydrate skipped locals.
-//!
-//! Run: `cargo run --example with_serde --features serde`
 
 use corot_rs::{corot, SkipSerde};
 use std::task::Poll;
@@ -57,7 +57,8 @@ fn dump(label: &str, c: &CheckoutCoroutine) {
     println!("--- {label} ---\n{json}\n");
 }
 
-fn main() {
+#[test]
+fn test_with_serde() {
     println!("=== run A: step until first wait, checkpoint ===\n");
     let mut a = checkout();
     assert!(matches!(a.step(), Ok(Poll::Pending)));

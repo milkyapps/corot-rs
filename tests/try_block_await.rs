@@ -6,12 +6,10 @@
 //!
 //! Note: `try { }` is still unstable in rustc (soft warning); the macro desugars
 //! it away so the generated code is stable.
-//!
-//! Run: `cargo run -p corot-rs --example try_block_await`
 
 #![allow(unused_mut, unreachable_code)]
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 fn ok_i(n: i32) -> Result<i32, &'static str> {
@@ -103,7 +101,8 @@ async fn try_await_then_question() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn main() {
+#[test]
+fn test_try_block_await() {
     println!("=== general ? ok ===");
     let mut c = general_question_ok();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

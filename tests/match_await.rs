@@ -1,10 +1,8 @@
 //! Await in `match`: scrutinee, arm body, and guard.
 //!
 //! Rust allows `.await` in match guards; corot supports that as a bool settle.
-//!
-//! Run: `cargo run -p corot-rs --example match_await`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 // --- await on the scrutinee ---
@@ -129,7 +127,8 @@ fn run_guard() {
     println!();
 }
 
-fn main() {
+#[test]
+fn test_match_await() {
     run_scrutinee();
     run_arm();
     run_arm_skipped();

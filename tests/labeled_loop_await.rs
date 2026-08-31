@@ -2,12 +2,10 @@
 //!
 //! `continue` works before and after the await, and in sync `for` bodies.
 //! Unlabeled `break`/`continue` inside nested sync loops stay native.
-//!
-//! Run: `cargo run -p corot-rs --example labeled_loop_await`
 
 #![allow(unused_mut, unreachable_code)]
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -134,7 +132,8 @@ async fn continue_in_sync_for() {
     println!("syncfor: done");
 }
 
-fn main() {
+#[test]
+fn test_labeled_loop_await() {
     println!("=== labeled break ===");
     let mut c = labeled_break();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

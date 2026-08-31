@@ -1,10 +1,8 @@
 //! Multiple typed-let awaits inside one `loop` / `if` / `for` / `match` body.
-//!
-//! Run: `cargo run -p corot-rs --example multi_await_body`
 
 #![allow(unused_mut, unreachable_code)]
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -64,7 +62,8 @@ async fn multi_match() {
     println!("match: done");
 }
 
-fn main() {
+#[test]
+fn test_multi_await_body() {
     println!("=== multi loop ===");
     let mut c = multi_loop();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

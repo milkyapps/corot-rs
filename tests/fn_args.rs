@@ -1,10 +1,8 @@
 //! `#[corot]` async fns with typed arguments.
 //!
 //! Args are stored on `NotStarted` and captured across awaits like locals.
-//!
-//! Run: `cargo run -p corot-rs --example fn_args`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -48,7 +46,8 @@ async fn root_calls_leaf(seed: i32) {
     println!("root: done");
 }
 
-fn main() {
+#[test]
+fn test_fn_args() {
     println!("=== greet ===");
     let mut c = greet("Ada".into());
     assert!(matches!(c.step(), Ok(Poll::Pending)));

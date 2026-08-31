@@ -1,8 +1,6 @@
 //! Non-unit return types: `T` and `Result<T, E>`.
-//!
-//! Run: `cargo run -p corot-rs --example return_value`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -48,7 +46,8 @@ async fn result_await_err() -> Result<i32, &'static str> {
     Ok(n)
 }
 
-fn main() {
+#[test]
+fn test_return_value() {
     println!("=== -> i32 trailing ===");
     let mut c = add_after_await(10);
     assert!(matches!(c.step(), Ok(Poll::Pending)));

@@ -1,8 +1,6 @@
 //! Simple `loop` with one await inside (and `break`).
-//!
-//! Run: `cargo run --example loop_await`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -22,7 +20,8 @@ async fn count_loop() {
     println!("done");
 }
 
-fn main() {
+#[test]
+fn test_loop_await() {
     let mut c = count_loop();
 
     // iteration 1

@@ -1,10 +1,8 @@
 //! `if let` and `let…else` with await.
 //!
 //! Scrutinee types use `corot_rs::val::<T>(…)` (or literal patterns like `Some(0)`).
-//!
-//! Run: `cargo run --example if_let_await`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 // --- if let: await on scrutinee ---
@@ -138,7 +136,8 @@ async fn else_if_let_scrutinee_nested_skip() {
     println!("eils-nest: after");
 }
 
-fn main() {
+#[test]
+fn test_if_let_await() {
     println!("=== if let scrutinee ===");
     let mut c = if_let_scrutinee();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

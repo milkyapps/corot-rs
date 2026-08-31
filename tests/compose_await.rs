@@ -2,10 +2,8 @@
 //!
 //! The child is the generated coroutine enum (not a Rust `Future`). The parent
 //! drives `child.step()` / forwards `settle_wait` until `Poll::Ready`.
-//!
-//! Run: `cargo run -p corot-rs --example compose_await`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -33,7 +31,8 @@ async fn root() {
     println!("root: done");
 }
 
-fn main() {
+#[test]
+fn test_compose_await() {
     println!("=== compose root → mid → leaf ===");
     let mut c = root();
 

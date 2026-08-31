@@ -2,12 +2,10 @@
 //!
 //! Fallthrough trailing expressions and early `break 'label` (before the await)
 //! are supported. `continue` cannot target a block label.
-//!
-//! Run: `cargo run -p corot-rs --example labeled_block_await`
 
 #![allow(unused_mut, unreachable_code)]
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 #[corot]
@@ -76,7 +74,8 @@ async fn break_from_nested_for() {
     println!("nest: x={x}");
 }
 
-fn main() {
+#[test]
+fn test_labeled_block_await() {
     println!("=== break with value ===");
     let mut c = break_with_value();
     assert!(matches!(c.step(), Ok(Poll::Pending)));

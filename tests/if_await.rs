@@ -1,8 +1,6 @@
 //! Await inside `if`: condition, then, else, and else-if chains.
-//!
-//! Run: `cargo run --example if_await`
 
-use corot_macros::corot;
+use corot_rs::corot;
 use std::task::Poll;
 
 // --- await in the condition (bare `expr.await` → bool) ---
@@ -233,7 +231,8 @@ fn run_else_if_cond() {
     println!();
 }
 
-fn main() {
+#[test]
+fn test_if_await() {
     run_cond();
     run_then();
     run_then_skipped();
