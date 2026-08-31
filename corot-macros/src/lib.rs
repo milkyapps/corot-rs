@@ -8,7 +8,7 @@ use syn::{
 /// Suspension points: typed `let` awaits; `if` / `if let` / `let…else` / `loop` /
 /// `for` / `match` with a single await in a supported position.
 ///
-/// - `if` / `if let`: condition/scrutinee, then, or else
+/// - `if` / `if let`: condition/scrutinee, then, else, or else-if chain
 /// - `let…else`: await in the initializer or in the `else` block
 /// - `match`: scrutinee, one arm body, or one guard
 /// - `for`: range literal or `iter::<I>(…)`, optional body await
@@ -65,11 +65,11 @@ enum SuspendKind {
         /// Stmts after the `if` until the next await / end (run in `AfterIfN`).
         join_stmts: Vec<Stmt>,
     },
-    /// Await only inside the else branch (`if` or `if let`).
+    /// Await only inside the else branch / else-if chain (`if` or `if let`).
     IfElse {
         cond: Expr,
         then_branch: syn::Block,
-        before_await: Vec<Stmt>,
+        else_suspend: ElseSuspend,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
     },
@@ -141,6 +141,31 @@ enum SuspendKind {
     },
 }
 
+/// Where the single await lives inside an `else` / `else if` chain.
+enum ElseSuspend {
+    /// `else { before; await; after }`
+    FinalBlock {
+        before_await: Vec<Stmt>,
+    },
+    /// `else if COND { before; await; after } else REST`
+    ElseIfThen {
+        cond: Expr,
+        before_await: Vec<Stmt>,
+        rest_else: Option<Box<Expr>>,
+    },
+    /// `else if COND { sync } else <rest with await>`
+    ElseIfSkip {
+        cond: Expr,
+        then_branch: syn::Block,
+        rest: Box<ElseSuspend>,
+    },
+    /// `else if EXPR.await { then } else REST` (bool settle)
+    ElseIfCond {
+        then_branch: syn::Block,
+        rest_else: Option<Box<Expr>>,
+    },
+}
+
 #[derive(Clone)]
 struct Binding {
     name: Ident,
@@ -205,8 +230,17 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     }
                 }
             }
-            SuspendKind::IfElse { before_await, .. }
-            | SuspendKind::Loop { before_await, .. } => {
+            SuspendKind::IfElse {
+                else_suspend,
+                ..
+            } => {
+                for stmt in else_suspend_before_await(else_suspend) {
+                    if let Some(b) = typed_let_binding(stmt) {
+                        upsert_binding(&mut live, b);
+                    }
+                }
+            }
+            SuspendKind::Loop { before_await, .. } => {
                 for stmt in before_await {
                     if let Some(b) = typed_let_binding(stmt) {
                         upsert_binding(&mut live, b);
@@ -914,24 +948,18 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
                 .as_ref()
                 .map(|(_, e)| e.as_ref())
                 .unwrap();
-            let else_stmts = else_block_stmts(else_expr)?;
-            let (before_await, plain, after_await) =
-                extract_single_await_from_stmts(else_stmts)?;
+            let parsed = parse_else_await_chain(else_expr)?;
             Ok(Some(AwaitPoint {
-                name: plain.name,
-                tmp: plain.tmp,
-                wait_ty: plain.wait_ty,
-                base: plain.base,
+                name: parsed.name,
+                tmp: parsed.tmp,
+                wait_ty: parsed.wait_ty,
+                base: parsed.base,
                 before: Vec::new(),
                 kind: SuspendKind::IfElse {
                     cond: strip_val_in_if_cond(expr_if.cond.as_ref().clone()),
                     then_branch: expr_if.then_branch.clone(),
-                    before_await,
-                    after_await: {
-                        let mut v = plain.after_resume;
-                        v.extend(after_await);
-                        v
-                    },
+                    else_suspend: parsed.else_suspend,
+                    after_await: parsed.after_await,
                     join_stmts: Vec::new(),
                 },
             }))
@@ -1764,8 +1792,181 @@ fn else_block_stmts(else_expr: &Expr) -> syn::Result<&[Stmt]> {
         Expr::Block(b) => Ok(&b.block.stmts),
         other => Err(syn::Error::new_spanned(
             other,
-            "#[corot] only supports `else { ... }` (not else-if) when awaiting in else",
+            "#[corot] let…else requires `else { ... }` (a block)",
         )),
+    }
+}
+
+struct ParsedElseAwait {
+    name: Ident,
+    tmp: Ident,
+    wait_ty: Type,
+    base: Expr,
+    else_suspend: ElseSuspend,
+    after_await: Vec<Stmt>,
+}
+
+/// Walk `else` / `else if` chain and locate the single await.
+fn parse_else_await_chain(else_expr: &Expr) -> syn::Result<ParsedElseAwait> {
+    match else_expr {
+        Expr::Block(b) => {
+            let (before_await, plain, after_await) =
+                extract_single_await_from_stmts(&b.block.stmts)?;
+            Ok(ParsedElseAwait {
+                name: plain.name,
+                tmp: plain.tmp,
+                wait_ty: plain.wait_ty,
+                base: plain.base,
+                else_suspend: ElseSuspend::FinalBlock { before_await },
+                after_await: {
+                    let mut v = plain.after_resume;
+                    v.extend(after_await);
+                    v
+                },
+            })
+        }
+        Expr::If(inner) => {
+            let cond_has = contains_await(&inner.cond);
+            let then_has = inner.then_branch.stmts.iter().any(stmt_contains_await);
+            let else_has = inner
+                .else_branch
+                .as_ref()
+                .is_some_and(|(_, e)| contains_await(e));
+
+            match (cond_has, then_has, else_has) {
+                (false, true, false) => {
+                    let (before_await, plain, after_await) =
+                        extract_single_await_from_stmts(&inner.then_branch.stmts)?;
+                    Ok(ParsedElseAwait {
+                        name: plain.name,
+                        tmp: plain.tmp,
+                        wait_ty: plain.wait_ty,
+                        base: plain.base,
+                        else_suspend: ElseSuspend::ElseIfThen {
+                            cond: strip_val_in_if_cond(inner.cond.as_ref().clone()),
+                            before_await,
+                            rest_else: inner.else_branch.as_ref().map(|(_, e)| e.clone()),
+                        },
+                        after_await: {
+                            let mut v = plain.after_resume;
+                            v.extend(after_await);
+                            v
+                        },
+                    })
+                }
+                (false, false, true) => {
+                    let rest_expr = inner
+                        .else_branch
+                        .as_ref()
+                        .map(|(_, e)| e.as_ref())
+                        .unwrap();
+                    let mut parsed = parse_else_await_chain(rest_expr)?;
+                    parsed.else_suspend = ElseSuspend::ElseIfSkip {
+                        cond: strip_val_in_if_cond(inner.cond.as_ref().clone()),
+                        then_branch: inner.then_branch.clone(),
+                        rest: Box::new(parsed.else_suspend),
+                    };
+                    Ok(parsed)
+                }
+                (true, false, false) => {
+                    if let Expr::Let(_) = inner.cond.as_ref() {
+                        return Err(syn::Error::new_spanned(
+                            &inner.cond,
+                            "#[corot] await in `else if let` scrutinee is not supported yet",
+                        ));
+                    }
+                    let Some(base) = bare_await_base(&inner.cond) else {
+                        return Err(syn::Error::new_spanned(
+                            &inner.cond,
+                            "await in `else if` condition must be a bare `expr.await` (bool)",
+                        ));
+                    };
+                    let name = format_ident!("elseif_cond");
+                    let tmp = format_ident!("__await_{}", name);
+                    Ok(ParsedElseAwait {
+                        name,
+                        tmp,
+                        wait_ty: syn::parse_quote!(bool),
+                        base,
+                        else_suspend: ElseSuspend::ElseIfCond {
+                            then_branch: inner.then_branch.clone(),
+                            rest_else: inner.else_branch.as_ref().map(|(_, e)| e.clone()),
+                        },
+                        after_await: Vec::new(),
+                    })
+                }
+                (false, false, false) => Err(syn::Error::new_spanned(
+                    else_expr,
+                    "internal error: else-if chain marked as containing await, but none found",
+                )),
+                _ => Err(syn::Error::new_spanned(
+                    else_expr,
+                    "#[corot] supports at most one await in an else/else-if chain",
+                )),
+            }
+        }
+        other => Err(syn::Error::new_spanned(
+            other,
+            "#[corot] else branch must be `else { ... }` or `else if ...`",
+        )),
+    }
+}
+
+fn else_suspend_before_await(es: &ElseSuspend) -> &[Stmt] {
+    match es {
+        ElseSuspend::FinalBlock { before_await }
+        | ElseSuspend::ElseIfThen { before_await, .. } => before_await.as_slice(),
+        ElseSuspend::ElseIfSkip { rest, .. } => else_suspend_before_await(rest),
+        ElseSuspend::ElseIfCond { .. } => &[],
+    }
+}
+
+fn emit_else_suspend(
+    es: &ElseSuspend,
+    go_wait: &proc_macro2::TokenStream,
+    non_suspend: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match es {
+        ElseSuspend::FinalBlock { before_await } => quote! {
+            #(#before_await)*
+            #go_wait
+        },
+        ElseSuspend::ElseIfThen {
+            cond,
+            before_await,
+            rest_else,
+        } => {
+            let else_body = else_expr_tokens(rest_else);
+            quote! {
+                if #cond {
+                    #(#before_await)*
+                    #go_wait
+                } else {
+                    #else_body
+                    #non_suspend
+                }
+            }
+        }
+        ElseSuspend::ElseIfSkip {
+            cond,
+            then_branch,
+            rest,
+        } => {
+            let then_stmts = &then_branch.stmts;
+            let rest_code = emit_else_suspend(rest, go_wait, non_suspend);
+            quote! {
+                if #cond {
+                    #(#then_stmts)*
+                    #non_suspend
+                } else {
+                    #rest_code
+                }
+            }
+        }
+        ElseSuspend::ElseIfCond { .. } => {
+            // Condition await: evaluate base + suspend (then/else run on resume).
+            quote! { #go_wait }
+        }
     }
 }
 
@@ -2157,18 +2358,18 @@ fn gen_enter_await(
         SuspendKind::IfElse {
             cond,
             then_branch,
-            before_await,
+            else_suspend,
             ..
         } => {
             let then_stmts = &then_branch.stmts;
+            let else_body = emit_else_suspend(else_suspend, &go_wait, &non_suspend);
             quote! {
                 #(#before)*
                 if #cond {
                     #(#then_stmts)*
                     #non_suspend
                 } else {
-                    #(#before_await)*
-                    #go_wait
+                    #else_body
                 }
             }
         }
@@ -2356,10 +2557,35 @@ fn gen_after_resume(
             }
         }
         SuspendKind::IfThen { after_await, .. }
-        | SuspendKind::IfElse { after_await, .. }
         | SuspendKind::MatchArm { after_await, .. } => {
             quote! { #(#after_await)* }
         }
+        SuspendKind::IfElse {
+            else_suspend,
+            after_await,
+            ..
+        } => match else_suspend {
+            ElseSuspend::ElseIfCond {
+                then_branch,
+                rest_else,
+            } => {
+                let tmp = &ap.tmp;
+                let then_stmts = &then_branch.stmts;
+                match rest_else {
+                    Some(e) => quote! {
+                        if #tmp {
+                            #(#then_stmts)*
+                        } else #e;
+                    },
+                    None => quote! {
+                        if #tmp {
+                            #(#then_stmts)*
+                        }
+                    },
+                }
+            }
+            _ => quote! { #(#after_await)* },
+        },
         SuspendKind::LetElseAwait { after_await, .. } => {
             let parts = after_await.iter().map(emit_stmt_rewrite_returns);
             let has_return = after_await.iter().any(stmt_has_return);
