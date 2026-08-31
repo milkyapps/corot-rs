@@ -91,6 +91,53 @@ async fn let_else_success() {
     println!("success: x={x}");
 }
 
+// --- else if let: await on scrutinee ---
+
+#[corot]
+async fn else_if_let_scrutinee() {
+    let a: bool = false;
+    println!("eils: before");
+    if a {
+        println!("eils: first");
+    } else if let Some(x) = corot_rs::val::<Option<i32>>(().await) {
+        println!("eils: some {x}");
+    } else {
+        println!("eils: none");
+    }
+    println!("eils: after");
+}
+
+#[corot]
+async fn else_if_let_scrutinee_skipped() {
+    let a: bool = true;
+    println!("eils-skip: before");
+    if a {
+        println!("eils-skip: first (no suspend)");
+    } else if let Some(x) = corot_rs::val::<Option<i32>>(().await) {
+        println!("eils-skip: unreachable {x}");
+    } else {
+        println!("eils-skip: unreachable else");
+    }
+    println!("eils-skip: after");
+}
+
+#[corot]
+async fn else_if_let_scrutinee_nested_skip() {
+    let a: bool = false;
+    let b: bool = false;
+    println!("eils-nest: before");
+    if a {
+        println!("eils-nest: first");
+    } else if b {
+        println!("eils-nest: second");
+    } else if let Some(x) = corot_rs::val::<Option<i32>>(().await) {
+        println!("eils-nest: some {x}");
+    } else {
+        println!("eils-nest: none");
+    }
+    println!("eils-nest: after");
+}
+
 fn main() {
     println!("=== if let scrutinee ===");
     let mut c = if_let_scrutinee();
@@ -142,5 +189,31 @@ fn main() {
 
     println!("=== let else success (no suspend) ===");
     let mut c = let_else_success();
+    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+
+    println!();
+    println!("=== else if let scrutinee (Some) ===");
+    let mut c = else_if_let_scrutinee();
+    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    c.settle_wait(&Some(7));
+    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+
+    println!();
+    println!("=== else if let scrutinee (None) ===");
+    let mut c = else_if_let_scrutinee();
+    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    c.settle_wait(&None::<i32>);
+    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+
+    println!();
+    println!("=== else if let scrutinee (skipped) ===");
+    let mut c = else_if_let_scrutinee_skipped();
+    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+
+    println!();
+    println!("=== else if let scrutinee (nested skip → Some) ===");
+    let mut c = else_if_let_scrutinee_nested_skip();
+    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    c.settle_wait(&Some(4));
     assert!(matches!(c.step(), Ok(Poll::Ready(()))));
 }

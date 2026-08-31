@@ -24,6 +24,7 @@ use syn::{
 ///   inside nested sync loops stay native
 /// - `let x: T = loop { …; break value }` / `break 'label value` (loop-as-expression)
 /// - `if` / `if let`: condition/scrutinee, then, else, or else-if chain
+///   (including `else if let PAT = ….await`)
 /// - `let…else`: await in the initializer or in the `else` block
 /// - `match`: scrutinee, one arm body, or one guard
 /// - `for`: range literal or `iter::<I>(…)`, optional body await
@@ -269,6 +270,12 @@ enum ElseSuspend {
     },
     /// `else if EXPR.await { then } else REST` (bool settle)
     ElseIfCond {
+        then_branch: syn::Block,
+        rest_else: Option<Box<Expr>>,
+    },
+    /// `else if let PAT = EXPR.await { then } else REST`
+    ElseIfLetScrutinee {
+        pat: Pat,
         then_branch: syn::Block,
         rest_else: Option<Box<Expr>>,
     },
@@ -3599,11 +3606,23 @@ fn parse_else_await_chain(
                     Ok(parsed)
                 }
                 (true, false, false) => {
-                    if let Expr::Let(_) = inner.cond.as_ref() {
-                        return Err(syn::Error::new_spanned(
-                            &inner.cond,
-                            "#[corot] await in `else if let` scrutinee is not supported yet",
-                        ));
+                    if let Expr::Let(expr_let) = inner.cond.as_ref() {
+                        let base = await_base_from_scrut(&expr_let.expr)?;
+                        let wait_ty = resolve_scrut_ty(&expr_let.pat, &expr_let.expr)?;
+                        let name = format_ident!("elseif_scrut");
+                        let tmp = format_ident!("__await_{}", name);
+                        return Ok(ParsedElseAwait {
+                            name,
+                            tmp,
+                            wait_ty,
+                            base,
+                            else_suspend: ElseSuspend::ElseIfLetScrutinee {
+                                pat: expr_let.pat.as_ref().clone(),
+                                then_branch: inner.then_branch.clone(),
+                                rest_else: inner.else_branch.as_ref().map(|(_, e)| e.clone()),
+                            },
+                            after_await: Vec::new(),
+                        });
                     }
                     let Some(base) = bare_await_base(&inner.cond) else {
                         return Err(syn::Error::new_spanned(
@@ -3647,7 +3666,15 @@ fn else_suspend_before_await(es: &ElseSuspend) -> &[Stmt] {
         ElseSuspend::FinalBlock { before_await }
         | ElseSuspend::ElseIfThen { before_await, .. } => before_await.as_slice(),
         ElseSuspend::ElseIfSkip { rest, .. } => else_suspend_before_await(rest),
-        ElseSuspend::ElseIfCond { .. } => &[],
+        ElseSuspend::ElseIfCond { .. } | ElseSuspend::ElseIfLetScrutinee { .. } => &[],
+    }
+}
+
+/// Peel sync `else if` skips to the suspend leaf (resume does not re-check them).
+fn else_suspend_resume_leaf(es: &ElseSuspend) -> &ElseSuspend {
+    match es {
+        ElseSuspend::ElseIfSkip { rest, .. } => else_suspend_resume_leaf(rest),
+        other => other,
     }
 }
 
@@ -3698,8 +3725,8 @@ fn emit_else_suspend(
                 }
             }
         }
-        ElseSuspend::ElseIfCond { .. } => {
-            // Condition await: evaluate base + suspend (then/else run on resume).
+        ElseSuspend::ElseIfCond { .. } | ElseSuspend::ElseIfLetScrutinee { .. } => {
+            // Condition/scrutinee await: evaluate base + suspend (then/else run on resume).
             quote! { #go_wait }
         }
     }
@@ -4671,7 +4698,7 @@ fn gen_after_resume(
             else_suspend,
             after_await,
             ..
-        } => match else_suspend {
+        } => match else_suspend_resume_leaf(else_suspend) {
             ElseSuspend::ElseIfCond {
                 then_branch,
                 rest_else,
@@ -4689,6 +4716,29 @@ fn gen_after_resume(
                     }
                     None => quote! {
                         if #tmp {
+                            #then_stmts
+                        }
+                    },
+                }
+            }
+            ElseSuspend::ElseIfLetScrutinee {
+                pat,
+                then_branch,
+                rest_else,
+            } => {
+                let tmp = &ap.tmp;
+                let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
+                match rest_else {
+                    Some(e) => {
+                        let else_body = emit_expr_rewrite_returns(e, ready_ok);
+                        quote! {
+                            if let #pat = #tmp {
+                                #then_stmts
+                            } else #else_body;
+                        }
+                    }
+                    None => quote! {
+                        if let #pat = #tmp {
                             #then_stmts
                         }
                     },

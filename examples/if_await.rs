@@ -117,6 +117,23 @@ async fn await_in_else_if_cond() {
     println!("eicond: after");
 }
 
+#[corot]
+async fn await_in_else_if_cond_nested_skip() {
+    let a: bool = false;
+    let b: bool = false;
+    println!("eicond-nest: before");
+    if a {
+        println!("eicond-nest: first");
+    } else if b {
+        println!("eicond-nest: second");
+    } else if ().await {
+        println!("eicond-nest: else-if then");
+    } else {
+        println!("eicond-nest: else-if else");
+    }
+    println!("eicond-nest: after");
+}
+
 fn run_cond() {
     println!("=== await in condition ===");
     let mut c = await_in_cond();
@@ -205,6 +222,13 @@ fn run_else_if_cond() {
     let mut c = await_in_else_if_cond();
     assert!(matches!(c.step(), Ok(Poll::Pending)));
     c.settle_wait(&false);
+    assert!(matches!(c.step(), Ok(Poll::Ready(()))));
+    println!();
+
+    println!("=== await in else-if condition nested skip (true) ===");
+    let mut c = await_in_else_if_cond_nested_skip();
+    assert!(matches!(c.step(), Ok(Poll::Pending)));
+    c.settle_wait(&true);
     assert!(matches!(c.step(), Ok(Poll::Ready(()))));
     println!();
 }
