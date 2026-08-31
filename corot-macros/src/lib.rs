@@ -31,6 +31,9 @@ use syn::{
 ///   coroutine with `Step::Ready(...)`)
 /// - `foo(args…).await` (not `call` / `iter` / `val`) — `step` returns
 ///   `Step::Effect(CallFoo(args…))` so the host can invoke `foo` itself
+/// - mid-expression awaits (e.g. `foo(val::<T>(a()).await, val::<U>(b()).await)`):
+///   hoisted left-to-right into typed temps; each await needs a known settle type
+///   via `val::<T>(…)`, `().await`, or `(expr as T).await`
 /// - `corot_rs::call::<ChildCoroutine>(child()).await` — drive another `#[corot]`
 ///   coroutine to completion (composition); child effects bubble as
 ///   `Effect::NestedChildCoroutine(…)`
@@ -1686,7 +1689,7 @@ fn split_awaits(
         } else if stmt_contains_await(stmt) {
             return Err(syn::Error::new_spanned(
                 stmt,
-                "#[corot] unsupported await placement (supported: typed let; if; match; loop; while; for; labeled block; try)",
+                "#[corot] unsupported await placement (supported: typed let / mid-expr await; if; match; loop; while; for; labeled block; try)",
             ));
         } else {
             current.push(stmt.clone());
@@ -1710,20 +1713,25 @@ fn expand_await_stmt(
     if let Some(aps) = expand_loop_stmt(stmt, index, err_ty)? {
         return Ok(Some(aps));
     }
-    if let Some(plain) = as_plain_await_let(stmt, err_ty, index)? {
-        return Ok(Some(vec![AwaitPoint {
-            name: plain.name,
-            tmp: plain.tmp,
-            wait_ty: plain.wait_ty,
-            base: plain.base,
-            before: Vec::new(),
-            try_ok: plain.try_ok,
-            nested_child: plain.nested_child,
-            effect: plain.effect,
-            kind: SuspendKind::Plain {
-                after_resume: plain.after_resume,
-            },
-        }]));
+    if let Some(plains) = as_plain_awaits(stmt, err_ty, index)? {
+        return Ok(Some(
+            plains
+                .into_iter()
+                .map(|plain| AwaitPoint {
+                    name: plain.name,
+                    tmp: plain.tmp,
+                    wait_ty: plain.wait_ty,
+                    base: plain.base,
+                    before: Vec::new(),
+                    try_ok: plain.try_ok,
+                    nested_child: plain.nested_child,
+                    effect: plain.effect,
+                    kind: SuspendKind::Plain {
+                        after_resume: plain.after_resume,
+                    },
+                })
+                .collect(),
+        ));
     }
     if let Some(ap) = as_await_let_else_stmt(stmt, err_ty)? {
         return Ok(Some(vec![ap]));
@@ -1751,11 +1759,18 @@ fn extract_body_units(
     let mut units = Vec::new();
     let mut current = Vec::new();
     for stmt in stmts {
-        if let Some(plain) = as_plain_await_let(stmt, err_ty, units_await_count(&units))? {
-            units.push(BodyUnit::Plain {
-                before: std::mem::take(&mut current),
-                plain,
-            });
+        if let Some(plains) = as_plain_awaits(stmt, err_ty, units_await_count(&units))? {
+            let mut before = std::mem::take(&mut current);
+            for (i, plain) in plains.into_iter().enumerate() {
+                units.push(BodyUnit::Plain {
+                    before: if i == 0 {
+                        std::mem::take(&mut before)
+                    } else {
+                        Vec::new()
+                    },
+                    plain,
+                });
+            }
             continue;
         }
         if let Some(nested) = as_nested_if_unit(stmt, err_ty)? {
@@ -2217,6 +2232,277 @@ fn is_chain_first(ap: &AwaitPoint) -> bool {
 
 fn is_chain_last(ap: &AwaitPoint) -> bool {
     chain_pos_len(ap).is_none_or(|(pos, len)| pos + 1 == len)
+}
+
+fn count_awaits(expr: &Expr) -> usize {
+    match expr {
+        Expr::Await(_) => 1,
+        Expr::Array(e) => e.elems.iter().map(count_awaits).sum(),
+        Expr::Assign(e) => count_awaits(&e.left) + count_awaits(&e.right),
+        Expr::Binary(e) => count_awaits(&e.left) + count_awaits(&e.right),
+        Expr::Block(e) => e.block.stmts.iter().map(count_awaits_in_stmt).sum(),
+        Expr::Break(e) => e.expr.as_ref().map(|x| count_awaits(x)).unwrap_or(0),
+        Expr::Call(e) => count_awaits(&e.func) + e.args.iter().map(count_awaits).sum::<usize>(),
+        Expr::Cast(e) => count_awaits(&e.expr),
+        Expr::Field(e) => count_awaits(&e.base),
+        Expr::Group(e) => count_awaits(&e.expr),
+        Expr::Index(e) => count_awaits(&e.expr) + count_awaits(&e.index),
+        Expr::MethodCall(e) => {
+            count_awaits(&e.receiver) + e.args.iter().map(count_awaits).sum::<usize>()
+        }
+        Expr::Paren(e) => count_awaits(&e.expr),
+        Expr::Reference(e) => count_awaits(&e.expr),
+        Expr::Repeat(e) => count_awaits(&e.expr) + count_awaits(&e.len),
+        Expr::Return(e) => e.expr.as_ref().map(|x| count_awaits(x)).unwrap_or(0),
+        Expr::Struct(e) => e.fields.iter().map(|f| count_awaits(&f.expr)).sum(),
+        Expr::Try(e) => count_awaits(&e.expr),
+        Expr::Tuple(e) => e.elems.iter().map(count_awaits).sum(),
+        Expr::Unary(e) => count_awaits(&e.expr),
+        Expr::Unsafe(e) => e.block.stmts.iter().map(count_awaits_in_stmt).sum(),
+        // Control-flow / unsupported mid-expr shapes: count for detection only.
+        Expr::If(e) => {
+            count_awaits(&e.cond)
+                + e.then_branch.stmts.iter().map(count_awaits_in_stmt).sum::<usize>()
+                + e.else_branch
+                    .as_ref()
+                    .map(|(_, x)| count_awaits(x))
+                    .unwrap_or(0)
+        }
+        Expr::Match(e) => {
+            count_awaits(&e.expr)
+                + e.arms
+                    .iter()
+                    .map(|a| {
+                        count_awaits(&a.body)
+                            + a.guard
+                                .as_ref()
+                                .map(|(_, g)| count_awaits(g))
+                                .unwrap_or(0)
+                    })
+                    .sum::<usize>()
+        }
+        Expr::Loop(e) => e.body.stmts.iter().map(count_awaits_in_stmt).sum(),
+        Expr::While(e) => {
+            count_awaits(&e.cond) + e.body.stmts.iter().map(count_awaits_in_stmt).sum::<usize>()
+        }
+        Expr::ForLoop(e) => {
+            count_awaits(&e.expr) + e.body.stmts.iter().map(count_awaits_in_stmt).sum::<usize>()
+        }
+        Expr::TryBlock(e) => e.block.stmts.iter().map(count_awaits_in_stmt).sum(),
+        Expr::Range(e) => {
+            e.start.as_ref().map(|x| count_awaits(x)).unwrap_or(0)
+                + e.end.as_ref().map(|x| count_awaits(x)).unwrap_or(0)
+        }
+        Expr::Yield(e) => e.expr.as_ref().map(|x| count_awaits(x)).unwrap_or(0),
+        Expr::Let(e) => count_awaits(&e.expr),
+        _ => 0,
+    }
+}
+
+fn count_awaits_in_stmt(stmt: &Stmt) -> usize {
+    match stmt {
+        Stmt::Local(Local {
+            init: Some(init), ..
+        }) => {
+            count_awaits(&init.expr)
+                + init
+                    .diverge
+                    .as_ref()
+                    .map(|(_, e)| count_awaits(e))
+                    .unwrap_or(0)
+        }
+        Stmt::Expr(expr, _) => count_awaits(expr),
+        _ => 0,
+    }
+}
+
+fn is_expr_construct(expr: &Expr) -> bool {
+    matches!(
+        unwrap_parens_ref(expr),
+        Expr::If(_)
+            | Expr::Match(_)
+            | Expr::While(_)
+            | Expr::ForLoop(_)
+            | Expr::Loop(_)
+            | Expr::Block(_)
+            | Expr::TryBlock(_)
+    )
+}
+
+/// Settle type of `BASE` in `BASE.await` for mid-expression temps.
+fn resolve_await_base_ty(base: &Expr) -> syn::Result<Type> {
+    let base = unwrap_parens_ref(base);
+    if let Some((ty, _)) = as_val_call(base) {
+        return Ok(ty);
+    }
+    if is_unit_expr(base) {
+        return Ok(syn::parse_quote!(()));
+    }
+    if let Expr::Cast(c) = base {
+        return Ok(c.ty.as_ref().clone());
+    }
+    Err(syn::Error::new_spanned(
+        base,
+        "#[corot] mid-expression await needs a known settle type; use \
+         `val::<T>(expr).await` (or `().await` / `(expr as T).await`)",
+    ))
+}
+
+/// Left-to-right hoist of every `.await` in `expr` into typed temps.
+fn hoist_awaits_from_expr(
+    expr: Expr,
+    start_index: usize,
+) -> syn::Result<(Vec<PlainAwait>, Expr)> {
+    let mut expr = expr;
+    let mut plains = Vec::new();
+    let mut i = 0usize;
+    while contains_await(&expr) {
+        let name = format_ident!("__m{}", start_index + i);
+        let tmp = format_ident!("__await_{}", name);
+        let mut resume = expr;
+        // Residual expression uses the binding name; settle value is `#tmp` then
+        // rebound in `after_resume` so later awaits / the final expr see `#name`.
+        let base = replace_first_await(&mut resume, ident_expr(&name))?;
+        let wait_ty = resolve_await_base_ty(&base)?;
+        let nested_child = as_corot_call(&base).map(|(ty, _)| ty);
+        if nested_child.is_some() {
+            return Err(syn::Error::new_spanned(
+                &base,
+                "#[corot] `call::<Child>(…)` mid-expression await is not supported yet",
+            ));
+        }
+        let base_stripped = strip_val_call(base);
+        let effect = as_effect_call(&base_stripped)?;
+        let base = if effect.is_some() {
+            syn::parse_quote!(())
+        } else {
+            base_stripped
+        };
+        let after_resume = vec![syn::parse_quote! {
+            let #name: #wait_ty = #tmp;
+        }];
+        plains.push(PlainAwait {
+            name,
+            tmp,
+            wait_ty,
+            base,
+            after_resume,
+            try_ok: None,
+            nested_child: None,
+            effect,
+        });
+        expr = resume;
+        i += 1;
+    }
+    Ok((plains, expr))
+}
+
+/// Typed-let awaits, statement-position awaits, and mid-expression multi-await.
+fn as_plain_awaits(
+    stmt: &Stmt,
+    err_ty: Option<&Type>,
+    await_index: usize,
+) -> syn::Result<Option<Vec<PlainAwait>>> {
+    match stmt {
+        Stmt::Local(Local {
+            attrs,
+            let_token,
+            pat,
+            init: Some(LocalInit {
+                eq_token,
+                expr,
+                diverge,
+            }),
+            semi_token,
+        }) => {
+            if is_expr_construct(expr) {
+                return Ok(None);
+            }
+            let else_has = diverge.as_ref().is_some_and(|(_, e)| contains_await(e));
+            let n = count_awaits(expr);
+            if n == 0 {
+                return Ok(None);
+            }
+            if else_has {
+                // let…else with await in init (and optionally else) — single-path only.
+                if n > 1 {
+                    return Err(syn::Error::new_spanned(
+                        stmt,
+                        "#[corot] multiple awaits in a let…else initializer are not supported",
+                    ));
+                }
+                return Ok(as_plain_await_let(stmt, err_ty, await_index)?.map(|p| vec![p]));
+            }
+            if n == 1 {
+                return Ok(as_plain_await_let(stmt, err_ty, await_index)?.map(|p| vec![p]));
+            }
+            if outer_try(expr).is_some() {
+                return Err(syn::Error::new_spanned(
+                    stmt,
+                    "#[corot] `await?` with multiple mid-expression awaits is not supported yet",
+                ));
+            }
+            let (mut plains, final_expr) =
+                hoist_awaits_from_expr(expr.as_ref().clone(), await_index)?;
+            if plains.is_empty() {
+                return Ok(None);
+            }
+            let final_let = Stmt::Local(Local {
+                attrs: attrs.clone(),
+                let_token: *let_token,
+                pat: pat.clone(),
+                init: Some(LocalInit {
+                    eq_token: *eq_token,
+                    expr: Box::new(final_expr),
+                    diverge: diverge.as_ref().map(|(t, e)| (*t, e.clone())),
+                }),
+                semi_token: *semi_token,
+            });
+            plains
+                .last_mut()
+                .expect("plains non-empty")
+                .after_resume
+                .push(final_let);
+            Ok(Some(plains))
+        }
+        Stmt::Expr(expr, semi) => {
+            if is_expr_construct(expr) {
+                return Ok(None);
+            }
+            if !contains_await(expr) {
+                return Ok(None);
+            }
+            if outer_try(expr).is_some() {
+                return Err(syn::Error::new_spanned(
+                    stmt,
+                    "#[corot] statement-position `await?` is not supported; bind with `let`",
+                ));
+            }
+            // Bare `expr.await;` — synthesize a typed discard let when possible.
+            if count_awaits(expr) == 1 {
+                if let Some(base) = bare_await_base(expr) {
+                    if let Ok(wait_ty) = resolve_await_base_ty(&base) {
+                        let tmp_stmt: Stmt = syn::parse_quote! {
+                            let _: #wait_ty = #expr;
+                        };
+                        return Ok(as_plain_await_let(&tmp_stmt, err_ty, await_index)?.map(|p| vec![p]));
+                    }
+                }
+            }
+            let (mut plains, final_expr) =
+                hoist_awaits_from_expr(expr.clone(), await_index)?;
+            if plains.is_empty() {
+                return Ok(None);
+            }
+            plains
+                .last_mut()
+                .expect("plains non-empty")
+                .after_resume
+                .push(Stmt::Expr(final_expr, *semi));
+            Ok(Some(plains))
+        }
+        _ => Ok(None),
+    }
 }
 
 fn as_plain_await_let(
@@ -8830,6 +9116,55 @@ fn replace_first_await(expr: &mut Expr, replacement: Expr) -> syn::Result<Expr> 
         Expr::Try(e) => replace_first_await(&mut e.expr, replacement),
         Expr::Tuple(e) => replace_in_slice(&mut e.elems, replacement),
         Expr::Unary(e) => replace_first_await(&mut e.expr, replacement),
+        Expr::Repeat(e) => {
+            if contains_await(&e.expr) {
+                replace_first_await(&mut e.expr, replacement)
+            } else {
+                replace_first_await(&mut e.len, replacement)
+            }
+        }
+        Expr::Struct(e) => {
+            for field in e.fields.iter_mut() {
+                if contains_await(&field.expr) {
+                    return replace_first_await(&mut field.expr, replacement);
+                }
+            }
+            if let Some(rest) = e.rest.as_mut() {
+                if contains_await(rest) {
+                    return replace_first_await(rest, replacement);
+                }
+            }
+            Err(syn::Error::new_spanned(
+                e,
+                "#[corot] cannot split await inside this expression yet",
+            ))
+        }
+        Expr::Range(e) => {
+            if e.start.as_ref().is_some_and(|x| contains_await(x)) {
+                replace_first_await(e.start.as_mut().unwrap(), replacement)
+            } else if e.end.as_ref().is_some_and(|x| contains_await(x)) {
+                replace_first_await(e.end.as_mut().unwrap(), replacement)
+            } else {
+                Err(syn::Error::new_spanned(
+                    e,
+                    "#[corot] cannot split await inside this expression yet",
+                ))
+            }
+        }
+        Expr::Return(e) => match e.expr.as_mut() {
+            Some(inner) => replace_first_await(inner, replacement),
+            None => Err(syn::Error::new_spanned(
+                e,
+                "#[corot] cannot split await inside this expression yet",
+            )),
+        },
+        Expr::Break(e) => match e.expr.as_mut() {
+            Some(inner) => replace_first_await(inner, replacement),
+            None => Err(syn::Error::new_spanned(
+                e,
+                "#[corot] cannot split await inside this expression yet",
+            )),
+        },
         other => Err(syn::Error::new_spanned(
             other,
             "#[corot] cannot split await inside this expression yet",
