@@ -8,7 +8,8 @@ use syn::{
 
 /// Suspension points: typed `let` awaits (including `await?`); `if` / `if let` /
 /// `let…else` / `loop` / `for` / `match` in a supported position (including
-/// multiple plain awaits chained in one construct body).
+/// multiple plain awaits chained in one construct body, and nested `if` /
+/// `if let` with then-only awaits inside those bodies).
 ///
 /// The decorated `async fn` may take typed arguments (`x: T`, `mut x: T`); they
 /// are stored on `NotStarted` and live across awaits like other captures.
@@ -41,6 +42,8 @@ use syn::{
 ///   (including `else if let PAT = ….await`); condition+then or condition+else
 ///   (dual-region via `WaitingCond`); `else if` may await in cond and then
 ///   (`ElseIfCondThen`), or in multiple exclusive else-if bodies (shared `AfterIf`)
+/// - `let v: T = if … { … await …; value } else { … }` / `let v: T = match …`
+///   (expression-position if/match with await; arm/branch values bind before join)
 /// - `let…else`: await in the initializer or in the `else` block
 /// - `match`: scrutinee, one arm body, one guard, or guard+body (dual-region);
 ///   suspending arms may use `Some`/`Ok`/`Err`/tuple/`@`/`|` patterns
@@ -145,6 +148,9 @@ enum SuspendKind {
         /// Stmts after the `if` until the next await / end (run in `AfterIfN`).
         /// Only the last chain segment owns these.
         join_stmts: Vec<Stmt>,
+        entry_gate: Option<EntryGate>,
+        /// `let name: T = if …` — then/else values assign to this before AfterIf.
+        expr_bind: Option<(Ident, Type)>,
     },
     /// Await inside the else branch / else-if chain (`if` or `if let`), optionally
     /// with an awaited outer condition (`cond_await_base` → `WaitingCond{head}`).
@@ -164,6 +170,8 @@ enum SuspendKind {
         chain_len: usize,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
+        /// `let name: T = if …` with await in else / else-if.
+        expr_bind: Option<(Ident, Type)>,
     },
     /// `if let PAT = EXPR.await { then } else { else }`
     IfLetScrutinee {
@@ -200,6 +208,8 @@ enum SuspendKind {
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
+        /// Nested `if` at this chain position (first await of the nest).
+        entry_gate: Option<EntryGate>,
     },
     /// `while COND { … }` / `while let PAT = EXPR { … }` with optional label.
     ///
@@ -224,6 +234,7 @@ enum SuspendKind {
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
+        entry_gate: Option<EntryGate>,
     },
     /// `for x in ITER { … }` with optional await on the iterable and/or body.
     ///
@@ -248,6 +259,7 @@ enum SuspendKind {
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
+        entry_gate: Option<EntryGate>,
     },
     /// `match EXPR.await { arms… }` — settle value is the scrutinee.
     MatchScrutinee {
@@ -270,6 +282,9 @@ enum SuspendKind {
         after_await: Vec<Stmt>,
         arms_after: Vec<syn::Arm>,
         join_stmts: Vec<Stmt>,
+        entry_gate: Option<EntryGate>,
+        /// `let name: T = match …` — arm values assign to this before AfterMatch.
+        expr_bind: Option<(Ident, Type)>,
     },
     /// Await in a match guard (`if expr.await`, bool), optionally with awaits in
     /// that arm's body (`has_body_await` → guard uses `WaitingCond{head}`).
@@ -308,6 +323,7 @@ enum SuspendKind {
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
+        entry_gate: Option<EntryGate>,
     },
     /// `let name: Result<T, E> = try { …; let x: T = ….await?; … }`
     ///
@@ -322,6 +338,7 @@ enum SuspendKind {
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
+        entry_gate: Option<EntryGate>,
     },
 }
 
@@ -375,6 +392,39 @@ struct Binding {
     mutable: bool,
 }
 
+/// Wraps entry to a nested `if` / `if let` inside another suspending body.
+///
+/// Attached to the first await of the nest. On the else path (or failed `if let`),
+/// run `else_branch`, then `after`, then skip `span` chain slots.
+struct EntryGate {
+    /// Full sync condition (`flag` or `let PAT = EXPR`).
+    cond: Expr,
+    /// Bindings from `if let` (live on the then path / wait captures).
+    then_binds: Vec<Binding>,
+    else_branch: Option<Box<Expr>>,
+    /// Awaits owned by this nest (else skips this many chain positions).
+    span: usize,
+    /// Stmts after the nested `if` and before the next body await / end.
+    after: Vec<Stmt>,
+}
+
+/// One suspending unit in a construct body (plain let or nested `if`).
+enum BodyUnit {
+    Plain {
+        before: Vec<Stmt>,
+        plain: PlainAwait,
+    },
+    /// Nested `if` / `if let` with awaits only in then (else must be sync).
+    NestedIf {
+        before: Vec<Stmt>,
+        cond: Expr,
+        then_binds: Vec<Binding>,
+        else_branch: Option<Box<Expr>>,
+        then_units: Vec<BodyUnit>,
+        then_trailing: Vec<Stmt>,
+    },
+}
+
 fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     if input.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
@@ -416,8 +466,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             SuspendKind::IfThen {
                 pat_binds,
                 before_await,
-                ..
-            } => {
+                ..} => {
                 for b in pat_binds {
                     upsert_binding(&mut live, b.clone());
                 }
@@ -437,7 +486,12 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     }
                 }
             }
-            SuspendKind::Loop { before_await, .. } => {
+            SuspendKind::Loop { before_await, entry_gate, .. } => {
+                if let Some(g) = entry_gate {
+                    for b in &g.then_binds {
+                        upsert_binding(&mut live, b.clone());
+                    }
+                }
                 for stmt in before_await {
                     if let Some(b) = typed_let_binding(stmt) {
                         upsert_binding(&mut live, b);
@@ -448,8 +502,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 pat_binds,
                 before_await,
                 has_body_await,
-                ..
-            } => {
+                ..} => {
                 if *has_body_await {
                     for b in pat_binds {
                         upsert_binding(&mut live, b.clone());
@@ -478,8 +531,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 item_binds,
                 into_ty,
                 before_await,
-                ..
-            } => {
+                ..} => {
                 let iter_ty = into_iter_ty(into_ty);
                 upsert_binding(
                     &mut live,
@@ -501,8 +553,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             SuspendKind::MatchArm {
                 pat_binds,
                 before_await,
-                ..
-            } => {
+                ..} => {
                 for b in pat_binds {
                     upsert_binding(&mut live, b.clone());
                 }
@@ -540,8 +591,8 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     }
                 }
             }
-            SuspendKind::LabeledBlock { before_await, .. }
-            | SuspendKind::TryBlock { before_await, .. } => {
+            SuspendKind::LabeledBlock { before_await, ..}
+            | SuspendKind::TryBlock { before_await, ..} => {
                 for stmt in before_await {
                     if let Some(b) = typed_let_binding(stmt) {
                         upsert_binding(&mut live, b);
@@ -553,7 +604,8 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         captures_at_await.push(live.clone());
         // Locals after resume inside loop/if/match/block bodies do not escape the
         // construct; only `Plain` after-resume stmts stay live for later awaits.
-        if after_resume_escapes(&ap.kind) {
+        // Nested `if` bindings must not escape past the nest (else path skips them).
+        if after_resume_should_escape(captures_at_await.len() - 1, ap, &awaits) {
             for stmt in after_resume_stmts(ap) {
                 if let Some(b) = typed_let_binding(stmt) {
                     upsert_binding(&mut live, b);
@@ -653,7 +705,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             });
         }
 
-        if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. }) {
+        if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, ..}) {
             let var = waiting_variant(&ap.name);
             let cap_fields = caps.iter().map(|b| field_tokens(b));
             if let Some(child_ty) = &ap.nested_child {
@@ -737,7 +789,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 }
             });
         }
-        if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. }) {
+        if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, ..}) {
             let var = waiting_variant(&ap.name);
             if ap.nested_child.is_some() {
                 settle_arms.push(quote! {
@@ -799,8 +851,10 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             &join_caps_at[0],
             &awaits,
             &captures_at_await,
+            &join_caps_at,
             &ready_ok,
-            &effect_enum);
+            &effect_enum,
+        );
         step_arms.push(quote! {
             #not_started_pat => {
                 #enter
@@ -847,8 +901,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     before_await,
                     has_body_await,
                     label,
-                    ..
-                } => {
+                    ..} => {
                     let join_i = join_caps_index(ap, i);
                     let join_caps = &join_caps_at[join_i];
                     let goto_after =
@@ -864,9 +917,24 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     );
                     let some_body = if *has_body_await {
                         let go_wait = gen_enter_wait(ap, &var, caps, &effect_enum);
-                        quote! {
+                        let then_body = quote! {
                             #before_await_toks
                             #go_wait
+                        };
+                        if let Some(gate) = entry_gate_of(&ap.kind) {
+                            gen_entry_gate_wrap(
+                                i,
+                                ap,
+                                gate,
+                                then_body,
+                                &awaits,
+                                &captures_at_await,
+                                &join_caps_at,
+                                &ready_ok,
+                                &effect_enum,
+                            )
+                        } else {
+                            then_body
                         }
                     } else {
                         let goto_head = gen_goto_loop_head(head, ap, join_caps);
@@ -920,10 +988,28 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         break_bind.as_ref(),
                         &ready_ok,
                     );
+                    let then_body = quote! {
+                        #before_await_toks
+                        #go_wait
+                    };
+                    let body = if let Some(gate) = entry_gate_of(&ap.kind) {
+                        gen_entry_gate_wrap(
+                            i,
+                            ap,
+                            gate,
+                            then_body,
+                            &awaits,
+                            &captures_at_await,
+                            &join_caps_at,
+                            &ready_ok,
+                            &effect_enum,
+                        )
+                    } else {
+                        then_body
+                    };
                     step_arms.push(quote! {
                         Self::#head_var { #(#head_pats,)* } => {
-                            #before_await_toks
-                            #go_wait
+                            #body
                         }
                     });
                 }
@@ -948,11 +1034,29 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         None,
                         &ready_ok,
                     );
+                    let then_body = quote! {
+                        #before_await_toks
+                        #go_wait
+                    };
+                    let body = if let Some(gate) = entry_gate_of(&ap.kind) {
+                        gen_entry_gate_wrap(
+                            i,
+                            ap,
+                            gate,
+                            then_body,
+                            &awaits,
+                            &captures_at_await,
+                            &join_caps_at,
+                            &ready_ok,
+                            &effect_enum,
+                        )
+                    } else {
+                        then_body
+                    };
                     step_arms.push(quote! {
                         Self::#head_var { #(#head_pats,)* } => {
                             if #cond {
-                                #before_await_toks
-                                #go_wait
+                                #body
                             } else {
                                 #goto_after
                             }
@@ -963,8 +1067,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     sync_cond: None,
                     cond_await_base: Some(base),
                     label,
-                    ..
-                } => {
+                    ..} => {
                     let _ = label;
                     let join_i = join_caps_index(ap, i);
                     let join_caps = &join_caps_at[join_i];
@@ -979,8 +1082,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 SuspendKind::While {
                     sync_cond: None,
                     label,
-                    ..
-                } => {
+                    ..} => {
                     let go_wait = gen_enter_wait(ap, &var, caps, &effect_enum);
                     let _ = label;
                     step_arms.push(quote! {
@@ -1008,8 +1110,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         before_await,
                         label,
                         chain_head,
-                        ..
-                    } => rewrite_loop_body_stmts(
+                        ..} => rewrite_loop_body_stmts(
                         *chain_head,
                         before_await,
                         join_caps,
@@ -1018,7 +1119,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         None,
                         &ready_ok,
                     ),
-                    SuspendKind::IfThen { before_await, .. } => {
+                    SuspendKind::IfThen { before_await, ..} => {
                         emit_stmts_rewrite_returns(before_await, &ready_ok)
                     }
                     SuspendKind::MatchGuard {
@@ -1069,17 +1170,27 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 }
             };
             let false_path = match &ap.kind {
-                SuspendKind::IfThen { else_branch, .. } => {
-                    let else_body = else_expr_tokens(else_branch, &ready_ok);
+                SuspendKind::IfThen {
+                    else_branch,
+                    expr_bind,
+                    ..
+                } => {
+                    let else_body =
+                        emit_opt_expr_bind_assign(expr_bind.as_ref(), else_branch, &ready_ok);
                     quote! {
                         #else_body
                         #goto_after
                     }
                 }
-                SuspendKind::IfElse { else_suspend, .. } => {
+                SuspendKind::IfElse {
+                    else_suspend,
+                    expr_bind,
+                    ..
+                } => {
                     match else_suspend_resume_leaf(else_suspend) {
                         ElseSuspend::ElseIfCondThen { rest_else, .. } => {
-                            let else_body = else_expr_tokens(rest_else, &ready_ok);
+                            let else_body =
+                                emit_opt_expr_bind_assign(expr_bind.as_ref(), rest_else, &ready_ok);
                             quote! {
                                 #else_body
                                 #goto_after
@@ -1099,6 +1210,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                                 &mut sib_idx,
                                 &goto_after,
                                 &ready_ok,
+                                expr_bind.as_ref(),
                             );
                             quote! { #else_body }
                         }
@@ -1110,7 +1222,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     } else {
                         let after_tokens = arms_after
                             .iter()
-                            .map(|a| emit_sync_arm_with_join(a, &goto_after, &ready_ok));
+                            .map(|a| emit_sync_arm_with_join(a, &goto_after, &ready_ok, None));
                         quote! {
                             match __scrut {
                                 #(#after_tokens)*
@@ -1123,12 +1235,10 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             let cond_check = match &ap.kind {
                 SuspendKind::While {
                     await_let_pat: Some(pat),
-                    ..
-                }
+                    ..}
                 | SuspendKind::IfThen {
                     cond_let_pat: Some(pat),
-                    ..
-                }
+                    ..}
                 | SuspendKind::IfElse {
                     cond_let_pat: Some(pat),
                     ..
@@ -1165,20 +1275,17 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 }
                 SuspendKind::IfElse {
                     cond_await_base: Some(_),
+                    then_branch,
+                    else_suspend,
+                    expr_bind,
                     ..
                 } => {
                     // Outer if cond await: true → then sync → AfterIf; false → else suspend.
-                    let then_stmts = match &ap.kind {
-                        SuspendKind::IfElse { then_branch, .. } => {
-                            emit_stmts_rewrite_returns(&then_branch.stmts, &ready_ok)
-                        }
-                        _ => quote! {},
+                    let then_path = match expr_bind.as_ref() {
+                        Some(bind) => emit_stmts_bind_assign(bind, &then_branch.stmts, &ready_ok),
+                        None => emit_stmts_rewrite_returns(&then_branch.stmts, &ready_ok),
                     };
                     let go_wait = gen_enter_wait(ap, &waiting_variant(&ap.name), caps, &effect_enum);
-                    let else_suspend = match &ap.kind {
-                        SuspendKind::IfElse { else_suspend, .. } => else_suspend,
-                        _ => unreachable!(),
-                    };
                     let mut sib_idx = 0usize;
                     let else_body = emit_else_suspend(
                         else_suspend,
@@ -1188,10 +1295,11 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         &mut sib_idx,
                         &goto_after,
                         &ready_ok,
+                        expr_bind.as_ref(),
                     );
                     quote! {
                         if __wait.expect("call settle_wait before step") {
-                            #then_stmts
+                            #then_path
                             #goto_after
                         } else {
                             #else_body
@@ -1213,7 +1321,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             });
         }
 
-        if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. }) {
+        if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, ..}) {
             let cap_pats: Vec<_> = caps.iter().map(cap_pat).collect();
             let cap_moves: Vec<_> = caps
                 .iter()
@@ -1226,16 +1334,20 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             let join_i = join_caps_index(ap, i);
             let after_resume =
                 gen_after_resume(i, ap, &join_caps_at[join_i], &ready_ok);
+            let nest_after = if let Some(g) = nest_gate_ending_at(i, &awaits) {
+                rewrite_gate_after_stmts(ap, &g.after, &join_caps_at[join_i], &ready_ok)
+            } else {
+                quote! {}
+            };
             let tail = match &ap.kind {
                 // Cond-only while: resume already jumps to LoopHead / AfterLoop.
                 SuspendKind::While {
                     sync_cond: None,
                     has_body_await: false,
-                    ..
-                } => quote! {},
-                SuspendKind::Loop { .. }
-                | SuspendKind::While { .. }
-                | SuspendKind::For { .. } => {
+                    ..} => quote! {},
+                SuspendKind::Loop { ..}
+                | SuspendKind::While { ..}
+                | SuspendKind::For { ..} => {
                     if is_chain_last(ap) {
                         let head = chain_head_of(ap).unwrap_or(i);
                         let join_i = join_caps_index(ap, i);
@@ -1260,11 +1372,11 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         &effective_join_caps(ap, &join_caps_at[join_i]),
                     )
                 }
-                SuspendKind::IfThen { .. }
-                | SuspendKind::MatchArm { .. }
+                SuspendKind::IfThen { ..}
+                | SuspendKind::MatchArm { ..}
                 | SuspendKind::MatchGuard { .. }
-                | SuspendKind::LabeledBlock { .. }
-                | SuspendKind::TryBlock { .. } => {
+                | SuspendKind::LabeledBlock { ..}
+                | SuspendKind::TryBlock { ..} => {
                     if is_chain_last(ap) {
                         let join_i = join_caps_index(ap, i);
                         gen_goto_join(
@@ -1316,6 +1428,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                             }
                             ::core::result::Result::Ok(::corot_rs::Step::Ready(#tmp)) => {
                                 #after_resume
+                                #nest_after
                                 #tail
                             }
                             ::core::result::Result::Ok(::corot_rs::Step::Effect(__eff)) => {
@@ -1345,6 +1458,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         #guard
                         let #tmp = __wait.expect("call settle_wait before step");
                         #after_resume
+                        #nest_after
                         #tail
                     }
                 });
@@ -1575,91 +1689,426 @@ fn expand_await_stmt(
     Ok(None)
 }
 
-/// Plain typed-let awaits in a construct body, in order, plus trailing sync stmts.
-fn extract_body_awaits(
+/// Body units: plain typed-let awaits and nested `if` / `if let` (then-only).
+fn extract_body_units(
     stmts: &[Stmt],
     err_ty: Option<&Type>,
-) -> syn::Result<(Vec<(Vec<Stmt>, PlainAwait)>, Vec<Stmt>)> {
-    let mut segments = Vec::new();
+) -> syn::Result<(Vec<BodyUnit>, Vec<Stmt>)> {
+    let mut units = Vec::new();
     let mut current = Vec::new();
     for stmt in stmts {
-        if let Some(plain) = as_plain_await_let(stmt, err_ty, segments.len())? {
-            segments.push((std::mem::take(&mut current), plain));
-        } else if stmt_contains_await(stmt) {
+        if let Some(plain) = as_plain_await_let(stmt, err_ty, units_await_count(&units))? {
+            units.push(BodyUnit::Plain {
+                before: std::mem::take(&mut current),
+                plain,
+            });
+            continue;
+        }
+        if let Some(nested) = as_nested_if_unit(stmt, err_ty)? {
+            let BodyUnit::NestedIf {
+                cond,
+                then_binds,
+                else_branch,
+                then_units,
+                then_trailing,
+                ..
+            } = nested
+            else {
+                unreachable!()
+            };
+            units.push(BodyUnit::NestedIf {
+                before: std::mem::take(&mut current),
+                cond,
+                then_binds,
+                else_branch,
+                then_units,
+                then_trailing,
+            });
+            continue;
+        }
+        if stmt_contains_await(stmt) {
             return Err(syn::Error::new_spanned(
                 stmt,
-                "#[corot] await inside a suspending block must be a typed let binding",
+                "#[corot] nested suspending construct in a body must be `if` / `if let` \
+                 with awaits only in the then branch (else sync); \
+                 nested loop/while/for/match are not supported yet",
             ));
-        } else {
-            current.push(stmt.clone());
         }
+        current.push(stmt.clone());
     }
-    if segments.is_empty() {
+    if units.is_empty() {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "internal error: expected await in branch",
         ));
     }
-    Ok((segments, current))
+    Ok((units, current))
 }
+
+fn units_await_count(units: &[BodyUnit]) -> usize {
+    units.iter().map(unit_await_count).sum()
+}
+
+fn unit_await_count(unit: &BodyUnit) -> usize {
+    match unit {
+        BodyUnit::Plain { .. } => 1,
+        BodyUnit::NestedIf { then_units, .. } => units_await_count(then_units),
+    }
+}
+
+fn as_nested_if_unit(stmt: &Stmt, err_ty: Option<&Type>) -> syn::Result<Option<BodyUnit>> {
+    let Stmt::Expr(Expr::If(expr_if), _) = stmt else {
+        return Ok(None);
+    };
+    if contains_await(&expr_if.cond) {
+        return Err(syn::Error::new_spanned(
+            &expr_if.cond,
+            "#[corot] await in a nested `if` condition inside another suspending body \
+             is not supported yet",
+        ));
+    }
+    let then_has = expr_if.then_branch.stmts.iter().any(stmt_contains_await);
+    let else_has = expr_if
+        .else_branch
+        .as_ref()
+        .is_some_and(|(_, e)| contains_await(e));
+    if !then_has {
+        return Ok(None); // sync if — treat as normal stmt by caller
+    }
+    if else_has {
+        return Err(syn::Error::new_spanned(
+            stmt,
+            "#[corot] nested `if` inside a suspending body cannot await in else / else-if yet",
+        ));
+    }
+    let else_branch = expr_if.else_branch.as_ref().map(|(_, e)| e.clone());
+    let (then_units, then_trailing) = extract_body_units(&expr_if.then_branch.stmts, err_ty)?;
+    if then_units
+        .iter()
+        .any(|u| matches!(u, BodyUnit::NestedIf { .. }))
+    {
+        return Err(syn::Error::new_spanned(
+            stmt,
+            "#[corot] only one level of nested `if` inside a suspending body is supported",
+        ));
+    }
+    let pat_binds = if_let_pat_binds(&expr_if.cond)?;
+    let cond = strip_val_in_if_cond(expr_if.cond.as_ref().clone());
+    Ok(Some(BodyUnit::NestedIf {
+        before: Vec::new(),
+        cond,
+        then_binds: pat_binds,
+        else_branch,
+        then_units,
+        then_trailing,
+    }))
+}
+
 
 fn extract_single_await_from_stmts(
     stmts: &[Stmt],
     err_ty: Option<&Type>,
 ) -> syn::Result<(Vec<Stmt>, PlainAwait, Vec<Stmt>)> {
-    let (mut segments, trailing) = extract_body_awaits(stmts, err_ty)?;
-    if segments.len() != 1 {
+    let (units, trailing) = extract_body_units(stmts, err_ty)?;
+    if units.len() != 1 {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "#[corot] only one await is supported in this position",
         ));
     }
-    let (before, plain) = segments.remove(0);
-    Ok((before, plain, trailing))
+    match units.into_iter().next().unwrap() {
+        BodyUnit::Plain { before, plain } => Ok((before, plain, trailing)),
+        BodyUnit::NestedIf { .. } => Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "#[corot] only one await is supported in this position",
+        )),
+    }
 }
 
-fn plain_segments_to_points<F>(
+fn body_units_to_points<F>(
     _index: usize,
-    segments: Vec<(Vec<Stmt>, PlainAwait)>,
+    units: Vec<BodyUnit>,
     trailing: Vec<Stmt>,
     mut make_kind: F,
 ) -> Vec<AwaitPoint>
 where
-    F: FnMut(usize, usize, Vec<Stmt>, Vec<Stmt>) -> SuspendKind,
+    F: FnMut(usize, usize, Vec<Stmt>, Vec<Stmt>, Option<EntryGate>) -> SuspendKind,
 {
-    let len = segments.len();
+    let len = units_await_count(&units);
     let mut out = Vec::with_capacity(len);
-    for (pos, (before_await, plain)) in segments.into_iter().enumerate() {
-        let mut after_await = plain.after_resume;
-        if pos + 1 == len {
-            after_await.extend(trailing.iter().cloned());
-        }
-        out.push(AwaitPoint {
-            name: plain.name,
-            tmp: plain.tmp,
-            wait_ty: plain.wait_ty,
-            base: plain.base,
-            before: Vec::new(),
-            try_ok: plain.try_ok,
-            nested_child: plain.nested_child,
-            effect: plain.effect,
-            kind: make_kind(pos, len, before_await, after_await),
-        });
-    }
+    let mut pos = 0usize;
+    flatten_body_units(units, trailing, len, &mut pos, &mut out, &mut make_kind);
+    debug_assert_eq!(pos, len);
     out
+}
+
+/// Flatten body units into parent-kind await points. Nested `if`s become an
+/// [`EntryGate`] on their first await (else skips `span` slots after `after`).
+fn flatten_body_units<F>(
+    units: Vec<BodyUnit>,
+    trailing: Vec<Stmt>,
+    chain_len: usize,
+    pos: &mut usize,
+    out: &mut Vec<AwaitPoint>,
+    make_kind: &mut F,
+) where
+    F: FnMut(usize, usize, Vec<Stmt>, Vec<Stmt>, Option<EntryGate>) -> SuspendKind,
+{
+    let nunits = units.len();
+    for (ui, unit) in units.into_iter().enumerate() {
+        let is_last_unit = ui + 1 == nunits;
+        match unit {
+            BodyUnit::Plain { before, plain } => {
+                let start = *pos;
+                let mut after_await = plain.after_resume;
+                if is_last_unit {
+                    after_await.extend(trailing.iter().cloned());
+                }
+                out.push(AwaitPoint {
+                    name: plain.name,
+                    tmp: plain.tmp,
+                    wait_ty: plain.wait_ty,
+                    base: plain.base,
+                    before: Vec::new(),
+                    try_ok: plain.try_ok,
+                    nested_child: plain.nested_child,
+                    effect: plain.effect,
+                    kind: make_kind(start, chain_len, before, after_await, None),
+                });
+                *pos += 1;
+            }
+            BodyUnit::NestedIf {
+                before: nest_before,
+                cond,
+                then_binds,
+                else_branch,
+                mut then_units,
+                then_trailing,
+            } => {
+                let span = units_await_count(&then_units);
+                if let Some(first) = then_units.first_mut() {
+                    let b = match first {
+                        BodyUnit::Plain { before, .. }
+                        | BodyUnit::NestedIf { before, .. } => before,
+                    };
+                    let mut prefixed = nest_before;
+                    prefixed.append(b);
+                    *b = prefixed;
+                }
+                // Body trailing after a final nested `if` runs on both then/else —
+                // keep it on the gate, not only on the resume path.
+                let (inner_trailing, gate_after) = if is_last_unit {
+                    (then_trailing, trailing.clone())
+                } else {
+                    (then_trailing, Vec::new())
+                };
+                let before_len = out.len();
+                flatten_body_units(
+                    then_units,
+                    inner_trailing,
+                    chain_len,
+                    pos,
+                    out,
+                    make_kind,
+                );
+                if before_len < out.len() {
+                    if entry_gate_of(&out[before_len].kind).is_some() {
+                        continue;
+                    }
+                    set_entry_gate(
+                        &mut out[before_len].kind,
+                        Some(EntryGate {
+                            cond,
+                            then_binds,
+                            else_branch,
+                            span,
+                            after: gate_after,
+                        }),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn entry_gate_of(kind: &SuspendKind) -> Option<&EntryGate> {
+    match kind {
+        SuspendKind::Loop { entry_gate, .. }
+        | SuspendKind::While { entry_gate, .. }
+        | SuspendKind::For { entry_gate, .. }
+        | SuspendKind::IfThen { entry_gate, ..}
+        | SuspendKind::MatchArm { entry_gate, ..}
+        | SuspendKind::LabeledBlock { entry_gate, .. }
+        | SuspendKind::TryBlock { entry_gate, .. } => entry_gate.as_ref(),
+        _ => None,
+    }
+}
+
+fn entry_gate_mut(kind: &mut SuspendKind) -> Option<&mut Option<EntryGate>> {
+    match kind {
+        SuspendKind::Loop { entry_gate, .. }
+        | SuspendKind::While { entry_gate, .. }
+        | SuspendKind::For { entry_gate, .. }
+        | SuspendKind::IfThen { entry_gate, ..}
+        | SuspendKind::MatchArm { entry_gate, ..}
+        | SuspendKind::LabeledBlock { entry_gate, .. }
+        | SuspendKind::TryBlock { entry_gate, .. } => Some(entry_gate),
+        _ => None,
+    }
+}
+
+fn set_entry_gate(kind: &mut SuspendKind, gate: Option<EntryGate>) {
+    if let Some(slot) = entry_gate_mut(kind) {
+        *slot = gate;
+    }
+}
+
+fn nest_gate_ending_at(index: usize, awaits: &[AwaitPoint]) -> Option<&EntryGate> {
+    for (i, ap) in awaits.iter().enumerate().take(index + 1) {
+        if let Some(g) = entry_gate_of(&ap.kind) {
+            if i + g.span == index + 1 {
+                return Some(g);
+            }
+        }
+    }
+    None
+}
+
+fn rewrite_gate_after_stmts(
+    ap: &AwaitPoint,
+    stmts: &[Stmt],
+    join_caps: &[Binding],
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match &ap.kind {
+        SuspendKind::Loop {
+            label,
+            break_bind,
+            chain_head,
+            ..
+        } => rewrite_loop_body_stmts(
+            *chain_head,
+            stmts,
+            join_caps,
+            label.as_ref(),
+            false,
+            break_bind.as_ref(),
+            ready_ok,
+        ),
+        SuspendKind::While {
+            label,
+            chain_head,
+            ..
+        } => rewrite_loop_body_stmts(
+            *chain_head,
+            stmts,
+            join_caps,
+            label.as_ref(),
+            false,
+            None,
+            ready_ok,
+        ),
+        SuspendKind::For {
+            label,
+            chain_head,
+            ..
+        } => rewrite_loop_body_stmts(
+            *chain_head,
+            stmts,
+            join_caps,
+            label.as_ref(),
+            true,
+            None,
+            ready_ok,
+        ),
+        _ => emit_stmts_rewrite_returns(stmts, ready_ok),
+    }
+}
+
+fn gen_body_skip_to(
+    target_i: usize,
+    from_ap: &AwaitPoint,
+    awaits: &[AwaitPoint],
+    captures_at_await: &[Vec<Binding>],
+    join_caps_at: &[Vec<Binding>],
+    ready_ok: &proc_macro2::TokenStream,
+    effect_enum: &Ident,
+) -> proc_macro2::TokenStream {
+    let head = chain_head_of(from_ap).unwrap_or(0);
+    let len = chain_pos_len(from_ap).map(|(_, l)| l).unwrap_or(1);
+    if target_i < head + len {
+        let next = &awaits[target_i];
+        let next_var = waiting_variant(&next.name);
+        let next_caps = &captures_at_await[target_i];
+        gen_enter_await(
+            target_i,
+            next,
+            &next_var,
+            next_caps,
+            &join_caps_at[target_i],
+            awaits,
+            captures_at_await,
+            join_caps_at,
+            ready_ok,
+            effect_enum,
+        )
+    } else if is_loop_kind(&from_ap.kind) {
+        gen_goto_loop_head(head, from_ap, &join_caps_at[head])
+    } else {
+        gen_goto_join(
+            from_ap,
+            head,
+            &effective_join_caps(from_ap, &join_caps_at[head]),
+        )
+    }
+}
+
+fn gen_entry_gate_wrap(
+    index: usize,
+    ap: &AwaitPoint,
+    gate: &EntryGate,
+    then_body: proc_macro2::TokenStream,
+    awaits: &[AwaitPoint],
+    captures_at_await: &[Vec<Binding>],
+    join_caps_at: &[Vec<Binding>],
+    ready_ok: &proc_macro2::TokenStream,
+    effect_enum: &Ident,
+) -> proc_macro2::TokenStream {
+    let cond = &gate.cond;
+    let else_body = else_expr_tokens(&gate.else_branch, ready_ok);
+    let join_i = join_caps_index(ap, index);
+    let after = rewrite_gate_after_stmts(ap, &gate.after, &join_caps_at[join_i], ready_ok);
+    let skip = gen_body_skip_to(
+        index + gate.span,
+        ap,
+        awaits,
+        captures_at_await,
+        join_caps_at,
+        ready_ok,
+        effect_enum,
+    );
+    quote! {
+        if #cond {
+            #then_body
+        } else {
+            #else_body
+            #after
+            #skip
+        }
+    }
 }
 
 fn chain_head_of(ap: &AwaitPoint) -> Option<usize> {
     match &ap.kind {
-        SuspendKind::Loop { chain_head, .. }
-        | SuspendKind::While { chain_head, .. }
-        | SuspendKind::For { chain_head, .. }
-        | SuspendKind::IfThen { chain_head, .. }
+        SuspendKind::Loop { chain_head, ..}
+        | SuspendKind::While { chain_head, ..}
+        | SuspendKind::For { chain_head, ..}
+        | SuspendKind::IfThen { chain_head, ..}
         | SuspendKind::IfElse { chain_head, .. }
-        | SuspendKind::MatchArm { chain_head, .. }
+        | SuspendKind::MatchArm { chain_head, ..}
         | SuspendKind::MatchGuard { chain_head, .. }
-        | SuspendKind::LabeledBlock { chain_head, .. }
-        | SuspendKind::TryBlock { chain_head, .. } => Some(*chain_head),
+        | SuspendKind::LabeledBlock { chain_head, ..}
+        | SuspendKind::TryBlock { chain_head, ..} => Some(*chain_head),
         _ => None,
     }
 }
@@ -1669,23 +2118,19 @@ fn chain_pos_len(ap: &AwaitPoint) -> Option<(usize, usize)> {
         SuspendKind::Loop {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::While {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::For {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::IfThen {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::IfElse {
             chain_pos,
             chain_len,
@@ -1694,8 +2139,7 @@ fn chain_pos_len(ap: &AwaitPoint) -> Option<(usize, usize)> {
         | SuspendKind::MatchArm {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::MatchGuard {
             chain_pos,
             chain_len,
@@ -1704,13 +2148,11 @@ fn chain_pos_len(ap: &AwaitPoint) -> Option<(usize, usize)> {
         | SuspendKind::LabeledBlock {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::TryBlock {
             chain_pos,
             chain_len,
-            ..
-        } => Some((*chain_pos, *chain_len)),
+            ..} => Some((*chain_pos, *chain_len)),
         _ => None,
     }
 }
@@ -1742,6 +2184,21 @@ fn as_plain_await_let(
     else {
         return Ok(None);
     };
+
+    // Expression-position if/match/while/for/loop/block are handled elsewhere.
+    let init_inner = unwrap_parens_ref(expr);
+    if matches!(
+        init_inner,
+        Expr::If(_)
+            | Expr::Match(_)
+            | Expr::While(_)
+            | Expr::ForLoop(_)
+            | Expr::Loop(_)
+            | Expr::Block(_)
+            | Expr::TryBlock(_)
+    ) {
+        return Ok(None);
+    }
 
     let else_has_await = diverge
         .as_ref()
@@ -2041,7 +2498,8 @@ fn as_await_if_stmt(
                     },
                     else_branch: expr_if.else_branch.as_ref().map(|(_, e)| e.clone()),
                     join_stmts: Vec::new(),
-                },
+                    entry_gate: None,
+                    expr_bind: None,},
             }))
         }
         (true, true, false) => {
@@ -2076,7 +2534,8 @@ fn as_await_if_stmt(
                     },
                     else_branch: expr_if.else_branch.as_ref().map(|(_, e)| e.clone()),
                     join_stmts: Vec::new(),
-                },
+                    entry_gate: None,
+                    expr_bind: None,},
             }))
         }
         (false, false, true) => {
@@ -2107,7 +2566,7 @@ fn as_await_if_stmt(
                     chain_len: 1,
                     after_await: parsed.after_await,
                     join_stmts: Vec::new(),
-                },
+                    expr_bind: None,},
             }))
         }
         (true, false, true) => {
@@ -2147,7 +2606,7 @@ fn as_await_if_stmt(
                     chain_len: 1,
                     after_await: parsed.after_await,
                     join_stmts: Vec::new(),
-                },
+                    expr_bind: None,},
             }))
         }
         _ => Err(syn::Error::new_spanned(
@@ -2186,14 +2645,46 @@ fn parse_if_cond_await(
     }
 }
 
+fn parse_expr_bind(pat: &Pat) -> syn::Result<(Ident, Type)> {
+    let Pat::Type(PatType { pat: inner, ty, .. }) = pat else {
+        return Err(syn::Error::new_spanned(
+            pat,
+            "expression-position await bindings must be `let name: Type = <if/match …>`",
+        ));
+    };
+    let name = pat_ident_or_discard(inner)?;
+    Ok((name, ty.as_ref().clone()))
+}
+
 fn expand_if_stmt(
     stmt: &Stmt,
     index: usize,
     err_ty: Option<&Type>,
 ) -> syn::Result<Option<Vec<AwaitPoint>>> {
-    let Stmt::Expr(Expr::If(expr_if), _) = stmt else {
+    let (expr_if, expr_bind) = if let Stmt::Expr(Expr::If(expr_if), _) = stmt {
+        (expr_if, None)
+    } else if let Stmt::Local(Local {
+        pat,
+        init: Some(LocalInit {
+            expr,
+            diverge: None,
+            ..
+        }),
+        ..
+    }) = stmt
+    {
+        let Expr::If(expr_if) = unwrap_parens_ref(expr) else {
+            return Ok(None);
+        };
+        let mut bind = parse_expr_bind(pat)?;
+        if bind.0 == "_unit" {
+            bind.0 = format_ident!("_if{}", index);
+        }
+        (expr_if, Some(bind))
+    } else {
         return Ok(None);
     };
+
     let cond_has = contains_await(&expr_if.cond);
     let then_has = expr_if.then_branch.stmts.iter().any(stmt_contains_await);
     let else_has = expr_if
@@ -2201,11 +2692,23 @@ fn expand_if_stmt(
         .as_ref()
         .is_some_and(|(_, e)| contains_await(e));
 
+    if expr_bind.is_some() && !cond_has && !then_has && !else_has {
+        return Ok(None);
+    }
+    if let Some((_, ty)) = &expr_bind {
+        if expr_if.else_branch.is_none() && !is_unit_ty(ty) {
+            return Err(syn::Error::new_spanned(
+                stmt,
+                "#[corot] `let name: T = if …` with await requires an `else` when `T` is not `()`",
+            ));
+        }
+    }
+
     match (cond_has, then_has, else_has) {
         (false, false, false) => Ok(None),
         (false, true, false) | (true, true, false) => {
-            let (segments, trailing) =
-                extract_body_awaits(&expr_if.then_branch.stmts, err_ty)?;
+            let (units, trailing) =
+                extract_body_units(&expr_if.then_branch.stmts, err_ty)?;
             let (cond_await_base, cond_wait_ty, cond_let_pat, pat_binds, sync_cond) =
                 if cond_has {
                     let (base, ty, let_pat, binds, sync) = parse_if_cond_await(&expr_if.cond)?;
@@ -2220,11 +2723,12 @@ fn expand_if_stmt(
                     )
                 };
             let else_branch = expr_if.else_branch.as_ref().map(|(_, e)| e.clone());
-            Ok(Some(plain_segments_to_points(
+            let expr_bind_c = expr_bind.clone();
+            Ok(Some(body_units_to_points(
                 index,
-                segments,
+                units,
                 trailing,
-                |pos, len, before_await, after_await| SuspendKind::IfThen {
+                |pos, len, before_await, after_await, entry_gate| SuspendKind::IfThen {
                     cond: sync_cond.clone(),
                     pat_binds: if pos == 0 {
                         pat_binds.clone()
@@ -2257,6 +2761,8 @@ fn expand_if_stmt(
                         None
                     },
                     join_stmts: Vec::new(),
+                    entry_gate,
+                    expr_bind: expr_bind_c.clone(),
                 },
             )))
         }
@@ -2326,13 +2832,20 @@ fn expand_if_stmt(
                         chain_len: len,
                         after_await: leaf.after_await,
                         join_stmts: Vec::new(),
+                        expr_bind: expr_bind.clone(),
                     },
                 });
             }
             Ok(Some(out))
         }
         _ => {
-            // Mixed unsupported / single-await path via as_await_if_stmt.
+            if expr_bind.is_some() {
+                return Err(syn::Error::new_spanned(
+                    stmt,
+                    "#[corot] `let name: T = if` with await in multiple regions \
+                     (cond+then+else) is not supported yet",
+                ));
+            }
             Ok(as_await_if_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]))
         }
     }
@@ -2392,14 +2905,14 @@ fn expand_loop_stmt(
         return Ok(None);
     };
 
-    let (segments, trailing) = extract_body_awaits(&body_stmts, err_ty)?;
+    let (units, trailing) = extract_body_units(&body_stmts, err_ty)?;
     let label = label;
     let break_bind = break_bind;
-    Ok(Some(plain_segments_to_points(
+    Ok(Some(body_units_to_points(
         index,
-        segments,
+        units,
         trailing,
-        |pos, len, before_await, after_await| SuspendKind::Loop {
+        |pos, len, before_await, after_await, entry_gate| SuspendKind::Loop {
             label: label.clone(),
             break_bind: break_bind.clone(),
             chain_head: index,
@@ -2408,6 +2921,7 @@ fn expand_loop_stmt(
             before_await,
             after_await,
             join_stmts: Vec::new(),
+            entry_gate,
         },
     )))
 }
@@ -2477,12 +2991,12 @@ fn expand_while_stmt(
             }
         };
 
-    let (segments, trailing) = extract_body_awaits(&expr_while.body.stmts, err_ty)?;
-    Ok(Some(plain_segments_to_points(
+    let (units, trailing) = extract_body_units(&expr_while.body.stmts, err_ty)?;
+    Ok(Some(body_units_to_points(
         index,
-        segments,
+        units,
         trailing,
-        |pos, len, before_await, after_await| SuspendKind::While {
+        |pos, len, before_await, after_await, entry_gate| SuspendKind::While {
             label: label.clone(),
             sync_cond: sync_cond.clone(),
             cond_await_base: if pos == 0 {
@@ -2512,6 +3026,7 @@ fn expand_while_stmt(
             before_await,
             after_await,
             join_stmts: Vec::new(),
+            entry_gate,
         },
     )))
 }
@@ -2538,13 +3053,13 @@ fn expand_for_stmt(
             ForIterSource::Await(e) => (None, Some(e)),
         };
         let label = expr_for.label.as_ref().map(|l| l.name.ident.clone());
-        let (segments, trailing) =
-            extract_body_awaits(&expr_for.body.stmts, err_ty)?;
-        return Ok(Some(plain_segments_to_points(
+        let (units, trailing) =
+            extract_body_units(&expr_for.body.stmts, err_ty)?;
+        return Ok(Some(body_units_to_points(
             index,
-            segments,
+            units,
             trailing,
-            |pos, len, before_await, after_await| SuspendKind::For {
+            |pos, len, before_await, after_await, entry_gate| SuspendKind::For {
                 label: label.clone(),
                 item_pat: item_pat.clone(),
                 item_binds: if pos == 0 {
@@ -2571,6 +3086,7 @@ fn expand_for_stmt(
                 before_await,
                 after_await,
                 join_stmts: Vec::new(),
+            entry_gate,
             },
         )));
     }
@@ -2615,13 +3131,13 @@ fn expand_labeled_block_stmt(
         };
         let bind_ty = ty.as_ref().clone();
         let label_id = label.name.ident.clone();
-        let (segments, trailing) =
-            extract_body_awaits(&expr_block.block.stmts, err_ty)?;
-        return Ok(Some(plain_segments_to_points(
+        let (units, trailing) =
+            extract_body_units(&expr_block.block.stmts, err_ty)?;
+        return Ok(Some(body_units_to_points(
             index,
-            segments,
+            units,
             trailing,
-            |pos, len, before_await, after_await| SuspendKind::LabeledBlock {
+            |pos, len, before_await, after_await, entry_gate| SuspendKind::LabeledBlock {
                 label: label_id.clone(),
                 bind_name: bind_name.clone(),
                 bind_ty: bind_ty.clone(),
@@ -2632,6 +3148,7 @@ fn expand_labeled_block_stmt(
                 before_await,
                 after_await,
                 join_stmts: Vec::new(),
+            entry_gate,
             },
         )));
     }
@@ -2644,13 +3161,13 @@ fn expand_labeled_block_stmt(
         }
         let label_id = label.name.ident.clone();
         let bind_name = format_ident!("_blk{}", index);
-        let (segments, trailing) =
-            extract_body_awaits(&expr_block.block.stmts, err_ty)?;
-        return Ok(Some(plain_segments_to_points(
+        let (units, trailing) =
+            extract_body_units(&expr_block.block.stmts, err_ty)?;
+        return Ok(Some(body_units_to_points(
             index,
-            segments,
+            units,
             trailing,
-            |pos, len, before_await, after_await| SuspendKind::LabeledBlock {
+            |pos, len, before_await, after_await, entry_gate| SuspendKind::LabeledBlock {
                 label: label_id.clone(),
                 bind_name: bind_name.clone(),
                 bind_ty: syn::parse_quote!(()),
@@ -2661,6 +3178,7 @@ fn expand_labeled_block_stmt(
                 before_await,
                 after_await,
                 join_stmts: Vec::new(),
+            entry_gate,
             },
         )));
     }
@@ -2703,13 +3221,13 @@ fn expand_try_block_stmt(
     } else {
         bind_name
     };
-    let (segments, trailing) =
-        extract_body_awaits(&try_block.block.stmts, Some(&err_ty))?;
-    Ok(Some(plain_segments_to_points(
+    let (units, trailing) =
+        extract_body_units(&try_block.block.stmts, Some(&err_ty))?;
+    Ok(Some(body_units_to_points(
         index,
-        segments,
+        units,
         trailing,
-        |pos, len, before_await, after_await| SuspendKind::TryBlock {
+        |pos, len, before_await, after_await, entry_gate| SuspendKind::TryBlock {
             bind_name: bind_name.clone(),
             bind_ty: bind_ty.clone(),
             chain_head: index,
@@ -2718,6 +3236,7 @@ fn expand_try_block_stmt(
             before_await,
             after_await,
             join_stmts: Vec::new(),
+            entry_gate,
         },
     )))
 }
@@ -2727,9 +3246,39 @@ fn expand_match_stmt(
     index: usize,
     err_ty: Option<&Type>,
 ) -> syn::Result<Option<Vec<AwaitPoint>>> {
-    let Stmt::Expr(Expr::Match(expr_match), _) = stmt else {
+    let (expr_match, expr_bind) = if let Stmt::Expr(Expr::Match(expr_match), _) = stmt {
+        (expr_match, None)
+    } else if let Stmt::Local(Local {
+        pat,
+        init: Some(LocalInit {
+            expr,
+            diverge: None,
+            ..
+        }),
+        ..
+    }) = stmt
+    {
+        let Expr::Match(expr_match) = unwrap_parens_ref(expr) else {
+            return Ok(None);
+        };
+        let mut bind = parse_expr_bind(pat)?;
+        if bind.0 == "_unit" {
+            bind.0 = format_ident!("_match{}", index);
+        }
+        (expr_match, Some(bind))
+    } else {
         return Ok(None);
     };
+
+    let any_await = contains_await(&expr_match.expr)
+        || expr_match.arms.iter().any(|a| {
+            a.guard.as_ref().is_some_and(|(_, g)| contains_await(g))
+                || contains_await(&a.body)
+        });
+    if expr_bind.is_some() && !any_await {
+        return Ok(None);
+    }
+
     // Guard + body dual-region on one arm.
     for (i, arm) in expr_match.arms.iter().enumerate() {
         let guard_await = arm
@@ -2738,6 +3287,12 @@ fn expand_match_stmt(
             .is_some_and(|(_, g)| contains_await(g));
         let body_await = contains_await(&arm.body);
         if guard_await && body_await {
+            if expr_bind.is_some() {
+                return Err(syn::Error::new_spanned(
+                    stmt,
+                    "#[corot] `let name: T = match` with guard+body await is not supported yet",
+                ));
+            }
             if contains_await(&expr_match.expr) {
                 return Err(syn::Error::new_spanned(
                     arm,
@@ -2771,17 +3326,17 @@ fn expand_match_stmt(
                 ));
             };
             let body_stmts = expr_as_stmts(&arm.body);
-            let (segments, trailing) = extract_body_awaits(&body_stmts, err_ty)?;
+            let (units, trailing) = extract_body_units(&body_stmts, err_ty)?;
             let scrutinee = expr_match.expr.as_ref().clone();
             let arms_before = expr_match.arms[..i].to_vec();
             let arms_after = expr_match.arms[i + 1..].to_vec();
             let sus_pat = arm.pat.clone();
             let sus_body = arm.body.clone();
-            return Ok(Some(plain_segments_to_points(
+            return Ok(Some(body_units_to_points(
                 index,
-                segments,
+                units,
                 trailing,
-                |pos, len, before_await, after_await| SuspendKind::MatchGuard {
+                |pos, len, before_await, after_await, _entry_gate| SuspendKind::MatchGuard {
                     scrutinee: scrutinee.clone(),
                     scrut_ty: scrut_ty.clone(),
                     arms_before: if pos == 0 {
@@ -2825,36 +3380,62 @@ fn expand_match_stmt(
         }
         if body_await {
             if arm_idx.is_some() || contains_await(&expr_match.expr) {
+                if expr_bind.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        stmt,
+                        "#[corot] `let name: T = match` with this await shape is not supported yet",
+                    ));
+                }
                 return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
             }
             arm_idx = Some(i);
         }
     }
     let Some(ai) = arm_idx else {
+        if expr_bind.is_some() {
+            return Err(syn::Error::new_spanned(
+                stmt,
+                "#[corot] `let name: T = match` requires await in exactly one arm body \
+                 (scrutinee/guard-only expression match is not supported yet)",
+            ));
+        }
         return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
     };
     let sus = &expr_match.arms[ai];
     if sus.guard.as_ref().is_some_and(|(_, g)| contains_await(g)) {
+        if expr_bind.is_some() {
+            return Err(syn::Error::new_spanned(
+                stmt,
+                "#[corot] `let name: T = match` with this await shape is not supported yet",
+            ));
+        }
         return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
     }
     check_supported_pat(&sus.pat)?;
     let body_stmts = expr_as_stmts(&sus.body);
     if !body_stmts.iter().any(stmt_contains_await) {
+        if expr_bind.is_some() {
+            return Err(syn::Error::new_spanned(
+                stmt,
+                "#[corot] `let name: T = match` with this await shape is not supported yet",
+            ));
+        }
         return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
     }
     let scrut_ty = infer_match_scrutinee_ty(&expr_match.expr, &expr_match.arms)?;
     let pat_binds = bindings_from_pat(&sus.pat, &scrut_ty)?;
-    let (segments, trailing) = extract_body_awaits(&body_stmts, err_ty)?;
+    let (units, trailing) = extract_body_units(&body_stmts, err_ty)?;
     let scrutinee = expr_match.expr.as_ref().clone();
     let arms_before = expr_match.arms[..ai].to_vec();
     let arms_after = expr_match.arms[ai + 1..].to_vec();
     let sus_pat = sus.pat.clone();
     let sus_guard = sus.guard.as_ref().map(|(_, g)| g.clone());
-    Ok(Some(plain_segments_to_points(
+    let expr_bind_c = expr_bind.clone();
+    Ok(Some(body_units_to_points(
         index,
-        segments,
+        units,
         trailing,
-        |pos, len, before_await, after_await| SuspendKind::MatchArm {
+        |pos, len, before_await, after_await, entry_gate| SuspendKind::MatchArm {
             scrutinee: scrutinee.clone(),
             scrut_ty: scrut_ty.clone(),
             pat_binds: if pos == 0 {
@@ -2884,6 +3465,8 @@ fn expand_match_stmt(
                 Vec::new()
             },
             join_stmts: Vec::new(),
+            entry_gate,
+            expr_bind: expr_bind_c.clone(),
         },
     )))
 }
@@ -2950,6 +3533,7 @@ fn as_await_while_stmt(
                         v
                     },
                     join_stmts: Vec::new(),
+                    entry_gate: None,
                 },
             }))
         }
@@ -2982,7 +3566,8 @@ fn as_await_while_stmt(
                         before_await: Vec::new(),
                         after_await: expr_while.body.stmts.clone(),
                         join_stmts: Vec::new(),
-                    },
+                    entry_gate: None,
+                },
                 }))
             } else {
                 let Some(base) = bare_await_base(&expr_while.cond) else {
@@ -3016,7 +3601,8 @@ fn as_await_while_stmt(
                         before_await: Vec::new(),
                         after_await: expr_while.body.stmts.clone(),
                         join_stmts: Vec::new(),
-                    },
+                    entry_gate: None,
+                },
                 }))
             }
         }
@@ -3106,7 +3692,8 @@ fn as_await_for_stmt(
                 v
             },
             join_stmts: Vec::new(),
-        },
+                    entry_gate: None,
+                },
     }))
 }
 
@@ -4452,7 +5039,8 @@ fn as_await_match_stmt(
                     },
                     arms_after: expr_match.arms[ai + 1..].to_vec(),
                     join_stmts: Vec::new(),
-                },
+                    entry_gate: None,
+                    expr_bind: None,},
             }))
         }
         (false, None, Some(gi)) => {
@@ -5103,6 +5691,7 @@ fn emit_else_suspend(
     sibling_idx: &mut usize,
     non_suspend: &proc_macro2::TokenStream,
     ready_ok: &proc_macro2::TokenStream,
+    expr_bind: Option<&(Ident, Type)>,
 ) -> proc_macro2::TokenStream {
     match es {
         ElseSuspend::FinalBlock { before_await } => {
@@ -5134,9 +5723,10 @@ fn emit_else_suspend(
                     sibling_idx,
                     non_suspend,
                     ready_ok,
+                    expr_bind,
                 )
             } else {
-                let else_body = else_expr_tokens(rest_else, ready_ok);
+                let else_body = emit_opt_expr_bind_assign(expr_bind, rest_else, ready_ok);
                 quote! {
                     #else_body
                     #non_suspend
@@ -5156,7 +5746,10 @@ fn emit_else_suspend(
             then_branch,
             rest,
         } => {
-            let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
+            let then_path = match expr_bind {
+                Some(bind) => emit_stmts_bind_assign(bind, &then_branch.stmts, ready_ok),
+                None => emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok),
+            };
             let rest_code = emit_else_suspend(
                 rest,
                 go_wait,
@@ -5165,10 +5758,11 @@ fn emit_else_suspend(
                 sibling_idx,
                 non_suspend,
                 ready_ok,
+                expr_bind,
             );
             quote! {
                 if #cond {
-                    #then_stmts
+                    #then_path
                     #non_suspend
                 } else {
                     #rest_code
@@ -5192,15 +5786,15 @@ fn emit_else_suspend(
 fn after_resume_stmts(ap: &AwaitPoint) -> Vec<&Stmt> {
     match &ap.kind {
         SuspendKind::Plain { after_resume } => after_resume.iter().collect(),
-        SuspendKind::IfThen { after_await, .. }
+        SuspendKind::IfThen { after_await, ..}
         | SuspendKind::IfElse { after_await, .. }
-        | SuspendKind::Loop { after_await, .. }
-        | SuspendKind::While { after_await, .. }
-        | SuspendKind::For { after_await, .. }
-        | SuspendKind::MatchArm { after_await, .. }
+        | SuspendKind::Loop { after_await, ..}
+        | SuspendKind::While { after_await, ..}
+        | SuspendKind::For { after_await, ..}
+        | SuspendKind::MatchArm { after_await, ..}
         | SuspendKind::LetElseAwait { after_await, .. }
-        | SuspendKind::LabeledBlock { after_await, .. }
-        | SuspendKind::TryBlock { after_await, .. } => after_await.iter().collect(),
+        | SuspendKind::LabeledBlock { after_await, ..}
+        | SuspendKind::TryBlock { after_await, ..} => after_await.iter().collect(),
         SuspendKind::MatchGuard {
             has_body_await: true,
             after_await,
@@ -5213,8 +5807,31 @@ fn after_resume_stmts(ap: &AwaitPoint) -> Vec<&Stmt> {
     }
 }
 
-fn after_resume_escapes(kind: &SuspendKind) -> bool {
-    matches!(kind, SuspendKind::Plain { .. }) || is_mid_chain_kind(kind)
+/// Whether resume bindings from await `index` stay live for later awaits.
+/// Bindings inside a nested `if` must not escape past that nest (else skips them).
+fn after_resume_should_escape(index: usize, ap: &AwaitPoint, awaits: &[AwaitPoint]) -> bool {
+    if matches!(&ap.kind, SuspendKind::Plain { .. }) {
+        return true;
+    }
+    if !is_mid_chain_kind(&ap.kind) {
+        return false;
+    }
+    if let Some((start, g)) = nest_gate_covering(index, awaits) {
+        index + 1 < start + g.span
+    } else {
+        true
+    }
+}
+
+fn nest_gate_covering(index: usize, awaits: &[AwaitPoint]) -> Option<(usize, &EntryGate)> {
+    for (i, ap) in awaits.iter().enumerate().take(index + 1) {
+        if let Some(g) = entry_gate_of(&ap.kind) {
+            if i <= index && index < i + g.span {
+                return Some((i, g));
+            }
+        }
+    }
+    None
 }
 
 fn is_mid_chain_kind(kind: &SuspendKind) -> bool {
@@ -5224,28 +5841,23 @@ fn is_mid_chain_kind(kind: &SuspendKind) -> bool {
         SuspendKind::IfThen {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::Loop {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::While {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::For {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::MatchArm {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::MatchGuard {
             chain_pos,
             chain_len,
@@ -5254,13 +5866,11 @@ fn is_mid_chain_kind(kind: &SuspendKind) -> bool {
         | SuspendKind::LabeledBlock {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::TryBlock {
             chain_pos,
             chain_len,
-            ..
-        } => *chain_pos + 1 < *chain_len,
+            ..} => *chain_pos + 1 < *chain_len,
         _ => false,
     }
 }
@@ -5301,16 +5911,16 @@ fn pat_binds_after_resume(ap: &AwaitPoint) -> Vec<Binding> {
 fn needs_join(kind: &SuspendKind) -> bool {
     let base = matches!(
         kind,
-        SuspendKind::IfThen { .. }
+        SuspendKind::IfThen { ..}
             | SuspendKind::IfElse { .. }
-            | SuspendKind::Loop { .. }
-            | SuspendKind::While { .. }
-            | SuspendKind::For { .. }
-            | SuspendKind::MatchArm { .. }
+            | SuspendKind::Loop { ..}
+            | SuspendKind::While { ..}
+            | SuspendKind::For { ..}
+            | SuspendKind::MatchArm { ..}
             | SuspendKind::MatchGuard { .. }
             | SuspendKind::LetElseAwait { .. }
-            | SuspendKind::LabeledBlock { .. }
-            | SuspendKind::TryBlock { .. }
+            | SuspendKind::LabeledBlock { ..}
+            | SuspendKind::TryBlock { ..}
     );
     if !base {
         return false;
@@ -5320,8 +5930,7 @@ fn needs_join(kind: &SuspendKind) -> bool {
         SuspendKind::IfThen {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::IfElse {
             chain_pos,
             chain_len,
@@ -5330,23 +5939,19 @@ fn needs_join(kind: &SuspendKind) -> bool {
         | SuspendKind::Loop {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::While {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::For {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::MatchArm {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::MatchGuard {
             chain_pos,
             chain_len,
@@ -5355,13 +5960,11 @@ fn needs_join(kind: &SuspendKind) -> bool {
         | SuspendKind::LabeledBlock {
             chain_pos,
             chain_len,
-            ..
-        }
+            ..}
         | SuspendKind::TryBlock {
             chain_pos,
             chain_len,
-            ..
-        } => *chain_pos + 1 == *chain_len,
+            ..} => *chain_pos + 1 == *chain_len,
         _ => true,
     }
 }
@@ -5369,14 +5972,14 @@ fn needs_join(kind: &SuspendKind) -> bool {
 fn is_loop_kind(kind: &SuspendKind) -> bool {
     matches!(
         kind,
-        SuspendKind::Loop { .. } | SuspendKind::While { .. } | SuspendKind::For { .. }
+        SuspendKind::Loop { ..} | SuspendKind::While { ..} | SuspendKind::For { ..}
     )
 }
 
 fn is_match_join_kind(kind: &SuspendKind) -> bool {
     matches!(
         kind,
-        SuspendKind::MatchArm { .. } | SuspendKind::MatchGuard { .. }
+        SuspendKind::MatchArm { ..} | SuspendKind::MatchGuard { .. }
     )
 }
 
@@ -5393,8 +5996,7 @@ fn for_has_iter_await(kind: &SuspendKind) -> bool {
         kind,
         SuspendKind::For {
             iter_await_base: Some(_),
-            ..
-        }
+            ..}
     )
 }
 
@@ -5406,12 +6008,10 @@ fn has_cond_wait_slot(kind: &SuspendKind) -> bool {
     match kind {
         SuspendKind::While {
             cond_await_base: Some(_),
-            ..
-        }
+            ..}
         | SuspendKind::IfThen {
             cond_await_base: Some(_),
-            ..
-        }
+            ..}
         | SuspendKind::IfElse {
             cond_await_base: Some(_),
             ..
@@ -5435,12 +6035,10 @@ fn cond_wait_ty_of(kind: &SuspendKind) -> Option<&Type> {
     match kind {
         SuspendKind::While {
             cond_wait_ty: Some(ty),
-            ..
-        }
+            ..}
         | SuspendKind::IfThen {
             cond_wait_ty: Some(ty),
-            ..
-        }
+            ..}
         | SuspendKind::IfElse {
             cond_wait_ty: Some(ty),
             ..
@@ -5481,7 +6079,7 @@ fn cond_wait_ty_tokens(kind: &SuspendKind) -> Option<Type> {
 
 fn for_into_ty(kind: &SuspendKind) -> Option<&Type> {
     match kind {
-        SuspendKind::For { into_ty, .. } => Some(into_ty),
+        SuspendKind::For { into_ty, ..} => Some(into_ty),
         _ => None,
     }
 }
@@ -5514,16 +6112,16 @@ fn join_variant(kind: &SuspendKind, index: usize) -> Ident {
 
 fn join_stmts_of(ap: &AwaitPoint) -> Option<&[Stmt]> {
     match &ap.kind {
-        SuspendKind::IfThen { join_stmts, .. }
+        SuspendKind::IfThen { join_stmts, ..}
         | SuspendKind::IfElse { join_stmts, .. }
-        | SuspendKind::Loop { join_stmts, .. }
-        | SuspendKind::While { join_stmts, .. }
-        | SuspendKind::For { join_stmts, .. }
-        | SuspendKind::MatchArm { join_stmts, .. }
+        | SuspendKind::Loop { join_stmts, ..}
+        | SuspendKind::While { join_stmts, ..}
+        | SuspendKind::For { join_stmts, ..}
+        | SuspendKind::MatchArm { join_stmts, ..}
         | SuspendKind::MatchGuard { join_stmts, .. }
         | SuspendKind::LetElseAwait { join_stmts, .. }
-        | SuspendKind::LabeledBlock { join_stmts, .. }
-        | SuspendKind::TryBlock { join_stmts, .. } => Some(join_stmts.as_slice()),
+        | SuspendKind::LabeledBlock { join_stmts, ..}
+        | SuspendKind::TryBlock { join_stmts, ..} => Some(join_stmts.as_slice()),
         _ => None,
     }
 }
@@ -5540,13 +6138,11 @@ fn effective_join_caps(ap: &AwaitPoint, join_caps: &[Binding]) -> Vec<Binding> {
         SuspendKind::LabeledBlock {
             bind_name,
             bind_ty,
-            ..
-        }
+            ..}
         | SuspendKind::TryBlock {
             bind_name,
             bind_ty,
-            ..
-        } => {
+            ..} => {
             let mut caps = join_caps.to_vec();
             upsert_binding(
                 &mut caps,
@@ -5560,8 +6156,17 @@ fn effective_join_caps(ap: &AwaitPoint, join_caps: &[Binding]) -> Vec<Binding> {
         }
         SuspendKind::Loop {
             break_bind: Some((bind_name, bind_ty)),
+            ..}
+        | SuspendKind::IfThen {
+            expr_bind: Some((bind_name, bind_ty)),
+            ..}
+        | SuspendKind::IfElse {
+            expr_bind: Some((bind_name, bind_ty)),
             ..
-        } => {
+        }
+        | SuspendKind::MatchArm {
+            expr_bind: Some((bind_name, bind_ty)),
+            ..} => {
             let mut caps = join_caps.to_vec();
             upsert_binding(
                 &mut caps,
@@ -5582,21 +6187,28 @@ fn join_value_binding(ap: &AwaitPoint) -> Option<Binding> {
         SuspendKind::LabeledBlock {
             bind_name,
             bind_ty,
-            ..
-        }
+            ..}
         | SuspendKind::TryBlock {
             bind_name,
             bind_ty,
-            ..
-        } => Some(Binding {
+            ..} => Some(Binding {
             name: bind_name.clone(),
             ty: bind_ty.clone(),
             mutable: false,
         }),
         SuspendKind::Loop {
             break_bind: Some((bind_name, bind_ty)),
+            ..}
+        | SuspendKind::IfThen {
+            expr_bind: Some((bind_name, bind_ty)),
+            ..}
+        | SuspendKind::IfElse {
+            expr_bind: Some((bind_name, bind_ty)),
             ..
-        } => Some(Binding {
+        }
+        | SuspendKind::MatchArm {
+            expr_bind: Some((bind_name, bind_ty)),
+            ..} => Some(Binding {
             name: bind_name.clone(),
             ty: bind_ty.clone(),
             mutable: false,
@@ -5605,9 +6217,68 @@ fn join_value_binding(ap: &AwaitPoint) -> Option<Binding> {
     }
 }
 
+fn expr_bind_of(kind: &SuspendKind) -> Option<&(Ident, Type)> {
+    match kind {
+        SuspendKind::IfThen { expr_bind, ..}
+        | SuspendKind::IfElse { expr_bind, .. }
+        | SuspendKind::MatchArm { expr_bind, ..} => expr_bind.as_ref(),
+        _ => None,
+    }
+}
+
+fn emit_expr_bind_assign(
+    bind: &(Ident, Type),
+    expr: &Expr,
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let (name, ty) = bind;
+    match expr {
+        Expr::Block(b) => emit_stmts_bind_assign(bind, &b.block.stmts, ready_ok),
+        e => {
+            let value = emit_expr_rewrite_returns(e, ready_ok);
+            quote! { let #name: #ty = #value; }
+        }
+    }
+}
+
+fn emit_stmts_bind_assign(
+    bind: &(Ident, Type),
+    stmts: &[Stmt],
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let (name, ty) = bind;
+    let (body_stmts, trailing) = split_block_trailing(stmts);
+    let body = emit_stmts_rewrite_returns(&body_stmts, ready_ok);
+    let value = match trailing {
+        Some(e) => emit_expr_rewrite_returns(e, ready_ok),
+        None => quote! { () },
+    };
+    quote! {
+        #body
+        let #name: #ty = #value;
+    }
+}
+
+fn emit_opt_expr_bind_assign(
+    bind: Option<&(Ident, Type)>,
+    else_branch: &Option<Box<Expr>>,
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    match bind {
+        Some(bind) => match else_branch {
+            Some(e) => emit_expr_bind_assign(bind, e, ready_ok),
+            None => {
+                let (name, ty) = bind;
+                quote! { let #name: #ty = (); }
+            }
+        },
+        None => else_expr_tokens(else_branch, ready_ok),
+    }
+}
+
 fn loop_head_caps(ap: &AwaitPoint, join_caps: &[Binding]) -> Vec<Binding> {
     match &ap.kind {
-        SuspendKind::For { into_ty, .. } => {
+        SuspendKind::For { into_ty, ..} => {
             let mut caps = join_caps.to_vec();
             caps.push(Binding {
                 name: format_ident!("__iter"),
@@ -5631,16 +6302,16 @@ fn assign_join_stmts(awaits: &mut [AwaitPoint], after_last: &mut Vec<Stmt>) {
             std::mem::take(after_last)
         };
         match &mut awaits[i].kind {
-            SuspendKind::IfThen { join_stmts, .. }
+            SuspendKind::IfThen { join_stmts, ..}
             | SuspendKind::IfElse { join_stmts, .. }
-            | SuspendKind::Loop { join_stmts, .. }
-            | SuspendKind::While { join_stmts, .. }
-            | SuspendKind::For { join_stmts, .. }
-            | SuspendKind::MatchArm { join_stmts, .. }
+            | SuspendKind::Loop { join_stmts, ..}
+            | SuspendKind::While { join_stmts, ..}
+            | SuspendKind::For { join_stmts, ..}
+            | SuspendKind::MatchArm { join_stmts, ..}
             | SuspendKind::MatchGuard { join_stmts, .. }
             | SuspendKind::LetElseAwait { join_stmts, .. }
-            | SuspendKind::LabeledBlock { join_stmts, .. }
-            | SuspendKind::TryBlock { join_stmts, .. } => {
+            | SuspendKind::LabeledBlock { join_stmts, ..}
+            | SuspendKind::TryBlock { join_stmts, ..} => {
                 *join_stmts = join;
             }
             _ => {}
@@ -5706,7 +6377,7 @@ fn gen_goto_loop_head(
         quote! { #n }
     });
     match &ap.kind {
-        SuspendKind::For { .. } => quote! {
+        SuspendKind::For { ..} => quote! {
             *self = Self::#var {
                 __iter,
                 #(#fields,)*
@@ -5820,6 +6491,7 @@ fn gen_enter_await(
     join_caps: &[Binding],
     awaits: &[AwaitPoint],
     captures_at_await: &[Vec<Binding>],
+    join_caps_at: &[Vec<Binding>],
     ready_ok: &proc_macro2::TokenStream,
     effect_enum: &Ident,
 ) -> proc_macro2::TokenStream {
@@ -5858,10 +6530,25 @@ fn gen_enter_await(
                     break_bind.as_ref(),
                     ready_ok,
                 );
-                quote! {
+                let then_body = quote! {
                     #before
                     #before_await
                     #go_wait
+                };
+                if let Some(gate) = entry_gate_of(&ap.kind) {
+                    gen_entry_gate_wrap(
+                        index,
+                        ap,
+                        gate,
+                        then_body,
+                        awaits,
+                        captures_at_await,
+                        join_caps_at,
+                        ready_ok,
+                        effect_enum,
+                    )
+                } else {
+                    then_body
                 }
             } else {
                 let goto_head = gen_goto_loop_head(*chain_head, ap, join_caps);
@@ -5890,10 +6577,25 @@ fn gen_enter_await(
                     None,
                     ready_ok,
                 );
-                quote! {
+                let then_body = quote! {
                     #before
                     #before_await
                     #go_wait
+                };
+                if let Some(gate) = entry_gate_of(&ap.kind) {
+                    gen_entry_gate_wrap(
+                        index,
+                        ap,
+                        gate,
+                        then_body,
+                        awaits,
+                        captures_at_await,
+                        join_caps_at,
+                        ready_ok,
+                        effect_enum,
+                    )
+                } else {
+                    then_body
                 }
             } else {
                 let goto_head = gen_goto_loop_head(*chain_head, ap, join_caps);
@@ -5908,16 +6610,14 @@ fn gen_enter_await(
             sync_cond: None,
             cond_await_base: Some(base),
             chain_head,
-            ..
-        } => {
+            ..} => {
             if *chain_pos > 0 {
                 // Mid body chain: enter next body wait directly.
                 let before_await = match &ap.kind {
                     SuspendKind::While {
                         before_await,
                         label,
-                        ..
-                    } => rewrite_loop_body_stmts(
+                        ..} => rewrite_loop_body_stmts(
                         *chain_head,
                         before_await,
                         join_caps,
@@ -5949,8 +6649,7 @@ fn gen_enter_await(
             label,
             chain_head,
             has_body_await: false,
-            ..
-        } => {
+            ..} => {
             let _ = (chain_pos, before_await, label, chain_head);
             let goto_head = gen_goto_loop_head(*chain_head, ap, join_caps);
             quote! {
@@ -5963,8 +6662,7 @@ fn gen_enter_await(
             before_await,
             label,
             chain_head,
-            ..
-        } => {
+            ..} => {
             if *chain_pos > 0 {
                 let before_await = rewrite_loop_body_stmts(
                     *chain_head,
@@ -5997,8 +6695,7 @@ fn gen_enter_await(
             before_await,
             label,
             has_body_await,
-            ..
-        } => {
+            ..} => {
             if *chain_pos > 0 {
                 let before_await = rewrite_loop_body_stmts(
                     *chain_head,
@@ -6009,10 +6706,25 @@ fn gen_enter_await(
                     None,
                     ready_ok,
                 );
-                return quote! {
+                let then_body = quote! {
                     #before
                     #before_await
                     #go_wait
+                };
+                return if let Some(gate) = entry_gate_of(&ap.kind) {
+                    gen_entry_gate_wrap(
+                        index,
+                        ap,
+                        gate,
+                        then_body,
+                        awaits,
+                        captures_at_await,
+                        join_caps_at,
+                        ready_ok,
+                        effect_enum,
+                    )
+                } else {
+                    then_body
                 };
             }
             let iter_ty = into_iter_ty(into_ty);
@@ -6050,8 +6762,8 @@ fn gen_enter_await(
             before_await,
             else_branch,
             cond_await_base,
-            ..
-        } => {
+            expr_bind,
+            ..} => {
             let before_await = emit_stmts_rewrite_returns(before_await, ready_ok);
             if *chain_pos > 0 {
                 quote! {
@@ -6067,12 +6779,31 @@ fn gen_enter_await(
                     #go_cond
                 }
             } else {
-                let else_body = else_expr_tokens(else_branch, ready_ok);
+                let else_body =
+                    emit_opt_expr_bind_assign(expr_bind.as_ref(), else_branch, ready_ok);
+                let then_body = quote! {
+                    #before_await
+                    #go_wait
+                };
+                let then_body = if let Some(gate) = entry_gate_of(&ap.kind) {
+                    gen_entry_gate_wrap(
+                        index,
+                        ap,
+                        gate,
+                        then_body,
+                        awaits,
+                        captures_at_await,
+                        join_caps_at,
+                        ready_ok,
+                        effect_enum,
+                    )
+                } else {
+                    then_body
+                };
                 quote! {
                     #before
                     if #cond {
-                        #before_await
-                        #go_wait
+                        #then_body
                     } else {
                         #else_body
                         #non_suspend
@@ -6097,7 +6828,10 @@ fn gen_enter_await(
                     #go_wait
                 };
             }
-            let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
+            let then_path = match expr_bind_of(&ap.kind) {
+                Some(bind) => emit_stmts_bind_assign(bind, &then_branch.stmts, ready_ok),
+                None => emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok),
+            };
             let sibling_go_waits: Vec<_> = (0..*chain_len)
                 .map(|pos| {
                     let sib_i = chain_head + pos;
@@ -6140,11 +6874,12 @@ fn gen_enter_await(
                         &mut sib_idx,
                         &non_suspend,
                         ready_ok,
+                        expr_bind_of(&ap.kind),
                     );
                     quote! {
                         #before
                         if #cond {
-                            #then_stmts
+                            #then_path
                             #non_suspend
                         } else {
                             #else_body
@@ -6161,11 +6896,12 @@ fn gen_enter_await(
                     &mut sib_idx,
                     &non_suspend,
                     ready_ok,
+                    expr_bind_of(&ap.kind),
                 );
                 quote! {
                     #before
                     if #cond {
-                        #then_stmts
+                        #then_path
                         #non_suspend
                     } else {
                         #else_body
@@ -6198,8 +6934,8 @@ fn gen_enter_await(
             sus_guard,
             before_await,
             arms_after,
-            ..
-        } => {
+            expr_bind,
+            ..} => {
             let before_await = emit_stmts_rewrite_returns(before_await, ready_ok);
             if *chain_pos > 0 {
                 quote! {
@@ -6208,12 +6944,13 @@ fn gen_enter_await(
                     #go_wait
                 }
             } else {
+                let bind = expr_bind.as_ref();
                 let before_arms = arms_before
                     .iter()
-                    .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok));
+                    .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok, bind));
                 let after_arms = arms_after
                     .iter()
-                    .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok));
+                    .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok, bind));
                 let guard = match sus_guard {
                     Some(g) => quote! { if #g },
                     None => quote! {},
@@ -6253,10 +6990,10 @@ fn gen_enter_await(
             }
             let before_arms = arms_before
                 .iter()
-                .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok));
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok, None));
             let after_arms = arms_after
                 .iter()
-                .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok));
+                .map(|a| emit_sync_arm_with_join(a, &non_suspend, ready_ok, None));
             let sus_enter = if *has_body_await {
                 if let Some(base) = guard_await_base {
                     let cond_var = waiting_cond_variant(join_index);
@@ -6289,8 +7026,7 @@ fn gen_enter_await(
             bind_name,
             bind_ty,
             before_await,
-            ..
-        } => {
+            ..} => {
             let before_await = rewrite_labeled_block_stmts(
                 before_await,
                 *chain_head,
@@ -6311,8 +7047,7 @@ fn gen_enter_await(
             bind_name,
             bind_ty,
             before_await,
-            ..
-        } => {
+            ..} => {
             let before_await = rewrite_try_block_stmts(
                 before_await,
                 *chain_head,
@@ -6351,6 +7086,7 @@ fn emit_sync_arm_with_join(
     arm: &syn::Arm,
     goto_join: &proc_macro2::TokenStream,
     ready_ok: &proc_macro2::TokenStream,
+    expr_bind: Option<&(Ident, Type)>,
 ) -> proc_macro2::TokenStream {
     let attrs = &arm.attrs;
     let pat = &arm.pat;
@@ -6358,8 +7094,18 @@ fn emit_sync_arm_with_join(
         Some((_, g)) => quote! { if #g },
         None => quote! {},
     };
-    match arm.body.as_ref() {
-        Expr::Block(b) => {
+    match (arm.body.as_ref(), expr_bind) {
+        (Expr::Block(b), Some(bind)) => {
+            let assign = emit_stmts_bind_assign(bind, &b.block.stmts, ready_ok);
+            quote! {
+                #(#attrs)*
+                #pat #guard => {
+                    #assign
+                    #goto_join
+                }
+            }
+        }
+        (Expr::Block(b), None) => {
             let stmts = emit_stmts_rewrite_returns(&b.block.stmts, ready_ok);
             quote! {
                 #(#attrs)*
@@ -6369,7 +7115,17 @@ fn emit_sync_arm_with_join(
                 }
             }
         }
-        body => {
+        (body, Some(bind)) => {
+            let assign = emit_expr_bind_assign(bind, body, ready_ok);
+            quote! {
+                #(#attrs)*
+                #pat #guard => {
+                    #assign
+                    #goto_join
+                }
+            }
+        }
+        (body, None) => {
             let body = emit_expr_rewrite_returns(body, ready_ok);
             quote! {
                 #(#attrs)*
@@ -6411,8 +7167,7 @@ fn gen_after_resume(
             SuspendKind::TryBlock {
                 bind_name,
                 bind_ty,
-                ..
-            },
+                ..},
         ) => {
             let tmp = &ap.tmp;
             let join_caps = effective_join_caps(ap, join_caps);
@@ -6513,13 +7268,34 @@ fn gen_after_resume(
                 }
             }
         }
-        SuspendKind::IfThen { after_await, .. }
-        | SuspendKind::MatchArm { after_await, .. } => {
-            emit_stmts_rewrite_returns(after_await, ready_ok)
+        SuspendKind::IfThen {
+            after_await,
+            expr_bind,
+            chain_pos,
+            chain_len,
+            ..
+        }
+        | SuspendKind::MatchArm {
+            after_await,
+            expr_bind,
+            chain_pos,
+            chain_len,
+            ..
+        } => {
+            if *chain_pos + 1 < *chain_len || expr_bind.is_none() {
+                emit_stmts_rewrite_returns(after_await, ready_ok)
+            } else {
+                emit_stmts_bind_assign(
+                    expr_bind.as_ref().expect("expr_bind"),
+                    after_await,
+                    ready_ok,
+                )
+            }
         }
         SuspendKind::IfElse {
             else_suspend,
             after_await,
+            expr_bind,
             ..
         } => match else_suspend_resume_leaf(else_suspend) {
             ElseSuspend::ElseIfCond {
@@ -6527,21 +7303,39 @@ fn gen_after_resume(
                 rest_else,
             } => {
                 let tmp = &ap.tmp;
-                let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
-                match rest_else {
-                    Some(e) => {
-                        let else_body = emit_expr_rewrite_returns(e, ready_ok);
+                match expr_bind.as_ref() {
+                    Some(bind) => {
+                        let then_path =
+                            emit_stmts_bind_assign(bind, &then_branch.stmts, ready_ok);
+                        let else_path =
+                            emit_opt_expr_bind_assign(Some(bind), rest_else, ready_ok);
                         quote! {
                             if #tmp {
-                                #then_stmts
-                            } else #else_body;
+                                #then_path
+                            } else {
+                                #else_path
+                            }
                         }
                     }
-                    None => quote! {
-                        if #tmp {
-                            #then_stmts
+                    None => {
+                        let then_stmts =
+                            emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
+                        match rest_else {
+                            Some(e) => {
+                                let else_body = emit_expr_rewrite_returns(e, ready_ok);
+                                quote! {
+                                    if #tmp {
+                                        #then_stmts
+                                    } else #else_body;
+                                }
+                            }
+                            None => quote! {
+                                if #tmp {
+                                    #then_stmts
+                                }
+                            },
                         }
-                    },
+                    }
                 }
             }
             ElseSuspend::ElseIfLetScrutinee {
@@ -6550,24 +7344,45 @@ fn gen_after_resume(
                 rest_else,
             } => {
                 let tmp = &ap.tmp;
-                let then_stmts = emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
-                match rest_else {
-                    Some(e) => {
-                        let else_body = emit_expr_rewrite_returns(e, ready_ok);
+                match expr_bind.as_ref() {
+                    Some(bind) => {
+                        let then_path =
+                            emit_stmts_bind_assign(bind, &then_branch.stmts, ready_ok);
+                        let else_path =
+                            emit_opt_expr_bind_assign(Some(bind), rest_else, ready_ok);
                         quote! {
                             if let #pat = #tmp {
-                                #then_stmts
-                            } else #else_body;
+                                #then_path
+                            } else {
+                                #else_path
+                            }
                         }
                     }
-                    None => quote! {
-                        if let #pat = #tmp {
-                            #then_stmts
+                    None => {
+                        let then_stmts =
+                            emit_stmts_rewrite_returns(&then_branch.stmts, ready_ok);
+                        match rest_else {
+                            Some(e) => {
+                                let else_body = emit_expr_rewrite_returns(e, ready_ok);
+                                quote! {
+                                    if let #pat = #tmp {
+                                        #then_stmts
+                                    } else #else_body;
+                                }
+                            }
+                            None => quote! {
+                                if let #pat = #tmp {
+                                    #then_stmts
+                                }
+                            },
                         }
-                    },
+                    }
                 }
             }
-            _ => emit_stmts_rewrite_returns(after_await, ready_ok),
+            _ => match expr_bind.as_ref() {
+                Some(bind) => emit_stmts_bind_assign(bind, after_await, ready_ok),
+                None => emit_stmts_rewrite_returns(after_await, ready_ok),
+            },
         },
         SuspendKind::LetElseAwait { after_await, .. } => {
             let parts = emit_stmts_rewrite_returns(after_await, ready_ok);
@@ -6621,8 +7436,7 @@ fn gen_after_resume(
             label,
             break_bind,
             chain_head,
-            ..
-        } => rewrite_loop_body_stmts(
+            ..} => rewrite_loop_body_stmts(
             *chain_head,
             after_await,
             join_caps,
@@ -6635,8 +7449,7 @@ fn gen_after_resume(
             after_await,
             label,
             chain_head,
-            ..
-        } => rewrite_loop_body_stmts(
+            ..} => rewrite_loop_body_stmts(
             *chain_head,
             after_await,
             join_caps,
@@ -6652,8 +7465,7 @@ fn gen_after_resume(
             after_await,
             label,
             chain_head,
-            ..
-        } => {
+            ..} => {
             let tmp = &ap.tmp;
             let body = rewrite_loop_body_stmts(
                 *chain_head,
@@ -6689,8 +7501,7 @@ fn gen_after_resume(
             after_await,
             label,
             chain_head,
-            ..
-        } => rewrite_loop_body_stmts(
+            ..} => rewrite_loop_body_stmts(
             *chain_head,
             after_await,
             join_caps,
@@ -6708,8 +7519,7 @@ fn gen_after_resume(
             chain_head,
             chain_pos,
             chain_len,
-            ..
-        } => {
+            ..} => {
             if *chain_pos + 1 < *chain_len {
                 rewrite_labeled_block_stmts(
                     after_await,
@@ -6765,8 +7575,7 @@ fn gen_after_resume(
             chain_head,
             chain_pos,
             chain_len,
-            ..
-        } => {
+            ..} => {
             if *chain_pos + 1 < *chain_len {
                 rewrite_try_block_stmts(
                     after_await,
@@ -7640,6 +8449,7 @@ fn gen_join_tail(
             &join_caps_at[next_i],
             awaits,
             captures_at_await,
+            join_caps_at,
             ready_ok,
             effect_enum,
         )
@@ -8067,7 +8877,7 @@ fn make_rehydration(
 
     for (i, (ap, caps)) in awaits.iter().zip(captures_at_await.iter()).enumerate() {
         let has_waiting_var =
-            !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. });
+            !matches!(&ap.kind, SuspendKind::For { has_body_await: false, ..});
         if has_waiting_var {
             let var = waiting_variant(&ap.name);
             let skip_in_var: Vec<_> = caps.iter().filter(|b| is_skip_serde(&b.ty)).collect();
@@ -8189,7 +8999,7 @@ fn make_getters(
         let mut arms = Vec::new();
         for (i, (ap, caps)) in awaits.iter().zip(captures_at_await.iter()).enumerate() {
             let has_waiting_var =
-                !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. });
+                !matches!(&ap.kind, SuspendKind::For { has_body_await: false, ..});
             if has_waiting_var && caps.iter().any(|c| c.name == *name) {
                 let var = waiting_variant(&ap.name);
                 arms.push(quote! {
