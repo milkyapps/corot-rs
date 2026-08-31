@@ -5,9 +5,11 @@ use syn::{
     Path, Stmt, Type,
 };
 
-/// Suspension points: typed `let` awaits; `if` / `if let` / `let…else` / `loop` /
-/// `for` / `match` with a single await in a supported position.
+/// Suspension points: typed `let` awaits (including `await?`); `if` / `if let` /
+/// `let…else` / `loop` / `for` / `match` with a single await in a supported position.
 ///
+/// - `let name: T = expr.await?` when the fn returns `Result<(), E>` (settle
+///   `Result<T, E>`; `Err` finishes with `Poll::Ready(Err(...))`)
 /// - `if` / `if let`: condition/scrutinee, then, else, or else-if chain
 /// - `let…else`: await in the initializer or in the `else` block
 /// - `match`: scrutinee, one arm body, or one guard
@@ -41,10 +43,12 @@ struct AwaitPoint {
     /// Statements before this await's statement/`if`.
     before: Vec<Stmt>,
     kind: SuspendKind,
+    /// `let name: OkTy = ….await?` — settle `Result<OkTy, E>`, bind on `Ok`.
+    try_ok: Option<(Ident, Type)>,
 }
 
 enum SuspendKind {
-    /// Top-level `let name: Ty = <expr with await>;`
+    /// Top-level `let name: Ty = <expr with await>` (possibly with `await?` via `try_ok`).
     Plain {
         after_resume: Vec<Stmt>,
     },
@@ -179,6 +183,7 @@ struct PlainAwait {
     wait_ty: Type,
     base: Expr,
     after_resume: Vec<Stmt>,
+    try_ok: Option<(Ident, Type)>,
 }
 
 fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
@@ -198,8 +203,10 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let vis = &input.vis;
     let fn_name = &input.sig.ident;
     let enum_name = coroutine_name(fn_name);
+    let (output_ty, err_ty) = parse_fn_output(&input.sig.output)?;
+    let ready_ok = ready_ok_tokens(&output_ty);
 
-    let (mut awaits, mut after_last) = split_awaits(&input.block.stmts)?;
+    let (mut awaits, mut after_last) = split_awaits(&input.block.stmts, err_ty.as_ref())?;
     assign_join_stmts(&mut awaits, &mut after_last);
 
     let mut live: Vec<Binding> = Vec::new();
@@ -334,6 +341,16 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         for b in pat_binds_after_resume(ap) {
             upsert_binding(&mut live, b);
         }
+        if let Some((name, ok_ty)) = &ap.try_ok {
+            upsert_binding(
+                &mut live,
+                Binding {
+                    name: name.clone(),
+                    ty: ok_ty.clone(),
+                    mutable: false,
+                },
+            );
+        }
         // Bindings introduced in join_stmts become live before the next await.
         if let Some(join) = join_stmts_of(ap) {
             for stmt in join {
@@ -457,11 +474,10 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut step_arms = Vec::new();
 
     if awaits.is_empty() {
+        let body = emit_completion_stmts(&after_last, &ready_ok);
         step_arms.push(quote! {
             Self::NotStarted => {
-                #(#after_last)*
-                *self = Self::Finished;
-                break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(()));
+                #body
             }
         });
     } else {
@@ -561,7 +577,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. }) {
             let cap_pats: Vec<_> = caps.iter().map(cap_pat).collect();
             let guard = rehydration_guard(&rehyd_name, &var, caps);
-            let after_resume = gen_after_resume(i, ap, &join_caps_at[i]);
+            let after_resume = gen_after_resume(i, ap, &join_caps_at[i], &ready_ok);
             let tail = match &ap.kind {
                 SuspendKind::Loop { .. } | SuspendKind::For { .. } => {
                     gen_goto_loop_head(i, ap, &join_caps_at[i])
@@ -574,7 +590,14 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 }
                 // Else-path of let…else diverges after resume (see gen_after_resume).
                 SuspendKind::LetElseAwait { .. } => quote! {},
-                _ => gen_join_tail(i, &awaits, &captures_at_await, &join_caps_at, &after_last),
+                _ => gen_join_tail(
+                    i,
+                    &awaits,
+                    &captures_at_await,
+                    &join_caps_at,
+                    &after_last,
+                    &ready_ok,
+                ),
             };
 
             step_arms.push(quote! {
@@ -592,8 +615,14 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             let join_caps = effective_join_caps(ap, &join_caps_at[i]);
             let join_pats: Vec<_> = join_caps.iter().map(cap_pat).collect();
             let join_stmts = join_stmts_of(ap).unwrap_or(&[]);
-            let after_join =
-                gen_join_tail(i, &awaits, &captures_at_await, &join_caps_at, &after_last);
+            let after_join = gen_join_tail(
+                i,
+                &awaits,
+                &captures_at_await,
+                &join_caps_at,
+                &after_last,
+                &ready_ok,
+            );
             step_arms.push(quote! {
                 Self::#after_var { #(#join_pats,)* } => {
                     #(#join_stmts)*
@@ -605,7 +634,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
     step_arms.push(quote! {
         Self::Finished => {
-            break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(()));
+            break 'step ::core::result::Result::Ok(#ready_ok);
         }
     });
 
@@ -630,8 +659,15 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         quote! {}
     };
 
-    let (rehyd_enum, rehyd_method, step_ret) =
-        make_rehydration(&vis, &rehyd_name, &awaits, &captures_at_await, &join_caps_at, &all_skips);
+    let (rehyd_enum, rehyd_method, step_ret) = make_rehydration(
+        &vis,
+        &rehyd_name,
+        &awaits,
+        &captures_at_await,
+        &join_caps_at,
+        &all_skips,
+        &output_ty,
+    );
     let getters = make_getters(&awaits, &captures_at_await, &join_caps_at);
 
     Ok(quote! {
@@ -694,12 +730,15 @@ fn needs_rehydration_variant(field: &Ident) -> Ident {
     )
 }
 
-fn split_awaits(stmts: &[Stmt]) -> syn::Result<(Vec<AwaitPoint>, Vec<Stmt>)> {
+fn split_awaits(
+    stmts: &[Stmt],
+    err_ty: Option<&Type>,
+) -> syn::Result<(Vec<AwaitPoint>, Vec<Stmt>)> {
     let mut awaits = Vec::new();
     let mut current: Vec<Stmt> = Vec::new();
 
     for stmt in stmts {
-        if let Some(ap) = as_await_stmt(stmt, awaits.len())? {
+        if let Some(ap) = as_await_stmt(stmt, awaits.len(), err_ty)? {
             let mut ap = ap;
             ap.before = std::mem::take(&mut current);
             awaits.push(ap);
@@ -716,35 +755,43 @@ fn split_awaits(stmts: &[Stmt]) -> syn::Result<(Vec<AwaitPoint>, Vec<Stmt>)> {
     Ok((awaits, current))
 }
 
-fn as_await_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>> {
-    if let Some(plain) = as_plain_await_let(stmt)? {
+fn as_await_stmt(
+    stmt: &Stmt,
+    index: usize,
+    err_ty: Option<&Type>,
+) -> syn::Result<Option<AwaitPoint>> {
+    if let Some(plain) = as_plain_await_let(stmt, err_ty)? {
         return Ok(Some(AwaitPoint {
             name: plain.name,
             tmp: plain.tmp,
             wait_ty: plain.wait_ty,
             base: plain.base,
             before: Vec::new(),
+            try_ok: plain.try_ok,
             kind: SuspendKind::Plain {
                 after_resume: plain.after_resume,
             },
         }));
     }
-    if let Some(ap) = as_await_let_else_stmt(stmt)? {
+    if let Some(ap) = as_await_let_else_stmt(stmt, err_ty)? {
         return Ok(Some(ap));
     }
-    if let Some(ap) = as_await_if_stmt(stmt, index)? {
+    if let Some(ap) = as_await_if_stmt(stmt, index, err_ty)? {
         return Ok(Some(ap));
     }
-    if let Some(ap) = as_await_loop_stmt(stmt)? {
+    if let Some(ap) = as_await_loop_stmt(stmt, err_ty)? {
         return Ok(Some(ap));
     }
-    if let Some(ap) = as_await_for_stmt(stmt)? {
+    if let Some(ap) = as_await_for_stmt(stmt, err_ty)? {
         return Ok(Some(ap));
     }
-    as_await_match_stmt(stmt, index)
+    as_await_match_stmt(stmt, index, err_ty)
 }
 
-fn as_plain_await_let(stmt: &Stmt) -> syn::Result<Option<PlainAwait>> {
+fn as_plain_await_let(
+    stmt: &Stmt,
+    err_ty: Option<&Type>,
+) -> syn::Result<Option<PlainAwait>> {
     let Stmt::Local(Local {
         attrs,
         let_token,
@@ -781,30 +828,78 @@ fn as_plain_await_let(stmt: &Stmt) -> syn::Result<Option<PlainAwait>> {
         ));
     }
 
-    // Await in initializer (optional sync else).
-    let wait_ty = resolve_let_wait_ty(pat, expr)?;
-    let name = match pat {
-        Pat::Type(PatType { pat, .. }) => pat_ident(pat)?,
-        Pat::Ident(p) if p.subpat.is_none() => p.ident.clone(),
-        _ => format_ident!("letelse"),
+    let has_try = outer_try(expr).is_some();
+    let work_expr: Expr = if let Some(inner) = outer_try(expr) {
+        inner.clone()
+    } else {
+        expr.as_ref().clone()
     };
+
+    if has_try && diverge.is_some() {
+        return Err(syn::Error::new_spanned(
+            stmt,
+            "#[corot] `await?` with `let…else` is not supported",
+        ));
+    }
+
+    let (name, wait_ty, try_ok) = if has_try {
+        let Some(err) = err_ty else {
+            return Err(syn::Error::new_spanned(
+                stmt,
+                "#[corot] `await?` requires the async fn to return `Result<(), E>`",
+            ));
+        };
+        let (name, ok_ty) = match pat {
+            Pat::Type(PatType { pat, ty, .. }) => (pat_ident(pat)?, ty.as_ref().clone()),
+            _ => {
+                return Err(syn::Error::new_spanned(
+                    pat,
+                    "`await?` bindings must be `let name: OkType = <expr>.await?`",
+                ));
+            }
+        };
+        (
+            name.clone(),
+            syn::parse_quote!(::core::result::Result<#ok_ty, #err>),
+            Some((name, ok_ty)),
+        )
+    } else {
+        // Await in initializer (optional sync else) — allow `let Some(x) = … else`.
+        let wait_ty = resolve_let_wait_ty(pat, expr)?;
+        let name = match pat {
+            Pat::Type(PatType { pat, .. }) => pat_ident(pat)?,
+            Pat::Ident(p) if p.subpat.is_none() => {
+                return Err(syn::Error::new_spanned(
+                    pat,
+                    "await bindings must be written as `let name: Type = <expr with await>`",
+                ));
+            }
+            _ => format_ident!("letelse"),
+        };
+        (name, wait_ty, None)
+    };
+
     let tmp = format_ident!("__await_{}", name);
-    let mut resume_expr = expr.as_ref().clone();
+    let mut resume_expr = work_expr;
     let base = replace_first_await(&mut resume_expr, ident_expr(&tmp))?;
-    // Strip val::<T>(…) wrapper from resume so we bind the settled value.
     resume_expr = strip_val_call(resume_expr);
 
-    let after_resume = vec![Stmt::Local(Local {
-        attrs: attrs.clone(),
-        let_token: *let_token,
-        pat: pat.clone(),
-        init: Some(LocalInit {
-            eq_token: *eq_token,
-            expr: Box::new(resume_expr),
-            diverge: diverge.as_ref().map(|(t, e)| (*t, e.clone())),
-        }),
-        semi_token: *semi_token,
-    })];
+    let after_resume = if try_ok.is_some() {
+        // Emitted specially in gen_after_resume (expands `?` to early Ready(Err)).
+        Vec::new()
+    } else {
+        vec![Stmt::Local(Local {
+            attrs: attrs.clone(),
+            let_token: *let_token,
+            pat: pat.clone(),
+            init: Some(LocalInit {
+                eq_token: *eq_token,
+                expr: Box::new(resume_expr),
+                diverge: diverge.as_ref().map(|(t, e)| (*t, e.clone())),
+            }),
+            semi_token: *semi_token,
+        })]
+    };
 
     Ok(Some(PlainAwait {
         name,
@@ -812,10 +907,23 @@ fn as_plain_await_let(stmt: &Stmt) -> syn::Result<Option<PlainAwait>> {
         wait_ty,
         base: strip_val_call(base),
         after_resume,
+        try_ok,
     }))
 }
 
-fn as_await_let_else_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
+fn outer_try(expr: &Expr) -> Option<&Expr> {
+    match expr {
+        Expr::Try(t) => Some(&t.expr),
+        Expr::Paren(p) => outer_try(&p.expr),
+        Expr::Group(g) => outer_try(&g.expr),
+        _ => None,
+    }
+}
+
+fn as_await_let_else_stmt(
+    stmt: &Stmt,
+    err_ty: Option<&Type>,
+) -> syn::Result<Option<AwaitPoint>> {
     let Stmt::Local(Local {
         pat,
         init: Some(LocalInit {
@@ -837,16 +945,18 @@ fn as_await_let_else_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
     }
 
     let else_stmts = else_block_stmts(else_expr)?;
-    let (before_await, plain, after_await) = extract_single_await_from_stmts(else_stmts)?;
+    let (before_await, plain, after_await) =
+        extract_single_await_from_stmts(else_stmts, err_ty)?;
     let scrut_ty = resolve_scrut_ty(pat, expr)?;
     let pat_binds = bindings_from_pat(pat, &scrut_ty)?;
 
-    Ok(Some(AwaitPoint {
+        Ok(Some(AwaitPoint {
         name: plain.name,
         tmp: plain.tmp,
         wait_ty: plain.wait_ty,
         base: plain.base,
         before: Vec::new(),
+        try_ok: plain.try_ok,
         kind: SuspendKind::LetElseAwait {
             pat: pat.clone(),
             init: strip_val_call(expr.as_ref().clone()),
@@ -862,7 +972,11 @@ fn as_await_let_else_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
     }))
 }
 
-fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>> {
+fn as_await_if_stmt(
+    stmt: &Stmt,
+    index: usize,
+    err_ty: Option<&Type>,
+) -> syn::Result<Option<AwaitPoint>> {
     let Stmt::Expr(Expr::If(expr_if), _) = stmt else {
         return Ok(None);
     };
@@ -883,12 +997,13 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
                 let wait_ty = resolve_scrut_ty(&expr_let.pat, &expr_let.expr)?;
                 let name = format_ident!("scrut{}", index);
                 let tmp = format_ident!("__await_{}", name);
-                Ok(Some(AwaitPoint {
+                    Ok(Some(AwaitPoint {
                     name,
                     tmp,
                     wait_ty,
                     base,
                     before: Vec::new(),
+                    try_ok: None,
                     kind: SuspendKind::IfLetScrutinee {
                         pat: expr_let.pat.as_ref().clone(),
                         then_branch: expr_if.then_branch.clone(),
@@ -904,12 +1019,13 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
                 };
                 let name = format_ident!("cond{}", index);
                 let tmp = format_ident!("__await_{}", name);
-                Ok(Some(AwaitPoint {
+                    Ok(Some(AwaitPoint {
                     name,
                     tmp: tmp.clone(),
                     wait_ty: syn::parse_quote!(bool),
                     base: base_of_await,
                     before: Vec::new(),
+                    try_ok: None,
                     kind: SuspendKind::IfCondition {
                         resume_cond: ident_expr(&tmp),
                         then_branch: expr_if.then_branch.clone(),
@@ -920,14 +1036,15 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
         }
         (false, true, false) => {
             let (before_await, plain, after_await) =
-                extract_single_await_from_stmts(&expr_if.then_branch.stmts)?;
+                extract_single_await_from_stmts(&expr_if.then_branch.stmts, err_ty)?;
             let pat_binds = if_let_pat_binds(&expr_if.cond)?;
-            Ok(Some(AwaitPoint {
+                Ok(Some(AwaitPoint {
                 name: plain.name,
                 tmp: plain.tmp,
                 wait_ty: plain.wait_ty,
                 base: plain.base,
                 before: Vec::new(),
+                try_ok: plain.try_ok,
                 kind: SuspendKind::IfThen {
                     cond: strip_val_in_if_cond(expr_if.cond.as_ref().clone()),
                     pat_binds,
@@ -948,13 +1065,14 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
                 .as_ref()
                 .map(|(_, e)| e.as_ref())
                 .unwrap();
-            let parsed = parse_else_await_chain(else_expr)?;
-            Ok(Some(AwaitPoint {
+            let parsed = parse_else_await_chain(else_expr, err_ty)?;
+                Ok(Some(AwaitPoint {
                 name: parsed.name,
                 tmp: parsed.tmp,
                 wait_ty: parsed.wait_ty,
                 base: parsed.base,
                 before: Vec::new(),
+                try_ok: None,
                 kind: SuspendKind::IfElse {
                     cond: strip_val_in_if_cond(expr_if.cond.as_ref().clone()),
                     then_branch: expr_if.then_branch.clone(),
@@ -972,7 +1090,10 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
     }
 }
 
-fn as_await_loop_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
+fn as_await_loop_stmt(
+    stmt: &Stmt,
+    err_ty: Option<&Type>,
+) -> syn::Result<Option<AwaitPoint>> {
     let Stmt::Expr(Expr::Loop(expr_loop), _) = stmt else {
         return Ok(None);
     };
@@ -986,13 +1107,14 @@ fn as_await_loop_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
         return Ok(None);
     }
     let (before_await, plain, after_await) =
-        extract_single_await_from_stmts(&expr_loop.body.stmts)?;
-    Ok(Some(AwaitPoint {
+        extract_single_await_from_stmts(&expr_loop.body.stmts, err_ty)?;
+        Ok(Some(AwaitPoint {
         name: plain.name,
         tmp: plain.tmp,
         wait_ty: plain.wait_ty,
         base: plain.base,
         before: Vec::new(),
+        try_ok: plain.try_ok,
         kind: SuspendKind::Loop {
             before_await,
             after_await: {
@@ -1005,7 +1127,10 @@ fn as_await_loop_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
     }))
 }
 
-fn as_await_for_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
+fn as_await_for_stmt(
+    stmt: &Stmt,
+    err_ty: Option<&Type>,
+) -> syn::Result<Option<AwaitPoint>> {
     let Stmt::Expr(Expr::ForLoop(expr_for), _) = stmt else {
         return Ok(None);
     };
@@ -1024,7 +1149,7 @@ fn as_await_for_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
     };
 
     let (before_await, plain, after_await) = if has_body_await {
-        extract_single_await_from_stmts(&expr_for.body.stmts)?
+        extract_single_await_from_stmts(&expr_for.body.stmts, err_ty)?
     } else {
         (
             expr_for.body.stmts.clone(),
@@ -1036,6 +1161,7 @@ fn as_await_for_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
                     .clone()
                     .unwrap_or_else(|| syn::parse_quote!(())),
                 after_resume: Vec::new(),
+                try_ok: None,
             },
             Vec::new(),
         )
@@ -1047,6 +1173,7 @@ fn as_await_for_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
         wait_ty: plain.wait_ty,
         base: plain.base,
         before: Vec::new(),
+        try_ok: plain.try_ok,
         kind: SuspendKind::For {
             item,
             into_ty,
@@ -1405,7 +1532,10 @@ fn result_arg(ty: &Type, idx: usize) -> Option<Type> {
     }
 }
 
-fn emit_stmt_rewrite_returns(stmt: &Stmt) -> proc_macro2::TokenStream {
+fn emit_stmt_rewrite_returns(
+    stmt: &Stmt,
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     match stmt {
         Stmt::Local(local) => {
             if let Some(init) = &local.init {
@@ -1413,7 +1543,7 @@ fn emit_stmt_rewrite_returns(stmt: &Stmt) -> proc_macro2::TokenStream {
                     let attrs = &local.attrs;
                     let pat = &local.pat;
                     let expr = &init.expr;
-                    let else_body = emit_expr_rewrite_returns(diverge);
+                    let else_body = emit_expr_rewrite_returns(diverge, ready_ok);
                     return quote! {
                         #(#attrs)*
                         let #pat = #expr else #else_body;
@@ -1423,7 +1553,7 @@ fn emit_stmt_rewrite_returns(stmt: &Stmt) -> proc_macro2::TokenStream {
             quote! { #stmt }
         }
         Stmt::Expr(expr, semi) => {
-            let e = emit_expr_rewrite_returns(expr);
+            let e = emit_expr_rewrite_returns(expr, ready_ok);
             match semi {
                 Some(_) => quote! { #e; },
                 None => quote! { #e },
@@ -1433,19 +1563,151 @@ fn emit_stmt_rewrite_returns(stmt: &Stmt) -> proc_macro2::TokenStream {
     }
 }
 
-fn emit_expr_rewrite_returns(expr: &Expr) -> proc_macro2::TokenStream {
+fn emit_expr_rewrite_returns(
+    expr: &Expr,
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
     match expr {
-        Expr::Return(ret) if ret.expr.is_none() => quote! {{
-            *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(()));
-        }},
+        Expr::Return(ret) => match &ret.expr {
+            None => quote! {{
+                *self = Self::Finished;
+                break 'step ::core::result::Result::Ok(#ready_ok);
+            }},
+            Some(e) => {
+                if let Some(finish) = as_result_finish_expr(e, ready_ok) {
+                    finish
+                } else {
+                    quote! { #expr }
+                }
+            }
+        },
         Expr::Block(b) => {
-            let stmts = b.block.stmts.iter().map(emit_stmt_rewrite_returns);
+            let stmts = b
+                .block
+                .stmts
+                .iter()
+                .map(|s| emit_stmt_rewrite_returns(s, ready_ok));
             quote! {{
                 #(#stmts)*
             }}
         }
-        other => quote! { #other },
+        other => {
+            if let Some(finish) = as_result_finish_expr(other, ready_ok) {
+                finish
+            } else {
+                quote! { #other }
+            }
+        }
+    }
+}
+
+/// Emit stmts then finish with `Ready(Ok(()))` / `Ready(())`, rewriting a trailing
+/// `Ok(())` / `Err(e)` / `return …` so they don't sit before `*self = …` (which
+/// would parse as multiplication).
+fn emit_completion_stmts(
+    stmts: &[Stmt],
+    ready_ok: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let default_finish = quote! {
+        *self = Self::Finished;
+        break 'step ::core::result::Result::Ok(#ready_ok);
+    };
+    if stmts.is_empty() {
+        return default_finish;
+    }
+    let last = stmts.last().unwrap();
+    let prefix = &stmts[..stmts.len() - 1];
+    let prefix_toks = prefix
+        .iter()
+        .map(|s| emit_stmt_rewrite_returns(s, ready_ok));
+    if let Some(finish) = as_result_finish_stmt(last, ready_ok) {
+        quote! {
+            #(#prefix_toks)*
+            #finish
+        }
+    } else {
+        let last_tok = emit_stmt_rewrite_returns(last, ready_ok);
+        quote! {
+            #(#prefix_toks)*
+            #last_tok
+            #default_finish
+        }
+    }
+}
+
+fn as_result_finish_stmt(
+    stmt: &Stmt,
+    ready_ok: &proc_macro2::TokenStream,
+) -> Option<proc_macro2::TokenStream> {
+    match stmt {
+        Stmt::Expr(Expr::Return(ret), _) => match &ret.expr {
+            None => Some(quote! {{
+                *self = Self::Finished;
+                break 'step ::core::result::Result::Ok(#ready_ok);
+            }}),
+            Some(e) => as_result_finish_expr(e, ready_ok),
+        },
+        // Trailing expression (no `;`) — typical `Ok(())` / `Err(e)` fn tail.
+        Stmt::Expr(expr, None) => as_result_finish_expr(expr, ready_ok),
+        _ => None,
+    }
+}
+
+fn as_result_finish_expr(
+    expr: &Expr,
+    ready_ok: &proc_macro2::TokenStream,
+) -> Option<proc_macro2::TokenStream> {
+    if is_ok_unit_expr(expr) {
+        return Some(quote! {
+            *self = Self::Finished;
+            break 'step ::core::result::Result::Ok(#ready_ok);
+        });
+    }
+    if let Some(err) = as_err_call_arg(expr) {
+        return Some(quote! {
+            *self = Self::Finished;
+            break 'step ::core::result::Result::Ok(
+                ::core::task::Poll::Ready(::core::result::Result::Err(
+                    ::core::convert::From::from(#err),
+                )),
+            );
+        });
+    }
+    None
+}
+
+fn is_ok_unit_expr(expr: &Expr) -> bool {
+    let Expr::Call(call) = unwrap_parens_ref(expr) else {
+        return false;
+    };
+    if !path_is_ident(&call.func, "Ok") || call.args.len() != 1 {
+        return false;
+    }
+    matches!(call.args.first(), Some(Expr::Tuple(t)) if t.elems.is_empty())
+}
+
+fn as_err_call_arg(expr: &Expr) -> Option<&Expr> {
+    let Expr::Call(call) = unwrap_parens_ref(expr) else {
+        return None;
+    };
+    if !path_is_ident(&call.func, "Err") || call.args.len() != 1 {
+        return None;
+    }
+    call.args.first()
+}
+
+fn unwrap_parens_ref(expr: &Expr) -> &Expr {
+    match expr {
+        Expr::Paren(p) => unwrap_parens_ref(&p.expr),
+        Expr::Group(g) => unwrap_parens_ref(&g.expr),
+        other => other,
+    }
+}
+
+fn path_is_ident(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Path(p) => p.path.is_ident(name),
+        _ => false,
     }
 }
 
@@ -1475,7 +1737,11 @@ fn expr_has_return(expr: &Expr) -> bool {
     }
 }
 
-fn as_await_match_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>> {
+fn as_await_match_stmt(
+    stmt: &Stmt,
+    index: usize,
+    err_ty: Option<&Type>,
+) -> syn::Result<Option<AwaitPoint>> {
     let Stmt::Expr(Expr::Match(expr_match), _) = stmt else {
         return Ok(None);
     };
@@ -1521,12 +1787,13 @@ fn as_await_match_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoi
             let scrut_ty = infer_match_scrut_ty(&expr_match.arms)?;
             let name = format_ident!("scrut{}", index);
             let tmp = format_ident!("__await_{}", name);
-            Ok(Some(AwaitPoint {
+                Ok(Some(AwaitPoint {
                 name,
                 tmp: tmp.clone(),
                 wait_ty: scrut_ty,
                 base,
                 before: Vec::new(),
+                try_ok: None,
                 kind: SuspendKind::MatchScrutinee {
                     arms: expr_match.arms.clone(),
                 },
@@ -1548,14 +1815,16 @@ fn as_await_match_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoi
             check_simple_match_pat(&sus.pat)?;
             let pat_binds = simple_pat_idents(&sus.pat);
             let stmts = expr_as_stmts(&sus.body);
-            let (before_await, plain, after_await) = extract_single_await_from_stmts(&stmts)?;
+            let (before_await, plain, after_await) =
+                extract_single_await_from_stmts(&stmts, err_ty)?;
             let sus_guard = sus.guard.as_ref().map(|(_, g)| g.clone());
-            Ok(Some(AwaitPoint {
+                Ok(Some(AwaitPoint {
                 name: plain.name,
                 tmp: plain.tmp,
                 wait_ty: plain.wait_ty,
                 base: plain.base,
                 before: Vec::new(),
+                try_ok: plain.try_ok,
                 kind: SuspendKind::MatchArm {
                     scrutinee: expr_match.expr.as_ref().clone(),
                     scrut_ty,
@@ -1593,12 +1862,13 @@ fn as_await_match_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoi
             };
             let name = format_ident!("guard{}", index);
             let tmp = format_ident!("__await_{}", name);
-            Ok(Some(AwaitPoint {
+                Ok(Some(AwaitPoint {
                 name,
                 tmp,
                 wait_ty: syn::parse_quote!(bool),
                 base,
                 before: Vec::new(),
+                try_ok: None,
                 kind: SuspendKind::MatchGuard {
                     scrutinee: expr_match.expr.as_ref().clone(),
                     scrut_ty,
@@ -1807,11 +2077,14 @@ struct ParsedElseAwait {
 }
 
 /// Walk `else` / `else if` chain and locate the single await.
-fn parse_else_await_chain(else_expr: &Expr) -> syn::Result<ParsedElseAwait> {
+fn parse_else_await_chain(
+    else_expr: &Expr,
+    err_ty: Option<&Type>,
+) -> syn::Result<ParsedElseAwait> {
     match else_expr {
         Expr::Block(b) => {
             let (before_await, plain, after_await) =
-                extract_single_await_from_stmts(&b.block.stmts)?;
+                extract_single_await_from_stmts(&b.block.stmts, err_ty)?;
             Ok(ParsedElseAwait {
                 name: plain.name,
                 tmp: plain.tmp,
@@ -1836,7 +2109,7 @@ fn parse_else_await_chain(else_expr: &Expr) -> syn::Result<ParsedElseAwait> {
             match (cond_has, then_has, else_has) {
                 (false, true, false) => {
                     let (before_await, plain, after_await) =
-                        extract_single_await_from_stmts(&inner.then_branch.stmts)?;
+                        extract_single_await_from_stmts(&inner.then_branch.stmts, err_ty)?;
                     Ok(ParsedElseAwait {
                         name: plain.name,
                         tmp: plain.tmp,
@@ -1860,7 +2133,7 @@ fn parse_else_await_chain(else_expr: &Expr) -> syn::Result<ParsedElseAwait> {
                         .as_ref()
                         .map(|(_, e)| e.as_ref())
                         .unwrap();
-                    let mut parsed = parse_else_await_chain(rest_expr)?;
+                    let mut parsed = parse_else_await_chain(rest_expr, err_ty)?;
                     parsed.else_suspend = ElseSuspend::ElseIfSkip {
                         cond: strip_val_in_if_cond(inner.cond.as_ref().clone()),
                         then_branch: inner.then_branch.clone(),
@@ -1972,6 +2245,7 @@ fn emit_else_suspend(
 
 fn extract_single_await_from_stmts(
     stmts: &[Stmt],
+    err_ty: Option<&Type>,
 ) -> syn::Result<(Vec<Stmt>, PlainAwait, Vec<Stmt>)> {
     let mut before = Vec::new();
     let mut found: Option<PlainAwait> = None;
@@ -1979,7 +2253,7 @@ fn extract_single_await_from_stmts(
 
     for stmt in stmts {
         if found.is_none() {
-            if let Some(plain) = as_plain_await_let(stmt)? {
+            if let Some(plain) = as_plain_await_let(stmt, err_ty)? {
                 found = Some(plain);
             } else if stmt_contains_await(stmt) {
                 return Err(syn::Error::new_spanned(
@@ -2502,10 +2776,32 @@ fn gen_after_resume(
     index: usize,
     ap: &AwaitPoint,
     join_caps: &[Binding],
+    ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
-    match &ap.kind {
+    let try_bind = if let Some((name, ok_ty)) = &ap.try_ok {
+        let tmp = &ap.tmp;
+        quote! {
+            let #name: #ok_ty = match #tmp {
+                ::core::result::Result::Ok(v) => v,
+                ::core::result::Result::Err(e) => {
+                    *self = Self::Finished;
+                    break 'step ::core::result::Result::Ok(
+                        ::core::task::Poll::Ready(::core::result::Result::Err(
+                            ::core::convert::From::from(e),
+                        )),
+                    );
+                }
+            };
+        }
+    } else {
+        quote! {}
+    };
+
+    let rest = match &ap.kind {
         SuspendKind::Plain { after_resume } => {
-            let parts = after_resume.iter().map(emit_stmt_rewrite_returns);
+            let parts = after_resume
+                .iter()
+                .map(|s| emit_stmt_rewrite_returns(s, ready_ok));
             quote! { #(#parts)* }
         }
         SuspendKind::IfCondition {
@@ -2587,7 +2883,9 @@ fn gen_after_resume(
             _ => quote! { #(#after_await)* },
         },
         SuspendKind::LetElseAwait { after_await, .. } => {
-            let parts = after_await.iter().map(emit_stmt_rewrite_returns);
+            let parts = after_await
+                .iter()
+                .map(|s| emit_stmt_rewrite_returns(s, ready_ok));
             let has_return = after_await.iter().any(stmt_has_return);
             if has_return {
                 quote! { #(#parts)* }
@@ -2595,7 +2893,7 @@ fn gen_after_resume(
                 quote! {
                     #(#parts)*
                     *self = Self::Finished;
-                    break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(()));
+                    break 'step ::core::result::Result::Ok(#ready_ok);
                 }
             }
         }
@@ -2630,6 +2928,11 @@ fn gen_after_resume(
         SuspendKind::Loop { after_await, .. } | SuspendKind::For { after_await, .. } => {
             rewrite_loop_after_await(index, after_await, join_caps)
         }
+    };
+
+    quote! {
+        #try_bind
+        #rest
     }
 }
 
@@ -2708,13 +3011,10 @@ fn gen_join_tail(
     captures_at_await: &[Vec<Binding>],
     join_caps_at: &[Vec<Binding>],
     after_last: &[Stmt],
+    ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     if completed_i + 1 >= awaits.len() {
-        quote! {
-            #(#after_last)*
-            *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(()));
-        }
+        emit_completion_stmts(after_last, ready_ok)
     } else {
         let next_i = completed_i + 1;
         let next = &awaits[next_i];
@@ -2727,6 +3027,43 @@ fn gen_join_tail(
             next_caps,
             &join_caps_at[next_i],
         )
+    }
+}
+
+fn parse_fn_output(output: &syn::ReturnType) -> syn::Result<(Type, Option<Type>)> {
+    match output {
+        syn::ReturnType::Default => Ok((syn::parse_quote!(()), None)),
+        syn::ReturnType::Type(_, ty) => {
+            if is_unit_ty(ty) {
+                return Ok((syn::parse_quote!(()), None));
+            }
+            if let Some(err) = result_err_ty(ty) {
+                // Only `Result<(), E>` for now (Ok payload must be unit).
+                if result_ok_ty(ty).is_some_and(|ok| is_unit_ty(&ok)) {
+                    return Ok(((**ty).clone(), Some(err)));
+                }
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "#[corot] with `await?` currently supports `Result<(), E>` return types only",
+                ));
+            }
+            Err(syn::Error::new_spanned(
+                ty,
+                "#[corot] return type must be `()` or `Result<(), E>`",
+            ))
+        }
+    }
+}
+
+fn is_unit_ty(ty: &Type) -> bool {
+    matches!(ty, Type::Tuple(t) if t.elems.is_empty())
+}
+
+fn ready_ok_tokens(output_ty: &Type) -> proc_macro2::TokenStream {
+    if is_unit_ty(output_ty) {
+        quote! { ::core::task::Poll::Ready(()) }
+    } else {
+        quote! { ::core::task::Poll::Ready(::core::result::Result::Ok(())) }
     }
 }
 
@@ -2993,11 +3330,16 @@ fn make_rehydration(
     captures_at_await: &[Vec<Binding>],
     join_caps_at: &[Vec<Binding>],
     all_skips: &[Binding],
+    output_ty: &Type,
 ) -> (
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
 ) {
+    let step_ret = quote! {
+        ::core::result::Result<::core::task::Poll<#output_ty>, #rehyd_name>
+    };
+
     if all_skips.is_empty() {
         let rehyd_enum = quote! {
             #vis enum #rehyd_name {
@@ -3008,9 +3350,6 @@ fn make_rehydration(
             pub fn rehydrate(&mut self) -> #rehyd_name {
                 #rehyd_name::Ok
             }
-        };
-        let step_ret = quote! {
-            ::core::result::Result<::core::task::Poll<()>, #rehyd_name>
         };
         return (rehyd_enum, rehyd_method, step_ret);
     }
@@ -3111,7 +3450,7 @@ fn make_rehydration(
     };
 
     let step_ret = quote! {
-        ::core::result::Result<::core::task::Poll<()>, #rehyd_name<'_>>
+        ::core::result::Result<::core::task::Poll<#output_ty>, #rehyd_name<'_>>
     };
 
     (rehyd_enum, rehyd_method, step_ret)
