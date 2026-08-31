@@ -12,6 +12,8 @@ use syn::{
 ///   `Result<T, E>`; `Err` finishes with `Poll::Ready(Err(...))`)
 /// - `return` / `return <expr>` before or after an await (rewritten to finish the
 ///   coroutine with `Poll::Ready(...)`)
+/// - `corot_rs::call::<ChildCoroutine>(child()).await` — drive another `#[corot]`
+///   coroutine to completion (composition)
 /// - `loop` / `for`: optional label; `break` / `continue` before or after the
 ///   await (unlabeled or `'label`); unlabeled `break`/`continue` inside nested
 ///   sync loops stay native
@@ -41,7 +43,7 @@ struct AwaitPoint {
     name: Ident,
     /// Temporary holding the settled await value (`__await_a`).
     tmp: Ident,
-    /// Type provided by `settle_wait` (await output).
+    /// Type provided by `settle_wait` (await output), or child `Output` when nested.
     wait_ty: Type,
     /// Expression evaluated before suspending (the await receiver/base).
     base: Expr,
@@ -50,6 +52,18 @@ struct AwaitPoint {
     kind: SuspendKind,
     /// `let name: OkTy = ….await?` — settle `Result<OkTy, E>`, bind on `Ok`.
     try_ok: Option<(Ident, Type)>,
+    /// `call::<ChildCoroutine>(…)` — drive another `#[corot]` enum.
+    nested_child: Option<Type>,
+}
+
+struct PlainAwait {
+    name: Ident,
+    tmp: Ident,
+    wait_ty: Type,
+    base: Expr,
+    after_resume: Vec<Stmt>,
+    try_ok: Option<(Ident, Type)>,
+    nested_child: Option<Type>,
 }
 
 enum SuspendKind {
@@ -183,15 +197,6 @@ struct Binding {
     name: Ident,
     ty: Type,
     mutable: bool,
-}
-
-struct PlainAwait {
-    name: Ident,
-    tmp: Ident,
-    wait_ty: Type,
-    base: Expr,
-    after_resume: Vec<Stmt>,
-    try_ok: Option<(Ident, Type)>,
 }
 
 fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
@@ -397,24 +402,33 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. }) {
             let var = waiting_variant(&ap.name);
             let cap_fields = caps.iter().map(|b| field_tokens(b));
-            let wait_ty = &ap.wait_ty;
-            let wait_skip = cfg!(feature = "serde") && is_skip_serde(&ap.wait_ty);
-            let wait_field = if wait_skip {
-                quote! {
-                    #[serde(skip)]
-                    __wait: ::core::option::Option<#wait_ty>,
-                }
+            if let Some(child_ty) = &ap.nested_child {
+                variants.push(quote! {
+                    #var {
+                        #(#cap_fields,)*
+                        __child: #child_ty,
+                    }
+                });
             } else {
-                quote! {
-                    __wait: ::core::option::Option<#wait_ty>,
-                }
-            };
-            variants.push(quote! {
-                #var {
-                    #(#cap_fields,)*
-                    #wait_field
-                }
-            });
+                let wait_ty = &ap.wait_ty;
+                let wait_skip = cfg!(feature = "serde") && is_skip_serde(&ap.wait_ty);
+                let wait_field = if wait_skip {
+                    quote! {
+                        #[serde(skip)]
+                        __wait: ::core::option::Option<#wait_ty>,
+                    }
+                } else {
+                    quote! {
+                        __wait: ::core::option::Option<#wait_ty>,
+                    }
+                };
+                variants.push(quote! {
+                    #var {
+                        #(#cap_fields,)*
+                        #wait_field
+                    }
+                });
+            }
         }
 
         if is_loop_kind(&ap.kind) {
@@ -457,15 +471,23 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
         if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. }) {
             let var = waiting_variant(&ap.name);
-            let ty = &ap.wait_ty;
-            settle_arms.push(quote! {
-                Self::#var { __wait, .. } => {
-                    let value = value
-                        .downcast_ref::<#ty>()
-                        .unwrap_or_else(|| panic!("settle_wait: expected {}", ::core::any::type_name::<#ty>()));
-                    *__wait = ::core::option::Option::Some(*value);
-                }
-            });
+            if ap.nested_child.is_some() {
+                settle_arms.push(quote! {
+                    Self::#var { __child, .. } => {
+                        __child.settle_wait(value);
+                    }
+                });
+            } else {
+                let ty = &ap.wait_ty;
+                settle_arms.push(quote! {
+                    Self::#var { __wait, .. } => {
+                        let value = value
+                            .downcast_ref::<#ty>()
+                            .unwrap_or_else(|| panic!("settle_wait: expected {}", ::core::any::type_name::<#ty>()));
+                        *__wait = ::core::option::Option::Some(*value);
+                    }
+                });
+            }
         }
     }
 
@@ -554,7 +576,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         &ready_ok,
                     );
                     let some_body = if *has_body_await {
-                        let go_wait = gen_go_waiting(&var, caps, &ap.base);
+                        let go_wait = gen_enter_wait(ap, &var, caps);
                         quote! {
                             #before_await_toks
                             #go_wait
@@ -584,7 +606,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     label,
                     ..
                 } => {
-                    let go_wait = gen_go_waiting(&var, caps, &ap.base);
+                    let go_wait = gen_enter_wait(ap, &var, caps);
                     let before_await_toks = rewrite_loop_body_stmts(
                         i,
                         before_await,
@@ -606,6 +628,13 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
         if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, .. }) {
             let cap_pats: Vec<_> = caps.iter().map(cap_pat).collect();
+            let cap_moves: Vec<_> = caps
+                .iter()
+                .map(|b| {
+                    let n = &b.name;
+                    quote! { #n }
+                })
+                .collect();
             let guard = rehydration_guard(&rehyd_name, &var, caps);
             let after_resume = gen_after_resume(i, ap, &join_caps_at[i], &ready_ok);
             let tail = match &ap.kind {
@@ -630,14 +659,48 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 ),
             };
 
-            step_arms.push(quote! {
-                Self::#var { #(#cap_pats,)* __wait } => {
-                    #guard
-                    let #tmp = __wait.expect("call settle_wait before step");
-                    #after_resume
-                    #tail
-                }
-            });
+            if ap.nested_child.is_some() {
+                let cap_moves_pending = cap_moves.clone();
+                let cap_moves_err = cap_moves;
+                step_arms.push(quote! {
+                    Self::#var { #(#cap_pats,)* mut __child } => {
+                        #guard
+                        match __child.step() {
+                            ::core::result::Result::Ok(::core::task::Poll::Pending) => {
+                                *self = Self::#var {
+                                    #(#cap_moves_pending,)*
+                                    __child,
+                                };
+                                break 'step ::core::result::Result::Ok(
+                                    ::core::task::Poll::Pending,
+                                );
+                            }
+                            ::core::result::Result::Ok(::core::task::Poll::Ready(#tmp)) => {
+                                #after_resume
+                                #tail
+                            }
+                            ::core::result::Result::Err(_) => {
+                                *self = Self::#var {
+                                    #(#cap_moves_err,)*
+                                    __child,
+                                };
+                                panic!(
+                                    "nested #[corot] rehydration is not supported yet"
+                                );
+                            }
+                        }
+                    }
+                });
+            } else {
+                step_arms.push(quote! {
+                    Self::#var { #(#cap_pats,)* __wait } => {
+                        #guard
+                        let #tmp = __wait.expect("call settle_wait before step");
+                        #after_resume
+                        #tail
+                    }
+                });
+            }
         }
 
         if needs_join(&ap.kind) {
@@ -669,15 +732,11 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     });
 
-    let settle_fn = if awaits.is_empty() {
-        quote! {}
-    } else {
-        quote! {
-            pub fn settle_wait(&mut self, value: &dyn ::std::any::Any) {
-                match self {
-                    #(#settle_arms)*
-                    _ => panic!("settle_wait called when not waiting"),
-                }
+    let settle_fn = quote! {
+        pub fn settle_wait(&mut self, value: &dyn ::std::any::Any) {
+            match self {
+                #(#settle_arms)*
+                _ => panic!("settle_wait called when not waiting"),
             }
         }
     };
@@ -791,7 +850,7 @@ fn as_await_stmt(
     index: usize,
     err_ty: Option<&Type>,
 ) -> syn::Result<Option<AwaitPoint>> {
-    if let Some(plain) = as_plain_await_let(stmt, err_ty)? {
+    if let Some(plain) = as_plain_await_let(stmt, err_ty, index)? {
         return Ok(Some(AwaitPoint {
             name: plain.name,
             tmp: plain.tmp,
@@ -799,6 +858,7 @@ fn as_await_stmt(
             base: plain.base,
             before: Vec::new(),
             try_ok: plain.try_ok,
+            nested_child: plain.nested_child,
             kind: SuspendKind::Plain {
                 after_resume: plain.after_resume,
             },
@@ -822,6 +882,7 @@ fn as_await_stmt(
 fn as_plain_await_let(
     stmt: &Stmt,
     err_ty: Option<&Type>,
+    await_index: usize,
 ) -> syn::Result<Option<PlainAwait>> {
     let Stmt::Local(Local {
         attrs,
@@ -881,7 +942,7 @@ fn as_plain_await_let(
             ));
         };
         let (name, ok_ty) = match pat {
-            Pat::Type(PatType { pat, ty, .. }) => (pat_ident(pat)?, ty.as_ref().clone()),
+            Pat::Type(PatType { pat, ty, .. }) => (pat_ident_or_discard(pat)?, ty.as_ref().clone()),
             _ => {
                 return Err(syn::Error::new_spanned(
                     pat,
@@ -898,7 +959,7 @@ fn as_plain_await_let(
         // Await in initializer (optional sync else) — allow `let Some(x) = … else`.
         let wait_ty = resolve_let_wait_ty(pat, expr)?;
         let name = match pat {
-            Pat::Type(PatType { pat, .. }) => pat_ident(pat)?,
+            Pat::Type(PatType { pat, .. }) => pat_ident_or_discard(pat)?,
             Pat::Ident(p) if p.subpat.is_none() => {
                 return Err(syn::Error::new_spanned(
                     pat,
@@ -910,10 +971,31 @@ fn as_plain_await_let(
         (name, wait_ty, None)
     };
 
+    // `let _: T = …` would collide across awaits; uniquify the stem.
+    let name = if name == "_unit" {
+        format_ident!("_unit{}", await_index)
+    } else {
+        name
+    };
+
     let tmp = format_ident!("__await_{}", name);
     let mut resume_expr = work_expr;
     let base = replace_first_await(&mut resume_expr, ident_expr(&tmp))?;
     resume_expr = strip_val_call(resume_expr);
+
+    let nested_child = as_corot_call(&base).map(|(ty, _)| ty);
+    if has_try && nested_child.is_some() {
+        return Err(syn::Error::new_spanned(
+            stmt,
+            "#[corot] `await?` on `call::<Child>(…)` is not supported yet",
+        ));
+    }
+    // Keep `call::<Child>(…)` as the base so evaluating it constructs the child.
+    let base = if nested_child.is_some() {
+        base
+    } else {
+        strip_val_call(base)
+    };
 
     let after_resume = if try_ok.is_some() {
         // Emitted specially in gen_after_resume (expands `?` to early Ready(Err)).
@@ -936,9 +1018,10 @@ fn as_plain_await_let(
         name,
         tmp,
         wait_ty,
-        base: strip_val_call(base),
+        base,
         after_resume,
         try_ok,
+        nested_child,
     }))
 }
 
@@ -988,6 +1071,7 @@ fn as_await_let_else_stmt(
         base: plain.base,
         before: Vec::new(),
         try_ok: plain.try_ok,
+        nested_child: plain.nested_child,
         kind: SuspendKind::LetElseAwait {
             pat: pat.clone(),
             init: strip_val_call(expr.as_ref().clone()),
@@ -1035,6 +1119,7 @@ fn as_await_if_stmt(
                     base,
                     before: Vec::new(),
                     try_ok: None,
+                    nested_child: None,
                     kind: SuspendKind::IfLetScrutinee {
                         pat: expr_let.pat.as_ref().clone(),
                         then_branch: expr_if.then_branch.clone(),
@@ -1057,6 +1142,7 @@ fn as_await_if_stmt(
                     base: base_of_await,
                     before: Vec::new(),
                     try_ok: None,
+                    nested_child: None,
                     kind: SuspendKind::IfCondition {
                         resume_cond: ident_expr(&tmp),
                         then_branch: expr_if.then_branch.clone(),
@@ -1076,6 +1162,7 @@ fn as_await_if_stmt(
                 base: plain.base,
                 before: Vec::new(),
                 try_ok: plain.try_ok,
+                nested_child: plain.nested_child,
                 kind: SuspendKind::IfThen {
                     cond: strip_val_in_if_cond(expr_if.cond.as_ref().clone()),
                     pat_binds,
@@ -1104,6 +1191,7 @@ fn as_await_if_stmt(
                 base: parsed.base,
                 before: Vec::new(),
                 try_ok: None,
+                nested_child: None,
                 kind: SuspendKind::IfElse {
                     cond: strip_val_in_if_cond(expr_if.cond.as_ref().clone()),
                     then_branch: expr_if.then_branch.clone(),
@@ -1144,6 +1232,7 @@ fn as_await_loop_stmt(
         base: plain.base,
         before: Vec::new(),
         try_ok: plain.try_ok,
+        nested_child: plain.nested_child,
         kind: SuspendKind::Loop {
             label,
             before_await,
@@ -1192,6 +1281,7 @@ fn as_await_for_stmt(
                     .unwrap_or_else(|| syn::parse_quote!(())),
                 after_resume: Vec::new(),
                 try_ok: None,
+                nested_child: None,
             },
             Vec::new(),
         )
@@ -1204,6 +1294,7 @@ fn as_await_for_stmt(
         base: plain.base,
         before: Vec::new(),
         try_ok: plain.try_ok,
+        nested_child: plain.nested_child,
         kind: SuspendKind::For {
             label: expr_for.label.as_ref().map(|l| l.name.ident.clone()),
             item,
@@ -1328,6 +1419,38 @@ fn try_range_into_ty(expr: &Expr) -> Option<Type> {
         .or_else(|| int_lit_type(range.end.as_deref()))
         .unwrap_or_else(|| syn::parse_quote!(i32));
     Some(syn::parse_quote!(::std::ops::Range<#ty>))
+}
+
+/// `call::<C>(arg)` / `corot_rs::call::<C>(arg)` — nest another `#[corot]` coroutine.
+fn as_corot_call(expr: &Expr) -> Option<(Type, Expr)> {
+    let expr = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        Expr::Group(g) => g.expr.as_ref(),
+        other => other,
+    };
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    if call.args.len() != 1 {
+        return None;
+    }
+    let Expr::Path(path) = call.func.as_ref() else {
+        return None;
+    };
+    let seg = path.path.segments.last()?;
+    if seg.ident != "call" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    let syn::GenericArgument::Type(ty) = args.args.first()? else {
+        return None;
+    };
+    Some((ty.clone(), call.args.first().unwrap().clone()))
 }
 
 /// `val::<T>(arg)` / `corot_rs::val::<T>(arg)` — identity wrapper for type ascription.
@@ -1891,6 +2014,7 @@ fn as_await_match_stmt(
                 base,
                 before: Vec::new(),
                 try_ok: None,
+                nested_child: None,
                 kind: SuspendKind::MatchScrutinee {
                     arms: expr_match.arms.clone(),
                 },
@@ -1922,6 +2046,7 @@ fn as_await_match_stmt(
                 base: plain.base,
                 before: Vec::new(),
                 try_ok: plain.try_ok,
+                nested_child: plain.nested_child,
                 kind: SuspendKind::MatchArm {
                     scrutinee: expr_match.expr.as_ref().clone(),
                     scrut_ty,
@@ -1966,6 +2091,7 @@ fn as_await_match_stmt(
                 base,
                 before: Vec::new(),
                 try_ok: None,
+                nested_child: None,
                 kind: SuspendKind::MatchGuard {
                     scrutinee: expr_match.expr.as_ref().clone(),
                     scrut_ty,
@@ -2355,7 +2481,7 @@ fn extract_single_await_from_stmts(
 
     for stmt in stmts {
         if found.is_none() {
-            if let Some(plain) = as_plain_await_let(stmt, err_ty)? {
+            if let Some(plain) = as_plain_await_let(stmt, err_ty, 0)? {
                 found = Some(plain);
             } else if stmt_contains_await(stmt) {
                 return Err(syn::Error::new_spanned(
@@ -2640,6 +2766,37 @@ fn gen_goto_loop_head(
     }
 }
 
+fn gen_enter_wait(
+    ap: &AwaitPoint,
+    waiting_var: &Ident,
+    caps: &[Binding],
+) -> proc_macro2::TokenStream {
+    if ap.nested_child.is_some() {
+        gen_go_nested(waiting_var, caps, &ap.base)
+    } else {
+        gen_go_waiting(waiting_var, caps, &ap.base)
+    }
+}
+
+fn gen_go_nested(
+    var: &Ident,
+    caps: &[Binding],
+    base: &Expr,
+) -> proc_macro2::TokenStream {
+    let cap_moves = caps.iter().map(|b| {
+        let n = &b.name;
+        quote! { #n }
+    });
+    quote! {
+        let __child = #base;
+        *self = Self::#var {
+            #(#cap_moves,)*
+            __child,
+        };
+        continue 'step;
+    }
+}
+
 fn gen_go_waiting(var: &Ident, caps: &[Binding], base: &Expr) -> proc_macro2::TokenStream {
     let cap_moves = caps.iter().map(|b| {
         let n = &b.name;
@@ -2664,7 +2821,7 @@ fn gen_enter_await(
     ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     let before = emit_stmts_rewrite_returns(&ap.before, ready_ok);
-    let go_wait = gen_go_waiting(waiting_var, caps, &ap.base);
+    let go_wait = gen_enter_wait(ap, waiting_var, caps);
     let join_caps = effective_join_caps(ap, join_caps);
     let non_suspend = gen_goto_join(ap, index, &join_caps);
 
@@ -3570,6 +3727,17 @@ fn pat_ident(pat: &Pat) -> syn::Result<Ident> {
         other => Err(syn::Error::new_spanned(
             other,
             "only simple ident patterns are supported",
+        )),
+    }
+}
+
+fn pat_ident_or_discard(pat: &Pat) -> syn::Result<Ident> {
+    match pat {
+        Pat::Ident(PatIdent { ident, .. }) => Ok(ident.clone()),
+        Pat::Wild(_) => Ok(format_ident!("_unit")),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "await bindings must be `let name: Type = …` or `let _: Type = …`",
         )),
     }
 }

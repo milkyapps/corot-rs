@@ -39,6 +39,23 @@ pub fn val<T>(value: T) -> T {
     value
 }
 
+/// Type ascription helper for awaiting another `#[corot]` coroutine.
+///
+/// Proc macros cannot prove a value is a generated coroutine enum, so write:
+///
+/// ```ignore
+/// let _: () = corot_rs::call::<ChildCoroutine>(child()).await;
+/// ```
+///
+/// `C` is the child's coroutine enum type (the return type of the `#[corot]` fn).
+/// The parent drives `C::step` / `settle_wait` until `Poll::Ready`, then resumes.
+///
+/// This function is the identity: it exists only so the macro can read `C`.
+#[inline(always)]
+pub fn call<C>(child: C) -> C {
+    child
+}
+
 /// Marker wrapper: captured across await, omitted from serde.
 ///
 /// - [`SkipSerde::new`] / [`SkipSerde::set`]: hydrated value
