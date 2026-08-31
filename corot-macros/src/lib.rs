@@ -2,13 +2,17 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use syn::{
-    parse_macro_input, Expr, ExprPath, Ident, ItemFn, Lifetime, Lit, Local, LocalInit, Pat, PatIdent,
-    PatType, Path, Stmt, Type,
+    parse_macro_input, Expr, ExprPath, FnArg, Ident, ItemFn, Lifetime, Lit, Local, LocalInit, Pat,
+    PatIdent, PatType, Path, Stmt, Type,
 };
 
 /// Suspension points: typed `let` awaits (including `await?`); `if` / `if let` /
 /// `let…else` / `loop` / `for` / `match` in a supported position (including
 /// multiple plain awaits chained in one construct body).
+///
+/// The decorated `async fn` may take typed arguments (`x: T`, `mut x: T`); they
+/// are stored on `NotStarted` and live across awaits like other captures.
+/// Methods (`self`) and generics are not supported yet.
 ///
 /// - `let name: T = expr.await?` when the fn returns `Result<(), E>` (settle
 ///   `Result<T, E>`; `Err` finishes with `Poll::Ready(Err(...))`)
@@ -295,12 +299,13 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             "#[corot] only supports async fn",
         ));
     }
-    if !input.sig.inputs.is_empty() {
+    if !input.sig.generics.params.is_empty() {
         return Err(syn::Error::new_spanned(
-            &input.sig.inputs,
-            "#[corot] basic version does not support function arguments yet",
+            &input.sig.generics,
+            "#[corot] does not support generic parameters yet",
         ));
     }
+    let fn_args = parse_fn_args(&input.sig.inputs)?;
 
     let vis = &input.vis;
     let fn_name = &input.sig.ident;
@@ -311,7 +316,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let (mut awaits, mut after_last) = split_awaits(&input.block.stmts, err_ty.as_ref())?;
     assign_join_stmts(&mut awaits, &mut after_last);
 
-    let mut live: Vec<Binding> = Vec::new();
+    let mut live: Vec<Binding> = fn_args.clone();
     let mut captures_at_await: Vec<Vec<Binding>> = Vec::new();
     let mut join_caps_at: Vec<Vec<Binding>> = Vec::new();
 
@@ -496,7 +501,16 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         }
     }
 
-    let mut variants = vec![quote! { NotStarted }];
+    let mut variants = if fn_args.is_empty() {
+        vec![quote! { NotStarted }]
+    } else {
+        let fields = fn_args.iter().map(field_tokens);
+        vec![quote! {
+            NotStarted {
+                #(#fields,)*
+            }
+        }]
+    };
     for (i, (ap, caps)) in awaits.iter().zip(captures_at_await.iter()).enumerate() {
         if for_has_iter_await(&ap.kind) {
             let iter_var = waiting_iter_variant(i);
@@ -616,6 +630,11 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     }
 
     let mut all_skips = collect_skip_bindings(&captures_at_await);
+    for b in &fn_args {
+        if is_skip_serde(&b.ty) {
+            upsert_binding(&mut all_skips, b.clone());
+        }
+    }
     for caps in &join_caps_at {
         for b in caps {
             if is_skip_serde(&b.ty) {
@@ -625,12 +644,19 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     }
     let rehyd_name = format_ident!("{}Rehydration", enum_name);
 
+    let not_started_pat = if fn_args.is_empty() {
+        quote! { Self::NotStarted }
+    } else {
+        let pats = fn_args.iter().map(cap_pat);
+        quote! { Self::NotStarted { #(#pats,)* } }
+    };
+
     let mut step_arms = Vec::new();
 
     if awaits.is_empty() {
         let body = emit_completion_stmts(&after_last, &ready_ok);
         step_arms.push(quote! {
-            Self::NotStarted => {
+            #not_started_pat => {
                 #body
             }
         });
@@ -644,7 +670,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             &ready_ok,
         );
         step_arms.push(quote! {
-            Self::NotStarted => {
+            #not_started_pat => {
                 #enter
             }
         });
@@ -975,6 +1001,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let (rehyd_enum, rehyd_method, step_ret) = make_rehydration(
         &vis,
         &rehyd_name,
+        &fn_args,
         &awaits,
         &captures_at_await,
         &join_caps_at,
@@ -982,6 +1009,29 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         &output_ty,
     );
     let getters = make_getters(&awaits, &captures_at_await, &join_caps_at);
+
+    let ctor_params = fn_args.iter().map(|b| {
+        let n = &b.name;
+        let t = &b.ty;
+        if b.mutable {
+            quote! { mut #n: #t }
+        } else {
+            quote! { #n: #t }
+        }
+    });
+    let ctor_body = if fn_args.is_empty() {
+        quote! { #enum_name::NotStarted }
+    } else {
+        let fields = fn_args.iter().map(|b| {
+            let n = &b.name;
+            quote! { #n }
+        });
+        quote! {
+            #enum_name::NotStarted {
+                #(#fields,)*
+            }
+        }
+    };
 
     Ok(quote! {
         #serde_attrs
@@ -1009,8 +1059,8 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             }
         }
 
-        #vis fn #fn_name() -> #enum_name {
-            #enum_name::NotStarted
+        #vis fn #fn_name(#(#ctor_params),*) -> #enum_name {
+            #ctor_body
         }
     })
 }
@@ -6004,6 +6054,44 @@ fn ident_expr(ident: &Ident) -> Expr {
     })
 }
 
+fn parse_fn_args(
+    inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
+) -> syn::Result<Vec<Binding>> {
+    let mut out = Vec::new();
+    for arg in inputs {
+        match arg {
+            FnArg::Receiver(recv) => {
+                return Err(syn::Error::new_spanned(
+                    recv,
+                    "#[corot] does not support methods (`self`) yet",
+                ));
+            }
+            FnArg::Typed(pt) => {
+                let (name, mutable) = match pt.pat.as_ref() {
+                    Pat::Ident(PatIdent {
+                        ident,
+                        mutability,
+                        subpat: None,
+                        ..
+                    }) => (ident.clone(), mutability.is_some()),
+                    other => {
+                        return Err(syn::Error::new_spanned(
+                            other,
+                            "#[corot] fn args must be `name: Type` or `mut name: Type`",
+                        ));
+                    }
+                };
+                out.push(Binding {
+                    name,
+                    ty: pt.ty.as_ref().clone(),
+                    mutable,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn typed_let_binding(stmt: &Stmt) -> Option<Binding> {
     let Stmt::Local(Local { pat, .. }) = stmt else {
         return None;
@@ -6120,6 +6208,7 @@ fn rehydration_guard(
 fn make_rehydration(
     vis: &syn::Visibility,
     rehyd_name: &Ident,
+    fn_args: &[Binding],
     awaits: &[AwaitPoint],
     captures_at_await: &[Vec<Binding>],
     join_caps_at: &[Vec<Binding>],
@@ -6167,9 +6256,32 @@ fn make_rehydration(
     };
 
     let mut arms = Vec::new();
-    arms.push(quote! {
-        Self::NotStarted | Self::Finished => #rehyd_name::Ok
-    });
+    let skip_in_args: Vec<_> = fn_args.iter().filter(|b| is_skip_serde(&b.ty)).collect();
+    if skip_in_args.is_empty() {
+        arms.push(quote! {
+            Self::NotStarted | Self::Finished => #rehyd_name::Ok
+        });
+    } else {
+        arms.push(quote! {
+            Self::Finished => #rehyd_name::Ok
+        });
+        let skip_pats: Vec<_> = skip_in_args.iter().map(|b| &b.name).collect();
+        let checks = skip_in_args.iter().map(|b| {
+            let n = &b.name;
+            let needs_var = needs_rehydration_variant(n);
+            quote! {
+                if #n.needs_rehydration() {
+                    return #rehyd_name::#needs_var { #n };
+                }
+            }
+        });
+        arms.push(quote! {
+            Self::NotStarted { #(#skip_pats,)* .. } => {
+                #(#checks)*
+                #rehyd_name::Ok
+            }
+        });
+    }
 
     for (i, (ap, caps)) in awaits.iter().zip(captures_at_await.iter()).enumerate() {
         let has_waiting_var =
