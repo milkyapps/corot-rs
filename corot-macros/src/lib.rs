@@ -17,6 +17,7 @@ use syn::{
 /// - `loop` / `while` / `while let` / `for`: optional label; `break` / `continue`
 ///   before or after the await (unlabeled or `'label`); unlabeled `break`/`continue`
 ///   inside nested sync loops stay native
+/// - `let x: T = loop { …; break value }` / `break 'label value` (loop-as-expression)
 /// - `if` / `if let`: condition/scrutinee, then, else, or else-if chain
 /// - `let…else`: await in the initializer or in the `else` block
 /// - `match`: scrutinee, one arm body, or one guard
@@ -115,8 +116,13 @@ enum SuspendKind {
     },
     /// `loop { before; let name: Ty = ….await; after; }` with optional label /
     /// `break` / `continue` (including `'label`).
+    ///
+    /// When used as `let bind: T = loop { …; break value }`, `break_bind` is set
+    /// and `break`/`break value` assign that binding before joining.
     Loop {
         label: Option<Ident>,
+        /// Present for loop-as-expression (`let name: Ty = loop { … }`).
+        break_bind: Option<(Ident, Type)>,
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
@@ -400,9 +406,13 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             _ => {}
         }
         captures_at_await.push(live.clone());
-        for stmt in after_resume_stmts(ap) {
-            if let Some(b) = typed_let_binding(stmt) {
-                upsert_binding(&mut live, b);
+        // Locals after resume inside loop/if/match/block bodies do not escape the
+        // construct; only `Plain` after-resume stmts stay live for later awaits.
+        if after_resume_escapes(&ap.kind) {
+            for stmt in after_resume_stmts(ap) {
+                if let Some(b) = typed_let_binding(stmt) {
+                    upsert_binding(&mut live, b);
+                }
             }
         }
         // Pattern bindings from let-else init / if-let scrutinee become live after resume.
@@ -418,6 +428,10 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     mutable: false,
                 },
             );
+        }
+        // Loop/block expression value is live for join_stmts and later awaits.
+        if let Some(b) = join_value_binding(ap) {
+            upsert_binding(&mut live, b);
         }
         // Bindings introduced in join_stmts become live before the next await.
         if let Some(join) = join_stmts_of(ap) {
@@ -628,6 +642,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         &join_caps_at[i],
                         label.as_ref(),
                         true,
+                        None,
                         &ready_ok,
                     );
                     let some_body = if *has_body_await {
@@ -659,6 +674,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 SuspendKind::Loop {
                     before_await,
                     label,
+                    break_bind,
                     ..
                 } => {
                     let go_wait = gen_enter_wait(ap, &var, caps);
@@ -668,6 +684,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         &join_caps_at[i],
                         label.as_ref(),
                         false,
+                        break_bind.as_ref(),
                         &ready_ok,
                     );
                     step_arms.push(quote! {
@@ -692,6 +709,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         &join_caps_at[i],
                         label.as_ref(),
                         false,
+                        None,
                         &ready_ok,
                     );
                     step_arms.push(quote! {
@@ -953,6 +971,9 @@ fn as_await_stmt(
     if let Some(ap) = as_await_labeled_block_stmt(stmt, index, err_ty)? {
         return Ok(Some(ap));
     }
+    if let Some(ap) = as_await_loop_stmt(stmt, index, err_ty)? {
+        return Ok(Some(ap));
+    }
     if let Some(plain) = as_plain_await_let(stmt, err_ty, index)? {
         return Ok(Some(AwaitPoint {
             name: plain.name,
@@ -971,9 +992,6 @@ fn as_await_stmt(
         return Ok(Some(ap));
     }
     if let Some(ap) = as_await_if_stmt(stmt, index, err_ty)? {
-        return Ok(Some(ap));
-    }
-    if let Some(ap) = as_await_loop_stmt(stmt, err_ty)? {
         return Ok(Some(ap));
     }
     if let Some(ap) = as_await_while_stmt(stmt, index, err_ty)? {
@@ -1317,8 +1335,66 @@ fn as_await_if_stmt(
 
 fn as_await_loop_stmt(
     stmt: &Stmt,
+    index: usize,
     err_ty: Option<&Type>,
 ) -> syn::Result<Option<AwaitPoint>> {
+    // `let name: Ty = ['lab:] loop { … }`
+    if let Stmt::Local(Local {
+        pat,
+        init: Some(LocalInit { expr, diverge, .. }),
+        ..
+    }) = stmt
+    {
+        if diverge.is_some() {
+            return Ok(None);
+        }
+        let Expr::Loop(expr_loop) = unwrap_parens_ref(expr) else {
+            return Ok(None);
+        };
+        if !expr_loop.body.stmts.iter().any(stmt_contains_await) {
+            return Ok(None);
+        }
+        let Pat::Type(PatType { pat: inner, ty, .. }) = pat else {
+            return Err(syn::Error::new_spanned(
+                pat,
+                "loop-as-expression await bindings must be `let name: Type = loop { … }`",
+            ));
+        };
+        let bind_name = pat_ident_or_discard(inner)?;
+        let bind_name = if bind_name == "_unit" {
+            format_ident!("_loop{}", index)
+        } else {
+            bind_name
+        };
+        let label = expr_loop
+            .label
+            .as_ref()
+            .map(|l| l.name.ident.clone());
+        let (before_await, plain, after_await) =
+            extract_single_await_from_stmts(&expr_loop.body.stmts, err_ty)?;
+        return Ok(Some(AwaitPoint {
+            name: plain.name,
+            tmp: plain.tmp,
+            wait_ty: plain.wait_ty,
+            base: plain.base,
+            before: Vec::new(),
+            try_ok: plain.try_ok,
+            nested_child: plain.nested_child,
+            kind: SuspendKind::Loop {
+                label,
+                break_bind: Some((bind_name, ty.as_ref().clone())),
+                before_await,
+                after_await: {
+                    let mut v = plain.after_resume;
+                    v.extend(after_await);
+                    v
+                },
+                join_stmts: Vec::new(),
+            },
+        }));
+    }
+
+    // `['lab:] loop { … };` as a statement
     let Stmt::Expr(Expr::Loop(expr_loop), _) = stmt else {
         return Ok(None);
     };
@@ -1341,6 +1417,7 @@ fn as_await_loop_stmt(
         nested_child: plain.nested_child,
         kind: SuspendKind::Loop {
             label,
+            break_bind: None,
             before_await,
             after_await: {
                 let mut v = plain.after_resume;
@@ -2852,6 +2929,10 @@ fn after_resume_stmts(ap: &AwaitPoint) -> Vec<&Stmt> {
     }
 }
 
+fn after_resume_escapes(kind: &SuspendKind) -> bool {
+    matches!(kind, SuspendKind::Plain { .. })
+}
+
 fn pat_binds_after_resume(ap: &AwaitPoint) -> Vec<Binding> {
     match &ap.kind {
         SuspendKind::Plain { after_resume } => {
@@ -2997,7 +3078,45 @@ fn effective_join_caps(ap: &AwaitPoint, join_caps: &[Binding]) -> Vec<Binding> {
             );
             caps
         }
+        SuspendKind::Loop {
+            break_bind: Some((bind_name, bind_ty)),
+            ..
+        } => {
+            let mut caps = join_caps.to_vec();
+            upsert_binding(
+                &mut caps,
+                Binding {
+                    name: bind_name.clone(),
+                    ty: bind_ty.clone(),
+                    mutable: false,
+                },
+            );
+            caps
+        }
         _ => join_caps.to_vec(),
+    }
+}
+
+fn join_value_binding(ap: &AwaitPoint) -> Option<Binding> {
+    match &ap.kind {
+        SuspendKind::LabeledBlock {
+            bind_name,
+            bind_ty,
+            ..
+        } => Some(Binding {
+            name: bind_name.clone(),
+            ty: bind_ty.clone(),
+            mutable: false,
+        }),
+        SuspendKind::Loop {
+            break_bind: Some((bind_name, bind_ty)),
+            ..
+        } => Some(Binding {
+            name: bind_name.clone(),
+            ty: bind_ty.clone(),
+            mutable: false,
+        }),
+        _ => None,
     }
 }
 
@@ -3173,8 +3292,10 @@ fn gen_enter_await(
 ) -> proc_macro2::TokenStream {
     let before = emit_stmts_rewrite_returns(&ap.before, ready_ok);
     let go_wait = gen_enter_wait(ap, waiting_var, caps);
-    let join_caps = effective_join_caps(ap, join_caps);
-    let non_suspend = gen_goto_join(ap, index, &join_caps);
+    // After* join caps may include expression values (loop/block break binds).
+    // LoopHead / WaitingIter must not — those run before a value exists.
+    let after_caps = effective_join_caps(ap, join_caps);
+    let non_suspend = gen_goto_join(ap, index, &after_caps);
 
     match &ap.kind {
         SuspendKind::Plain { .. }
@@ -3185,7 +3306,7 @@ fn gen_enter_await(
             #go_wait
         },
         SuspendKind::Loop { .. } | SuspendKind::While { .. } => {
-            let goto_head = gen_goto_loop_head(index, ap, &join_caps);
+            let goto_head = gen_goto_loop_head(index, ap, join_caps);
             quote! {
                 #before
                 #goto_head
@@ -3198,7 +3319,7 @@ fn gen_enter_await(
             ..
         } => {
             let iter_ty = into_iter_ty(into_ty);
-            let goto_head = gen_goto_loop_head(index, ap, &join_caps);
+            let goto_head = gen_goto_loop_head(index, ap, join_caps);
             if let Some(base) = iter_await_base {
                 let iter_var = waiting_iter_variant(index);
                 let join_moves = join_caps.iter().map(|b| {
@@ -3354,7 +3475,7 @@ fn gen_enter_await(
                 label,
                 bind_name,
                 bind_ty,
-                &join_caps,
+                &after_caps,
                 ready_ok,
             );
             quote! {
@@ -3579,23 +3700,30 @@ fn gen_after_resume(
         SuspendKind::Loop {
             after_await,
             label,
+            break_bind,
             ..
-        }
-        | SuspendKind::For {
+        } => rewrite_loop_body_stmts(
+            index,
+            after_await,
+            join_caps,
+            label.as_ref(),
+            false,
+            break_bind.as_ref(),
+            ready_ok,
+        ),
+        SuspendKind::For {
             after_await,
             label,
             ..
-        } => {
-            let is_for = matches!(&ap.kind, SuspendKind::For { .. });
-            rewrite_loop_body_stmts(
-                index,
-                after_await,
-                join_caps,
-                label.as_ref(),
-                is_for,
-                ready_ok,
-            )
-        }
+        } => rewrite_loop_body_stmts(
+            index,
+            after_await,
+            join_caps,
+            label.as_ref(),
+            true,
+            None,
+            ready_ok,
+        ),
         SuspendKind::While {
             sync_cond: None,
             await_let_pat,
@@ -3610,6 +3738,7 @@ fn gen_after_resume(
                 join_caps,
                 label.as_ref(),
                 false,
+                None,
                 ready_ok,
             );
             let goto_head = gen_goto_loop_head(index, ap, join_caps);
@@ -3643,6 +3772,7 @@ fn gen_after_resume(
             join_caps,
             label.as_ref(),
             false,
+            None,
             ready_ok,
         ),
         SuspendKind::LabeledBlock {
@@ -3963,6 +4093,7 @@ fn rewrite_loop_body_stmts(
     join_caps: &[Binding],
     label: Option<&Ident>,
     is_for: bool,
+    break_bind: Option<&(Ident, Type)>,
     ready_ok: &proc_macro2::TokenStream,
 ) -> proc_macro2::TokenStream {
     let ctx = LoopRewriteCtx {
@@ -3970,6 +4101,7 @@ fn rewrite_loop_body_stmts(
         join_caps,
         label,
         is_for,
+        break_bind,
         ready_ok,
     };
     let parts = stmts
@@ -3983,16 +4115,63 @@ struct LoopRewriteCtx<'a> {
     join_caps: &'a [Binding],
     label: Option<&'a Ident>,
     is_for: bool,
+    break_bind: Option<&'a (Ident, Type)>,
     ready_ok: &'a proc_macro2::TokenStream,
 }
 
-fn emit_loop_break(ctx: &LoopRewriteCtx<'_>) -> proc_macro2::TokenStream {
+fn emit_loop_break(
+    ctx: &LoopRewriteCtx<'_>,
+    value: Option<&Expr>,
+    in_nested: bool,
+) -> proc_macro2::TokenStream {
+    let mut after_caps = ctx.join_caps.to_vec();
+    let assign = match (ctx.break_bind, value) {
+        (Some((name, ty)), Some(e)) => {
+            let val = rewrite_loop_expr(e, ctx, in_nested);
+            upsert_binding(
+                &mut after_caps,
+                Binding {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                    mutable: false,
+                },
+            );
+            quote! { let #name: #ty = #val; }
+        }
+        (Some((name, ty)), None) if is_unit_ty(ty) => {
+            upsert_binding(
+                &mut after_caps,
+                Binding {
+                    name: name.clone(),
+                    ty: ty.clone(),
+                    mutable: false,
+                },
+            );
+            quote! { let #name: #ty = (); }
+        }
+        (Some(_), None) => {
+            return quote! {
+                ::core::compile_error!(
+                    "#[corot] `break` in a loop-as-expression requires a value"
+                )
+            };
+        }
+        (None, Some(_)) => {
+            return quote! {
+                ::core::compile_error!(
+                    "#[corot] `break` with a value requires `let name: T = loop { ... }`"
+                )
+            };
+        }
+        (None, None) => quote! {},
+    };
     let var = after_loop_variant(ctx.index);
-    let fields = ctx.join_caps.iter().map(|b| {
+    let fields = after_caps.iter().map(|b| {
         let n = &b.name;
         quote! { #n }
     });
     quote! {
+        #assign
         *self = Self::#var {
             #(#fields,)*
         };
@@ -4033,16 +4212,18 @@ fn rewrite_break_expr(
     ctx: &LoopRewriteCtx<'_>,
     in_nested: bool,
 ) -> proc_macro2::TokenStream {
-    if brk.expr.is_some() {
-        return quote! {
-            ::core::compile_error!("#[corot] `break` with a value is not supported yet")
-        };
-    }
+    let value = brk.expr.as_deref();
     match &brk.label {
-        None if !in_nested => emit_loop_break(ctx),
-        None => quote! { break },
-        Some(life) if label_matches(ctx, life) => emit_loop_break(ctx),
-        Some(life) if in_nested => quote! { break #life },
+        None if !in_nested => emit_loop_break(ctx, value, in_nested),
+        None => match value {
+            Some(e) => quote! { break #e },
+            None => quote! { break },
+        },
+        Some(life) if label_matches(ctx, life) => emit_loop_break(ctx, value, in_nested),
+        Some(life) if in_nested => match value {
+            Some(e) => quote! { break #life #e },
+            None => quote! { break #life },
+        },
         Some(life) => {
             let msg = format!(
                 "#[corot] `break '{0}` does not match this suspending loop's label",
