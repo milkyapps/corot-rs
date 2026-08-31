@@ -5,15 +5,17 @@ use syn::{
     Path, Stmt, Type,
 };
 
-/// Suspension points: typed `let` awaits; `if` / `loop` / `for` / `match` with a
-/// single await in a supported position.
+/// Suspension points: typed `let` awaits; `if` / `if let` / `let…else` / `loop` /
+/// `for` / `match` with a single await in a supported position.
 ///
-/// - `if`: condition (`expr.await` → bool), then, or else
-/// - `match`: scrutinee (`expr.await`), one arm body, or one guard (`expr.await` → bool)
-/// - `for`: range literal or `iter::<I>(…)` (`I: IntoIterator`), optional body await
+/// - `if` / `if let`: condition/scrutinee, then, or else
+/// - `let…else`: await in the initializer or in the `else` block
+/// - `match`: scrutinee, one arm body, or one guard
+/// - `for`: range literal or `iter::<I>(…)`, optional body await
 ///
 /// Locals that live across an await must be type-annotated.
-/// Match scrutinee types are inferred from arm pattern literals when possible.
+/// Scrutinee types for `if let` / `let…else` use pattern literals or
+/// `corot_rs::val::<T>(…)`.
 ///
 /// With the `serde` feature, wrap non-serializable captures in `SkipSerde<T>`
 /// (from the `corot-rs` crate). The macro matches that type name and emits
@@ -52,19 +54,36 @@ enum SuspendKind {
         then_branch: syn::Block,
         else_branch: Option<Box<Expr>>,
     },
-    /// Await only inside the then branch.
+    /// Await only inside the then branch (`if` or `if let`).
     IfThen {
         cond: Expr,
+        /// Bindings introduced by `if let` pattern (typed from scrutinee).
+        pat_binds: Vec<Binding>,
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         else_branch: Option<Box<Expr>>,
         /// Stmts after the `if` until the next await / end (run in `AfterIfN`).
         join_stmts: Vec<Stmt>,
     },
-    /// Await only inside the else branch.
+    /// Await only inside the else branch (`if` or `if let`).
     IfElse {
         cond: Expr,
         then_branch: syn::Block,
+        before_await: Vec<Stmt>,
+        after_await: Vec<Stmt>,
+        join_stmts: Vec<Stmt>,
+    },
+    /// `if let PAT = EXPR.await { then } else { else }`
+    IfLetScrutinee {
+        pat: Pat,
+        then_branch: syn::Block,
+        else_branch: Option<Box<Expr>>,
+    },
+    /// `let PAT = EXPR else { … await … }` — await only in the else block.
+    LetElseAwait {
+        pat: Pat,
+        init: Expr,
+        pat_binds: Vec<Binding>,
         before_await: Vec<Stmt>,
         after_await: Vec<Stmt>,
         join_stmts: Vec<Stmt>,
@@ -172,9 +191,35 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         join_caps_at.push(live.clone());
 
         match &ap.kind {
-            SuspendKind::IfThen { before_await, .. }
-            | SuspendKind::IfElse { before_await, .. }
+            SuspendKind::IfThen {
+                pat_binds,
+                before_await,
+                ..
+            } => {
+                for b in pat_binds {
+                    upsert_binding(&mut live, b.clone());
+                }
+                for stmt in before_await {
+                    if let Some(b) = typed_let_binding(stmt) {
+                        upsert_binding(&mut live, b);
+                    }
+                }
+            }
+            SuspendKind::IfElse { before_await, .. }
             | SuspendKind::Loop { before_await, .. } => {
+                for stmt in before_await {
+                    if let Some(b) = typed_let_binding(stmt) {
+                        upsert_binding(&mut live, b);
+                    }
+                }
+            }
+            SuspendKind::LetElseAwait {
+                pat_binds,
+                before_await,
+                ..
+            } => {
+                // Else path does not bind `pat`; success path uses join with pat_binds.
+                let _ = pat_binds;
                 for stmt in before_await {
                     if let Some(b) = typed_let_binding(stmt) {
                         upsert_binding(&mut live, b);
@@ -251,6 +296,10 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 upsert_binding(&mut live, b);
             }
         }
+        // Pattern bindings from let-else init / if-let scrutinee become live after resume.
+        for b in pat_binds_after_resume(ap) {
+            upsert_binding(&mut live, b);
+        }
         // Bindings introduced in join_stmts become live before the next await.
         if let Some(join) = join_stmts_of(ap) {
             for stmt in join {
@@ -322,7 +371,8 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
         if needs_join(&ap.kind) {
             let after_var = join_variant(&ap.kind, i);
-            let join_fields = join_caps_at[i].iter().map(|b| field_tokens(b));
+            let join_caps = effective_join_caps(ap, &join_caps_at[i]);
+            let join_fields = join_caps.iter().map(|b| field_tokens(b));
             variants.push(quote! {
                 #after_var {
                     #(#join_fields,)*
@@ -486,8 +536,10 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 | SuspendKind::IfElse { .. }
                 | SuspendKind::MatchArm { .. }
                 | SuspendKind::MatchGuard { .. } => {
-                    gen_goto_join(ap, i, &join_caps_at[i])
+                    gen_goto_join(ap, i, &effective_join_caps(ap, &join_caps_at[i]))
                 }
+                // Else-path of let…else diverges after resume (see gen_after_resume).
+                SuspendKind::LetElseAwait { .. } => quote! {},
                 _ => gen_join_tail(i, &awaits, &captures_at_await, &join_caps_at, &after_last),
             };
 
@@ -503,7 +555,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
         if needs_join(&ap.kind) {
             let after_var = join_variant(&ap.kind, i);
-            let join_caps = &join_caps_at[i];
+            let join_caps = effective_join_caps(ap, &join_caps_at[i]);
             let join_pats: Vec<_> = join_caps.iter().map(cap_pat).collect();
             let join_stmts = join_stmts_of(ap).unwrap_or(&[]);
             let after_join =
@@ -643,6 +695,9 @@ fn as_await_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>> {
             },
         }));
     }
+    if let Some(ap) = as_await_let_else_stmt(stmt)? {
+        return Ok(Some(ap));
+    }
     if let Some(ap) = as_await_if_stmt(stmt, index)? {
         return Ok(Some(ap));
     }
@@ -671,34 +726,39 @@ fn as_plain_await_let(stmt: &Stmt) -> syn::Result<Option<PlainAwait>> {
         return Ok(None);
     };
 
-    if diverge.is_some() {
-        return Err(syn::Error::new_spanned(
-            stmt,
-            "#[corot] does not support let ... else with await",
-        ));
-    }
+    let else_has_await = diverge
+        .as_ref()
+        .is_some_and(|(_, e)| contains_await(e));
+    let init_has_await = contains_await(expr);
 
-    if !contains_await(expr) {
+    if !init_has_await && !else_has_await {
         return Ok(None);
     }
 
-    let (name, wait_ty) = match pat {
-        Pat::Type(PatType { pat, ty, .. }) => {
-            let name = pat_ident(pat)?;
-            (name, ty.as_ref().clone())
-        }
-        _ => {
-            return Err(syn::Error::new_spanned(
-                pat,
-                "await bindings must be written as `let name: Type = <expr with await>` \
-                 (Type is the settle/await-output type)",
-            ));
-        }
-    };
+    // Await only in else → handled by as_await_let_else_stmt.
+    if else_has_await && !init_has_await {
+        return Ok(None);
+    }
 
+    if else_has_await && init_has_await {
+        return Err(syn::Error::new_spanned(
+            stmt,
+            "#[corot] supports at most one await in let…else (initializer or else, not both)",
+        ));
+    }
+
+    // Await in initializer (optional sync else).
+    let wait_ty = resolve_let_wait_ty(pat, expr)?;
+    let name = match pat {
+        Pat::Type(PatType { pat, .. }) => pat_ident(pat)?,
+        Pat::Ident(p) if p.subpat.is_none() => p.ident.clone(),
+        _ => format_ident!("letelse"),
+    };
     let tmp = format_ident!("__await_{}", name);
     let mut resume_expr = expr.as_ref().clone();
     let base = replace_first_await(&mut resume_expr, ident_expr(&tmp))?;
+    // Strip val::<T>(…) wrapper from resume so we bind the settled value.
+    resume_expr = strip_val_call(resume_expr);
 
     let after_resume = vec![Stmt::Local(Local {
         attrs: attrs.clone(),
@@ -707,7 +767,7 @@ fn as_plain_await_let(stmt: &Stmt) -> syn::Result<Option<PlainAwait>> {
         init: Some(LocalInit {
             eq_token: *eq_token,
             expr: Box::new(resume_expr),
-            diverge: None,
+            diverge: diverge.as_ref().map(|(t, e)| (*t, e.clone())),
         }),
         semi_token: *semi_token,
     })];
@@ -716,8 +776,55 @@ fn as_plain_await_let(stmt: &Stmt) -> syn::Result<Option<PlainAwait>> {
         name,
         tmp,
         wait_ty,
-        base,
+        base: strip_val_call(base),
         after_resume,
+    }))
+}
+
+fn as_await_let_else_stmt(stmt: &Stmt) -> syn::Result<Option<AwaitPoint>> {
+    let Stmt::Local(Local {
+        pat,
+        init: Some(LocalInit {
+            expr,
+            diverge: Some((_, else_expr)),
+            ..
+        }),
+        ..
+    }) = stmt
+    else {
+        return Ok(None);
+    };
+
+    if contains_await(expr) {
+        return Ok(None); // init await handled as plain
+    }
+    if !contains_await(else_expr) {
+        return Ok(None);
+    }
+
+    let else_stmts = else_block_stmts(else_expr)?;
+    let (before_await, plain, after_await) = extract_single_await_from_stmts(else_stmts)?;
+    let scrut_ty = resolve_scrut_ty(pat, expr)?;
+    let pat_binds = bindings_from_pat(pat, &scrut_ty)?;
+
+    Ok(Some(AwaitPoint {
+        name: plain.name,
+        tmp: plain.tmp,
+        wait_ty: plain.wait_ty,
+        base: plain.base,
+        before: Vec::new(),
+        kind: SuspendKind::LetElseAwait {
+            pat: pat.clone(),
+            init: strip_val_call(expr.as_ref().clone()),
+            pat_binds,
+            before_await,
+            after_await: {
+                let mut v = plain.after_resume;
+                v.extend(after_await);
+                v
+            },
+            join_stmts: Vec::new(),
+        },
     }))
 }
 
@@ -736,30 +843,51 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
     match (cond_has, then_has, else_has) {
         (false, false, false) => Ok(None),
         (true, false, false) => {
-            let Some(base_of_await) = bare_await_base(&expr_if.cond) else {
-                return Err(syn::Error::new_spanned(
-                    &expr_if.cond,
-                    "await in `if` condition must be a bare `expr.await` (result type: bool)",
-                ));
-            };
-            let name = format_ident!("cond{}", index);
-            let tmp = format_ident!("__await_{}", name);
-            Ok(Some(AwaitPoint {
-                name,
-                tmp: tmp.clone(),
-                wait_ty: syn::parse_quote!(bool),
-                base: base_of_await,
-                before: Vec::new(),
-                kind: SuspendKind::IfCondition {
-                    resume_cond: ident_expr(&tmp),
-                    then_branch: expr_if.then_branch.clone(),
-                    else_branch: expr_if.else_branch.as_ref().map(|(_, e)| e.clone()),
-                },
-            }))
+            // `if let PAT = EXPR.await` or `if EXPR.await`
+            if let Expr::Let(expr_let) = expr_if.cond.as_ref() {
+                let base = await_base_from_scrut(&expr_let.expr)?;
+                let wait_ty = resolve_scrut_ty(&expr_let.pat, &expr_let.expr)?;
+                let name = format_ident!("scrut{}", index);
+                let tmp = format_ident!("__await_{}", name);
+                Ok(Some(AwaitPoint {
+                    name,
+                    tmp,
+                    wait_ty,
+                    base,
+                    before: Vec::new(),
+                    kind: SuspendKind::IfLetScrutinee {
+                        pat: expr_let.pat.as_ref().clone(),
+                        then_branch: expr_if.then_branch.clone(),
+                        else_branch: expr_if.else_branch.as_ref().map(|(_, e)| e.clone()),
+                    },
+                }))
+            } else {
+                let Some(base_of_await) = bare_await_base(&expr_if.cond) else {
+                    return Err(syn::Error::new_spanned(
+                        &expr_if.cond,
+                        "await in `if` condition must be a bare `expr.await` (result type: bool)",
+                    ));
+                };
+                let name = format_ident!("cond{}", index);
+                let tmp = format_ident!("__await_{}", name);
+                Ok(Some(AwaitPoint {
+                    name,
+                    tmp: tmp.clone(),
+                    wait_ty: syn::parse_quote!(bool),
+                    base: base_of_await,
+                    before: Vec::new(),
+                    kind: SuspendKind::IfCondition {
+                        resume_cond: ident_expr(&tmp),
+                        then_branch: expr_if.then_branch.clone(),
+                        else_branch: expr_if.else_branch.as_ref().map(|(_, e)| e.clone()),
+                    },
+                }))
+            }
         }
         (false, true, false) => {
             let (before_await, plain, after_await) =
                 extract_single_await_from_stmts(&expr_if.then_branch.stmts)?;
+            let pat_binds = if_let_pat_binds(&expr_if.cond)?;
             Ok(Some(AwaitPoint {
                 name: plain.name,
                 tmp: plain.tmp,
@@ -767,7 +895,8 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
                 base: plain.base,
                 before: Vec::new(),
                 kind: SuspendKind::IfThen {
-                    cond: expr_if.cond.as_ref().clone(),
+                    cond: strip_val_in_if_cond(expr_if.cond.as_ref().clone()),
+                    pat_binds,
                     before_await,
                     after_await: {
                         let mut v = plain.after_resume;
@@ -795,7 +924,7 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
                 base: plain.base,
                 before: Vec::new(),
                 kind: SuspendKind::IfElse {
-                    cond: expr_if.cond.as_ref().clone(),
+                    cond: strip_val_in_if_cond(expr_if.cond.as_ref().clone()),
                     then_branch: expr_if.then_branch.clone(),
                     before_await,
                     after_await: {
@@ -809,8 +938,8 @@ fn as_await_if_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>
         }
         _ => Err(syn::Error::new_spanned(
             stmt,
-            "#[corot] supports at most one await in an if, and only in the condition, \
-             or only in then, or only in else",
+            "#[corot] supports at most one await in an if/if-let, and only in the \
+             condition/scrutinee, or only in then, or only in else",
         )),
     }
 }
@@ -1013,6 +1142,309 @@ fn try_range_into_ty(expr: &Expr) -> Option<Type> {
         .or_else(|| int_lit_type(range.end.as_deref()))
         .unwrap_or_else(|| syn::parse_quote!(i32));
     Some(syn::parse_quote!(::std::ops::Range<#ty>))
+}
+
+/// `val::<T>(arg)` / `corot_rs::val::<T>(arg)` — identity wrapper for type ascription.
+fn as_val_call(expr: &Expr) -> Option<(Type, Expr)> {
+    let expr = match expr {
+        Expr::Paren(p) => p.expr.as_ref(),
+        Expr::Group(g) => g.expr.as_ref(),
+        other => other,
+    };
+    let Expr::Call(call) = expr else {
+        return None;
+    };
+    if call.args.len() != 1 {
+        return None;
+    }
+    let Expr::Path(path) = call.func.as_ref() else {
+        return None;
+    };
+    let seg = path.path.segments.last()?;
+    if seg.ident != "val" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    if args.args.len() != 1 {
+        return None;
+    }
+    let syn::GenericArgument::Type(ty) = args.args.first()? else {
+        return None;
+    };
+    Some((ty.clone(), call.args.first().unwrap().clone()))
+}
+
+fn strip_val_call(expr: Expr) -> Expr {
+    if let Some((_, inner)) = as_val_call(&expr) {
+        inner
+    } else {
+        expr
+    }
+}
+
+/// Await receiver for a scrutinee: `expr.await` or `val::<T>(expr.await)`.
+fn await_base_from_scrut(expr: &Expr) -> syn::Result<Expr> {
+    if let Some(base) = bare_await_base(expr) {
+        return Ok(strip_val_call(base));
+    }
+    if let Some((_, arg)) = as_val_call(expr) {
+        if let Some(base) = bare_await_base(&arg) {
+            return Ok(base);
+        }
+    }
+    Err(syn::Error::new_spanned(
+        expr,
+        "await in `if let` / `let…else` scrutinee must be `expr.await` or \
+         `val::<T>(expr.await)`",
+    ))
+}
+
+fn strip_val_in_if_cond(cond: Expr) -> Expr {
+    match cond {
+        Expr::Let(mut expr_let) => {
+            expr_let.expr = Box::new(strip_val_call(*expr_let.expr));
+            Expr::Let(expr_let)
+        }
+        other => strip_val_call(other),
+    }
+}
+
+fn if_let_pat_binds(cond: &Expr) -> syn::Result<Vec<Binding>> {
+    let Expr::Let(expr_let) = cond else {
+        return Ok(Vec::new());
+    };
+    let scrut_ty = resolve_scrut_ty(&expr_let.pat, &expr_let.expr)?;
+    bindings_from_pat(&expr_let.pat, &scrut_ty)
+}
+
+fn resolve_let_wait_ty(pat: &Pat, expr: &Expr) -> syn::Result<Type> {
+    if let Some((ty, _)) = as_val_call(expr) {
+        return Ok(ty);
+    }
+    if let Pat::Type(pt) = pat {
+        return Ok(pt.ty.as_ref().clone());
+    }
+    if let Some(base) = bare_await_base(expr) {
+        if let Some((ty, _)) = as_val_call(&base) {
+            return Ok(ty);
+        }
+        return resolve_scrut_ty(pat, &base);
+    }
+    resolve_scrut_ty(pat, expr)
+}
+
+fn resolve_scrut_ty(pat: &Pat, scrut: &Expr) -> syn::Result<Type> {
+    if let Some((ty, _)) = as_val_call(scrut) {
+        return Ok(ty);
+    }
+    if let Some(base) = bare_await_base(scrut) {
+        if let Some((ty, _)) = as_val_call(&base) {
+            return Ok(ty);
+        }
+    }
+    if let Some(ty) = pattern_type_hint(pat)? {
+        return Ok(ty);
+    }
+    if simple_pat_idents(pat).is_empty() {
+        // No bindings to type; a placeholder is fine when unused.
+        return Ok(syn::parse_quote!(()));
+    }
+    Err(syn::Error::new_spanned(
+        scrut,
+        "#[corot] cannot infer scrutinee type for this pattern; use \
+         `corot_rs::val::<T>(…)` or a literal pattern (e.g. `Some(0)`)",
+    ))
+}
+
+fn bindings_from_pat(pat: &Pat, scrut_ty: &Type) -> syn::Result<Vec<Binding>> {
+    match pat {
+        Pat::Ident(p) if p.subpat.is_none() => Ok(vec![Binding {
+            name: p.ident.clone(),
+            ty: scrut_ty.clone(),
+            mutable: p.mutability.is_some(),
+        }]),
+        Pat::Ident(p) => {
+            let Some((_, sub)) = &p.subpat else {
+                return Ok(Vec::new());
+            };
+            // `x @ PAT` — x has scrut type; also recurse into PAT.
+            let mut out = vec![Binding {
+                name: p.ident.clone(),
+                ty: scrut_ty.clone(),
+                mutable: p.mutability.is_some(),
+            }];
+            out.extend(bindings_from_pat(sub, scrut_ty)?);
+            Ok(out)
+        }
+        Pat::Type(pt) => {
+            let inner = bindings_from_pat(&pt.pat, pt.ty.as_ref())?;
+            if inner.is_empty() {
+                if let Ok(name) = pat_ident(&pt.pat) {
+                    return Ok(vec![Binding {
+                        name,
+                        ty: pt.ty.as_ref().clone(),
+                        mutable: false,
+                    }]);
+                }
+            }
+            Ok(inner)
+        }
+        Pat::TupleStruct(p) if p.path.is_ident("Some") && p.elems.len() == 1 => {
+            let inner_ty = option_inner_ty(scrut_ty).ok_or_else(|| {
+                syn::Error::new_spanned(
+                    pat,
+                    "#[corot] `Some(…)` pattern requires scrutinee type `Option<T>` \
+                     (use `val::<Option<T>>(…)`)",
+                )
+            })?;
+            bindings_from_pat(&p.elems[0], &inner_ty)
+        }
+        Pat::TupleStruct(p) if p.path.is_ident("Ok") && p.elems.len() == 1 => {
+            let inner_ty = result_ok_ty(scrut_ty).ok_or_else(|| {
+                syn::Error::new_spanned(
+                    pat,
+                    "#[corot] `Ok(…)` pattern requires scrutinee type `Result<T, E>`",
+                )
+            })?;
+            bindings_from_pat(&p.elems[0], &inner_ty)
+        }
+        Pat::TupleStruct(p) if p.path.is_ident("Err") && p.elems.len() == 1 => {
+            let inner_ty = result_err_ty(scrut_ty).ok_or_else(|| {
+                syn::Error::new_spanned(
+                    pat,
+                    "#[corot] `Err(…)` pattern requires scrutinee type `Result<T, E>`",
+                )
+            })?;
+            bindings_from_pat(&p.elems[0], &inner_ty)
+        }
+        Pat::Or(p) => {
+            // Bindings must be the same across arms; take from first case.
+            if let Some(first) = p.cases.first() {
+                bindings_from_pat(first, scrut_ty)
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        Pat::Wild(_) | Pat::Lit(_) | Pat::Path(_) => Ok(Vec::new()),
+        other => Err(syn::Error::new_spanned(
+            other,
+            "#[corot] unsupported pattern in if-let / let-else await",
+        )),
+    }
+}
+
+fn option_inner_ty(ty: &Type) -> Option<Type> {
+    let Type::Path(p) = ty else {
+        return None;
+    };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Option" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.first()? {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+fn result_ok_ty(ty: &Type) -> Option<Type> {
+    result_arg(ty, 0)
+}
+
+fn result_err_ty(ty: &Type) -> Option<Type> {
+    result_arg(ty, 1)
+}
+
+fn result_arg(ty: &Type, idx: usize) -> Option<Type> {
+    let Type::Path(p) = ty else {
+        return None;
+    };
+    let seg = p.path.segments.last()?;
+    if seg.ident != "Result" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+        return None;
+    };
+    match args.args.iter().nth(idx)? {
+        syn::GenericArgument::Type(t) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+fn emit_stmt_rewrite_returns(stmt: &Stmt) -> proc_macro2::TokenStream {
+    match stmt {
+        Stmt::Local(local) => {
+            if let Some(init) = &local.init {
+                if let Some((_, diverge)) = &init.diverge {
+                    let attrs = &local.attrs;
+                    let pat = &local.pat;
+                    let expr = &init.expr;
+                    let else_body = emit_expr_rewrite_returns(diverge);
+                    return quote! {
+                        #(#attrs)*
+                        let #pat = #expr else #else_body;
+                    };
+                }
+            }
+            quote! { #stmt }
+        }
+        Stmt::Expr(expr, semi) => {
+            let e = emit_expr_rewrite_returns(expr);
+            match semi {
+                Some(_) => quote! { #e; },
+                None => quote! { #e },
+            }
+        }
+        other => quote! { #other },
+    }
+}
+
+fn emit_expr_rewrite_returns(expr: &Expr) -> proc_macro2::TokenStream {
+    match expr {
+        Expr::Return(ret) if ret.expr.is_none() => quote! {{
+            *self = Self::Finished;
+            break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(()));
+        }},
+        Expr::Block(b) => {
+            let stmts = b.block.stmts.iter().map(emit_stmt_rewrite_returns);
+            quote! {{
+                #(#stmts)*
+            }}
+        }
+        other => quote! { #other },
+    }
+}
+
+fn stmt_has_return(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Expr(expr, _) => expr_has_return(expr),
+        Stmt::Local(local) => local
+            .init
+            .as_ref()
+            .and_then(|i| i.diverge.as_ref())
+            .is_some_and(|(_, e)| expr_has_return(e)),
+        _ => false,
+    }
+}
+
+fn expr_has_return(expr: &Expr) -> bool {
+    match expr {
+        Expr::Return(_) => true,
+        Expr::Block(b) => b.block.stmts.iter().any(stmt_has_return),
+        Expr::If(e) => {
+            e.then_branch.stmts.iter().any(stmt_has_return)
+                || e.else_branch
+                    .as_ref()
+                    .is_some_and(|(_, x)| expr_has_return(x))
+        }
+        _ => false,
+    }
 }
 
 fn as_await_match_stmt(stmt: &Stmt, index: usize) -> syn::Result<Option<AwaitPoint>> {
@@ -1247,6 +1679,13 @@ fn pattern_type_hint(pat: &Pat) -> syn::Result<Option<Type>> {
                 "#[corot] unsupported literal pattern for match type inference",
             )),
         },
+        Pat::TupleStruct(p) if p.path.is_ident("Some") && p.elems.len() == 1 => {
+            match pattern_type_hint(&p.elems[0])? {
+                Some(inner) => Ok(Some(syn::parse_quote!(::core::option::Option<#inner>))),
+                None => Ok(None),
+            }
+        }
+        Pat::Path(p) if p.path.is_ident("None") => Ok(None),
         Pat::Or(p) => {
             let mut found = None;
             for case in &p.cases {
@@ -1375,10 +1814,41 @@ fn after_resume_stmts(ap: &AwaitPoint) -> Vec<&Stmt> {
         | SuspendKind::IfElse { after_await, .. }
         | SuspendKind::Loop { after_await, .. }
         | SuspendKind::For { after_await, .. }
-        | SuspendKind::MatchArm { after_await, .. } => after_await.iter().collect(),
+        | SuspendKind::MatchArm { after_await, .. }
+        | SuspendKind::LetElseAwait { after_await, .. } => after_await.iter().collect(),
         SuspendKind::IfCondition { .. }
+        | SuspendKind::IfLetScrutinee { .. }
         | SuspendKind::MatchScrutinee { .. }
         | SuspendKind::MatchGuard { .. } => Vec::new(),
+    }
+}
+
+fn pat_binds_after_resume(ap: &AwaitPoint) -> Vec<Binding> {
+    match &ap.kind {
+        SuspendKind::Plain { after_resume } => {
+            // `let PAT = … else …` after resume introduces pattern bindings.
+            after_resume
+                .iter()
+                .find_map(|stmt| {
+                    let Stmt::Local(Local {
+                        pat,
+                        init: Some(init),
+                        ..
+                    }) = stmt
+                    else {
+                        return None;
+                    };
+                    let scrut_ty = resolve_scrut_ty(pat, &init.expr).ok()?;
+                    bindings_from_pat(pat, &scrut_ty).ok()
+                })
+                .unwrap_or_default()
+        }
+        SuspendKind::IfLetScrutinee { pat, .. } => {
+            // Bindings are scoped to then-branch only; join does not see them.
+            let _ = pat;
+            Vec::new()
+        }
+        _ => Vec::new(),
     }
 }
 
@@ -1391,6 +1861,7 @@ fn needs_join(kind: &SuspendKind) -> bool {
             | SuspendKind::For { .. }
             | SuspendKind::MatchArm { .. }
             | SuspendKind::MatchGuard { .. }
+            | SuspendKind::LetElseAwait { .. }
     )
 }
 
@@ -1459,8 +1930,22 @@ fn join_stmts_of(ap: &AwaitPoint) -> Option<&[Stmt]> {
         | SuspendKind::Loop { join_stmts, .. }
         | SuspendKind::For { join_stmts, .. }
         | SuspendKind::MatchArm { join_stmts, .. }
-        | SuspendKind::MatchGuard { join_stmts, .. } => Some(join_stmts.as_slice()),
+        | SuspendKind::MatchGuard { join_stmts, .. }
+        | SuspendKind::LetElseAwait { join_stmts, .. } => Some(join_stmts.as_slice()),
         _ => None,
+    }
+}
+
+fn effective_join_caps(ap: &AwaitPoint, join_caps: &[Binding]) -> Vec<Binding> {
+    match &ap.kind {
+        SuspendKind::LetElseAwait { pat_binds, .. } => {
+            let mut caps = join_caps.to_vec();
+            for b in pat_binds {
+                upsert_binding(&mut caps, b.clone());
+            }
+            caps
+        }
+        _ => join_caps.to_vec(),
     }
 }
 
@@ -1495,7 +1980,8 @@ fn assign_join_stmts(awaits: &mut [AwaitPoint], after_last: &mut Vec<Stmt>) {
             | SuspendKind::Loop { join_stmts, .. }
             | SuspendKind::For { join_stmts, .. }
             | SuspendKind::MatchArm { join_stmts, .. }
-            | SuspendKind::MatchGuard { join_stmts, .. } => {
+            | SuspendKind::MatchGuard { join_stmts, .. }
+            | SuspendKind::LetElseAwait { join_stmts, .. } => {
                 *join_stmts = join;
             }
             _ => {}
@@ -1598,17 +2084,19 @@ fn gen_enter_await(
 ) -> proc_macro2::TokenStream {
     let before = &ap.before;
     let go_wait = gen_go_waiting(waiting_var, caps, &ap.base);
-    let non_suspend = gen_goto_join(ap, index, join_caps);
+    let join_caps = effective_join_caps(ap, join_caps);
+    let non_suspend = gen_goto_join(ap, index, &join_caps);
 
     match &ap.kind {
         SuspendKind::Plain { .. }
         | SuspendKind::IfCondition { .. }
+        | SuspendKind::IfLetScrutinee { .. }
         | SuspendKind::MatchScrutinee { .. } => quote! {
             #(#before)*
             #go_wait
         },
         SuspendKind::Loop { .. } => {
-            let goto_head = gen_goto_loop_head(index, ap, join_caps);
+            let goto_head = gen_goto_loop_head(index, ap, &join_caps);
             quote! {
                 #(#before)*
                 #goto_head
@@ -1621,7 +2109,7 @@ fn gen_enter_await(
             ..
         } => {
             let iter_ty = into_iter_ty(into_ty);
-            let goto_head = gen_goto_loop_head(index, ap, join_caps);
+            let goto_head = gen_goto_loop_head(index, ap, &join_caps);
             if let Some(base) = iter_await_base {
                 let iter_var = waiting_iter_variant(index);
                 let join_moves = join_caps.iter().map(|b| {
@@ -1684,6 +2172,22 @@ fn gen_enter_await(
                 }
             }
         }
+        SuspendKind::LetElseAwait {
+            pat,
+            init,
+            before_await,
+            ..
+        } => {
+            quote! {
+                #(#before)*
+                if let #pat = #init {
+                    #non_suspend
+                } else {
+                    #(#before_await)*
+                    #go_wait
+                }
+            }
+        }
         SuspendKind::MatchArm {
             scrutinee,
             arms_before,
@@ -1729,8 +2233,6 @@ fn gen_enter_await(
             let after_arms = arms_after
                 .iter()
                 .map(|a| emit_sync_arm_with_join(a, &non_suspend));
-            // Two-phase match so an irrefutable suspending pattern (e.g. `n`) does not
-            // make later arms unreachable when the await-guard is stripped for enter.
             quote! {
                 #(#before)*
                 let __scrut: #scrut_ty = #scrutinee;
@@ -1801,7 +2303,10 @@ fn gen_after_resume(
     join_caps: &[Binding],
 ) -> proc_macro2::TokenStream {
     match &ap.kind {
-        SuspendKind::Plain { after_resume } => quote! { #(#after_resume)* },
+        SuspendKind::Plain { after_resume } => {
+            let parts = after_resume.iter().map(emit_stmt_rewrite_returns);
+            quote! { #(#parts)* }
+        }
         SuspendKind::IfCondition {
             resume_cond,
             then_branch,
@@ -1821,6 +2326,26 @@ fn gen_after_resume(
                 },
             }
         }
+        SuspendKind::IfLetScrutinee {
+            pat,
+            then_branch,
+            else_branch,
+        } => {
+            let tmp = &ap.tmp;
+            let then_stmts = &then_branch.stmts;
+            match else_branch {
+                Some(e) => quote! {
+                    if let #pat = #tmp {
+                        #(#then_stmts)*
+                    } else #e;
+                },
+                None => quote! {
+                    if let #pat = #tmp {
+                        #(#then_stmts)*
+                    }
+                },
+            }
+        }
         SuspendKind::MatchScrutinee { arms } => {
             let tmp = &ap.tmp;
             let arm_tokens = arms.iter().map(emit_arm_body);
@@ -1834,6 +2359,19 @@ fn gen_after_resume(
         | SuspendKind::IfElse { after_await, .. }
         | SuspendKind::MatchArm { after_await, .. } => {
             quote! { #(#after_await)* }
+        }
+        SuspendKind::LetElseAwait { after_await, .. } => {
+            let parts = after_await.iter().map(emit_stmt_rewrite_returns);
+            let has_return = after_await.iter().any(stmt_has_return);
+            if has_return {
+                quote! { #(#parts)* }
+            } else {
+                quote! {
+                    #(#parts)*
+                    *self = Self::Finished;
+                    break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(()));
+                }
+            }
         }
         SuspendKind::MatchGuard {
             sus_pat,
@@ -2024,7 +2562,13 @@ fn stmt_contains_await(stmt: &Stmt) -> bool {
     match stmt {
         Stmt::Local(Local {
             init: Some(init), ..
-        }) => contains_await(&init.expr),
+        }) => {
+            contains_await(&init.expr)
+                || init
+                    .diverge
+                    .as_ref()
+                    .is_some_and(|(_, e)| contains_await(e))
+        }
         Stmt::Expr(expr, _) => contains_await(expr),
         Stmt::Macro(_) => false,
         Stmt::Item(_) => false,
@@ -2298,7 +2842,7 @@ fn make_rehydration(
 
         if needs_join(&ap.kind) {
             let after_var = join_variant(&ap.kind, i);
-            let join_caps = &join_caps_at[i];
+            let join_caps = effective_join_caps(ap, &join_caps_at[i]);
             let skip_in_join: Vec<_> = join_caps.iter().filter(|b| is_skip_serde(&b.ty)).collect();
             if skip_in_join.is_empty() {
                 arms.push(quote! {
@@ -2353,9 +2897,14 @@ fn make_getters(
     join_caps_at: &[Vec<Binding>],
 ) -> proc_macro2::TokenStream {
     let mut all = collect_all_bindings(captures_at_await);
-    for caps in join_caps_at {
+    for (i, caps) in join_caps_at.iter().enumerate() {
+        let caps = if let Some(ap) = awaits.get(i) {
+            effective_join_caps(ap, caps)
+        } else {
+            caps.clone()
+        };
         for b in caps {
-            upsert_binding(&mut all, b.clone());
+            upsert_binding(&mut all, b);
         }
     }
 
@@ -2372,7 +2921,8 @@ fn make_getters(
                     Self::#var { #name, .. } => ::core::option::Option::Some(#name),
                 });
             }
-            if needs_join(&ap.kind) && join_caps_at[i].iter().any(|c| c.name == *name) {
+            let join_caps = effective_join_caps(ap, &join_caps_at[i]);
+            if needs_join(&ap.kind) && join_caps.iter().any(|c| c.name == *name) {
                 let after_var = join_variant(&ap.kind, i);
                 arms.push(quote! {
                     Self::#after_var { #name, .. } => ::core::option::Option::Some(#name),

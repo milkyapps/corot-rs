@@ -28,6 +28,17 @@ pub fn iter<I: IntoIterator>(iterable: I) -> I {
     iterable
 }
 
+/// Type ascription helper for `if let` / `let…else` scrutinees.
+///
+/// ```ignore
+/// if let Some(x) = corot_rs::val::<Option<i32>>(fetch().await) { … }
+/// let Some(x) = corot_rs::val::<Option<i32>>(fetch().await) else { return; };
+/// ```
+#[inline(always)]
+pub fn val<T>(value: T) -> T {
+    value
+}
+
 /// Marker wrapper: captured across await, omitted from serde.
 ///
 /// - [`SkipSerde::new`] / [`SkipSerde::set`]: hydrated value
