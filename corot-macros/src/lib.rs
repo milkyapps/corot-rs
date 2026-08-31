@@ -14,9 +14,12 @@ use syn::{
 /// are stored on `NotStarted` and live across awaits like other captures.
 /// Methods (`self`) and generics are not supported yet.
 ///
-/// - `let name: T = expr.await?` when the fn returns `Result<(), E>` (settle
+/// Return type may be `()`, any `T`, or `Result<T, E>`. A trailing expression
+/// (or `return` / `Ok(…)` / `Err(…)`) becomes `Poll::Ready(…)`.
+///
+/// - `let name: T = expr.await?` when the fn returns `Result<U, E>` (settle
 ///   `Result<T, E>`; `Err` finishes with `Poll::Ready(Err(...))`)
-/// - general `expr?` in a `Result<(), E>` fn (rewritten to finish with `Err`)
+/// - general `expr?` in a `Result<U, E>` fn (rewritten to finish with `Err`)
 /// - `try { … }` blocks (including with await / `await?`): desugared; block type
 ///   must be written as `let name: Result<T, E> = try { … }`
 /// - `return` / `return <expr>` before or after an await (rewritten to finish the
@@ -30,8 +33,10 @@ use syn::{
 /// - `if` / `if let`: condition/scrutinee, then, else, or else-if chain
 ///   (including `else if let PAT = ….await`)
 /// - `let…else`: await in the initializer or in the `else` block
-/// - `match`: scrutinee, one arm body, or one guard
-/// - `for`: range literal or `iter::<I>(…)`, optional body await
+/// - `match`: scrutinee, one arm body, or one guard; suspending arms may use
+///   `Some`/`Ok`/`Err`/tuple/`@`/`|` patterns (scrutinee via literals or `val::<T>`)
+/// - `for`: range literal or `iter::<I>(…)`, optional body await; item pattern may
+///   be a tuple / `Some` / `Ok` / `Err` when `I`'s item type is known (`Vec`, ranges, …)
 /// - `while` / `while let`: await in the condition/scrutinee **or** the body (not both)
 /// - multiple typed-let awaits inside one `if`/`match`/`loop`/`while`/`for`/
 ///   labeled-block/`try` body (chained Waiting states)
@@ -177,7 +182,10 @@ enum SuspendKind {
     /// (the type of the `in` expression / settle value).
     For {
         label: Option<Ident>,
-        item: Ident,
+        /// Full `for PAT in …` pattern (may be tuple / `Some(x)` / etc.).
+        item_pat: Pat,
+        /// Bindings introduced by `item_pat` (typed from `IntoIterator::Item`).
+        item_binds: Vec<Binding>,
         /// Type of the `in` expression (`IntoIterator`), e.g. `Vec<i32>` or `Range<i32>`.
         into_ty: Type,
         /// `None` ⇒ iterable is awaited (`iter_await_base`); `Some` ⇒ sync expr.
@@ -198,8 +206,10 @@ enum SuspendKind {
     /// Await inside exactly one match arm body.
     MatchArm {
         scrutinee: Expr,
+        #[allow(dead_code)]
         scrut_ty: Type,
-        pat_binds: Vec<Ident>,
+        /// Bindings from the suspending arm's pattern (typed from `scrut_ty`).
+        pat_binds: Vec<Binding>,
         arms_before: Vec<syn::Arm>,
         sus_pat: Pat,
         sus_guard: Option<Box<Expr>>,
@@ -392,13 +402,12 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 }
             }
             SuspendKind::For {
-                item,
+                item_binds,
                 into_ty,
                 before_await,
                 ..
             } => {
                 let iter_ty = into_iter_ty(into_ty);
-                let item_ty = into_item_ty(into_ty);
                 upsert_binding(
                     &mut live,
                     Binding {
@@ -407,14 +416,9 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                         mutable: true,
                     },
                 );
-                upsert_binding(
-                    &mut live,
-                    Binding {
-                        name: item.clone(),
-                        ty: item_ty,
-                        mutable: false,
-                    },
-                );
+                for b in item_binds {
+                    upsert_binding(&mut live, b.clone());
+                }
                 for stmt in before_await {
                     if let Some(b) = typed_let_binding(stmt) {
                         upsert_binding(&mut live, b);
@@ -422,20 +426,12 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                 }
             }
             SuspendKind::MatchArm {
-                scrut_ty,
                 pat_binds,
                 before_await,
                 ..
             } => {
-                for name in pat_binds {
-                    upsert_binding(
-                        &mut live,
-                        Binding {
-                            name: name.clone(),
-                            ty: scrut_ty.clone(),
-                            mutable: false,
-                        },
-                    );
+                for b in pat_binds {
+                    upsert_binding(&mut live, b.clone());
                 }
                 for stmt in before_await {
                     if let Some(b) = typed_let_binding(stmt) {
@@ -711,7 +707,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             let head_pats: Vec<_> = head_caps.iter().map(cap_pat).collect();
             match &ap.kind {
                 SuspendKind::For {
-                    item,
+                    item_pat,
                     before_await,
                     has_body_await,
                     label,
@@ -743,11 +739,25 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                             #goto_head
                         }
                     };
+                    let head_moves = head_caps.iter().map(|b| {
+                        let n = &b.name;
+                        quote! { #n }
+                    });
                     step_arms.push(quote! {
                         Self::#head_var { #(#head_pats,)* } => {
                             match ::core::iter::Iterator::next(&mut __iter) {
-                                ::core::option::Option::Some(#item) => {
-                                    #some_body
+                                ::core::option::Option::Some(__item) => {
+                                    match __item {
+                                        #item_pat => {
+                                            #some_body
+                                        }
+                                        _ => {
+                                            *self = Self::#head_var {
+                                                #(#head_moves,)*
+                                            };
+                                            continue 'step;
+                                        }
+                                    }
                                 }
                                 ::core::option::Option::None => {
                                     #goto_after
@@ -1049,7 +1059,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
             #getters
 
-            #[allow(unused_variables)]
+            #[allow(unused_variables, unreachable_code)]
             pub fn step(&mut self) -> #step_ret {
                 'step: loop {
                     match ::core::mem::replace(self, Self::Finished) {
@@ -1357,7 +1367,7 @@ fn as_plain_await_let(
         let Some(err) = err_ty else {
             return Err(syn::Error::new_spanned(
                 stmt,
-                "#[corot] `await?` requires the async fn to return `Result<(), E>`",
+                "#[corot] `await?` requires the async fn to return `Result<_, E>`",
             ));
         };
         let (name, ok_ty) = match pat {
@@ -1827,8 +1837,9 @@ fn expand_for_stmt(
         return Ok(None);
     }
     if has_body_await {
-        let item = pat_ident(&expr_for.pat)?;
+        let item_pat = (*expr_for.pat).clone();
         let (into_ty, source) = resolve_for_iterable(&expr_for.expr)?;
+        let item_binds = bindings_from_pat(&item_pat, &into_item_ty(&into_ty))?;
         let (iter_expr, iter_await_base) = match source {
             ForIterSource::Sync(e) => (Some(e), None),
             ForIterSource::Await(e) => (None, Some(e)),
@@ -1846,7 +1857,12 @@ fn expand_for_stmt(
             trailing,
             |pos, len, before_await, after_await| SuspendKind::For {
                 label: label.clone(),
-                item: item.clone(),
+                item_pat: item_pat.clone(),
+                item_binds: if pos == 0 {
+                    item_binds.clone()
+                } else {
+                    Vec::new()
+                },
                 into_ty: into_ty.clone(),
                 iter_expr: iter_expr.clone(),
                 iter_await_base: iter_await_base.clone(),
@@ -2044,13 +2060,13 @@ fn expand_match_stmt(
     if sus.guard.as_ref().is_some_and(|(_, g)| contains_await(g)) {
         return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
     }
-    check_simple_match_pat(&sus.pat)?;
+    check_supported_pat(&sus.pat)?;
     let body_stmts = expr_as_stmts(&sus.body);
     if !body_stmts.iter().any(stmt_contains_await) {
         return Ok(as_await_match_stmt(stmt, index, err_ty)?.map(|ap| vec![ap]));
     }
-    let scrut_ty = infer_match_scrut_ty(&expr_match.arms)?;
-    let pat_binds = simple_pat_idents(&sus.pat);
+    let scrut_ty = infer_match_scrutinee_ty(&expr_match.expr, &expr_match.arms)?;
+    let pat_binds = bindings_from_pat(&sus.pat, &scrut_ty)?;
     let (segments, trailing) = extract_body_awaits(&body_stmts, err_ty)?;
     let scrutinee = expr_match.expr.as_ref().clone();
     let arms_before = expr_match.arms[..ai].to_vec();
@@ -2249,8 +2265,9 @@ fn as_await_for_stmt(
         return Ok(None);
     }
 
-    let item = pat_ident(&expr_for.pat)?;
+    let item_pat = (*expr_for.pat).clone();
     let (into_ty, source) = resolve_for_iterable(&expr_for.expr)?;
+    let item_binds = bindings_from_pat(&item_pat, &into_item_ty(&into_ty))?;
     let (iter_expr, iter_await_base) = match source {
         ForIterSource::Sync(expr) => (Some(expr), None),
         ForIterSource::Await(base) => (None, Some(base)),
@@ -2289,7 +2306,8 @@ fn as_await_for_stmt(
             chain_pos: 0,
             chain_len: 1,
             label: expr_for.label.as_ref().map(|l| l.name.ident.clone()),
-            item,
+            item_pat,
+            item_binds,
             into_ty,
             iter_expr,
             iter_await_base,
@@ -2391,7 +2409,47 @@ fn as_corot_iter_call(expr: &Expr) -> Option<(Type, Expr)> {
 }
 
 fn into_item_ty(into_ty: &Type) -> Type {
-    syn::parse_quote!(<#into_ty as ::core::iter::IntoIterator>::Item)
+    concrete_into_item_ty(into_ty).unwrap_or_else(|| {
+        syn::parse_quote!(<#into_ty as ::core::iter::IntoIterator>::Item)
+    })
+}
+
+/// Best-effort `IntoIterator::Item` when `I` is a known collection/range/array.
+/// Needed so `for (a, b) in …` can type `a`/`b` without waiting on rustc.
+fn concrete_into_item_ty(into_ty: &Type) -> Option<Type> {
+    match into_ty {
+        Type::Array(a) => Some(a.elem.as_ref().clone()),
+        Type::Slice(s) => Some(s.elem.as_ref().clone()),
+        Type::Reference(r) => concrete_into_item_ty(&r.elem),
+        Type::Path(p) => {
+            let seg = p.path.segments.last()?;
+            let name = seg.ident.to_string();
+            let syn::PathArguments::AngleBracketed(args) = &seg.arguments else {
+                return None;
+            };
+            let first_ty = match args.args.first()? {
+                syn::GenericArgument::Type(t) => t.clone(),
+                _ => return None,
+            };
+            match name.as_str() {
+                "Vec" | "VecDeque" | "LinkedList" | "BinaryHeap" | "HashSet" | "BTreeSet"
+                | "Option" => Some(first_ty),
+                "Range" | "RangeInclusive" | "RangeFrom" | "RangeTo" | "RangeToInclusive" => {
+                    Some(first_ty)
+                }
+                "HashMap" | "BTreeMap" => {
+                    let second = match args.args.iter().nth(1)? {
+                        syn::GenericArgument::Type(t) => t.clone(),
+                        _ => return None,
+                    };
+                    Some(syn::parse_quote! { (#first_ty, #second) })
+                }
+                _ => None,
+            }
+        }
+        Type::Tuple(_) => None, // not an iterable by itself
+        _ => None,
+    }
 }
 
 fn into_iter_ty(into_ty: &Type) -> Type {
@@ -2620,6 +2678,28 @@ fn bindings_from_pat(pat: &Pat, scrut_ty: &Type) -> syn::Result<Vec<Binding>> {
             })?;
             bindings_from_pat(&p.elems[0], &inner_ty)
         }
+        Pat::Tuple(p) => {
+            let Type::Tuple(tt) = scrut_ty else {
+                return Err(syn::Error::new_spanned(
+                    pat,
+                    "#[corot] tuple pattern requires a tuple scrutinee/item type \
+                     (use `val::<(T, U)>(…)` or `iter::<Vec<(T, U)>>(…)`)",
+                ));
+            };
+            if tt.elems.len() != p.elems.len() {
+                return Err(syn::Error::new_spanned(
+                    pat,
+                    "#[corot] tuple pattern arity does not match scrutinee/item type",
+                ));
+            }
+            let mut out = Vec::new();
+            for (elem_pat, elem_ty) in p.elems.iter().zip(tt.elems.iter()) {
+                out.extend(bindings_from_pat(elem_pat, elem_ty)?);
+            }
+            Ok(out)
+        }
+        Pat::Paren(p) => bindings_from_pat(&p.pat, scrut_ty),
+        Pat::Reference(p) => bindings_from_pat(&p.pat, scrut_ty),
         Pat::Or(p) => {
             // Bindings must be the same across arms; take from first case.
             if let Some(first) = p.cases.first() {
@@ -2628,10 +2708,11 @@ fn bindings_from_pat(pat: &Pat, scrut_ty: &Type) -> syn::Result<Vec<Binding>> {
                 Ok(Vec::new())
             }
         }
-        Pat::Wild(_) | Pat::Lit(_) | Pat::Path(_) => Ok(Vec::new()),
+        Pat::Wild(_) | Pat::Lit(_) | Pat::Path(_) | Pat::Const(_) => Ok(Vec::new()),
         other => Err(syn::Error::new_spanned(
             other,
-            "#[corot] unsupported pattern in if-let / let-else await",
+            "#[corot] unsupported pattern for suspending match arm / for loop \
+             (supported: ident, `@`, `_`, literals, paths, `Some`/`Ok`/`Err`, tuples, `|`)",
         )),
     }
 }
@@ -3115,9 +3196,10 @@ fn emit_return_finish(
     }
 }
 
-/// Emit stmts then finish with `Ready(Ok(()))` / `Ready(())`, rewriting a trailing
-/// `Ok(())` / `Err(e)` / `return …` so they don't sit before `*self = …` (which
-/// would parse as multiplication).
+/// Emit stmts then finish the coroutine. A trailing expression (no `;`),
+/// `return …`, `Ok(…)`, or `Err(…)` becomes `Poll::Ready(...)`. Otherwise
+/// falls through with the default ready value when the output type allows it
+/// (`()` or `Result<(), E>`).
 fn emit_completion_stmts(
     stmts: &[Stmt],
     ready_ok: &proc_macro2::TokenStream,
@@ -3137,6 +3219,14 @@ fn emit_completion_stmts(
             #prefix_toks
             #finish
         }
+    } else if let Stmt::Expr(expr, None) = last {
+        // Trailing value expression → `Poll::Ready(expr)` (supports `-> T`).
+        let e = emit_expr_rewrite_returns(expr, ready_ok);
+        quote! {
+            #prefix_toks
+            *self = Self::Finished;
+            break 'step ::core::result::Result::Ok(::core::task::Poll::Ready(#e));
+        }
     } else {
         let last_tok = emit_stmt_rewrite_returns(last, ready_ok);
         quote! {
@@ -3155,7 +3245,7 @@ fn as_result_finish_stmt(
         Stmt::Expr(Expr::Return(ret), _) => {
             Some(emit_return_finish(ret.expr.as_deref(), ready_ok))
         }
-        // Trailing expression (no `;`) — typical `Ok(())` / `Err(e)` fn tail.
+        // Trailing `Ok(…)` / `Err(e)` (no `;`).
         Stmt::Expr(expr, None) => as_result_finish_expr(expr, ready_ok),
         _ => None,
     }
@@ -3165,10 +3255,19 @@ fn as_result_finish_expr(
     expr: &Expr,
     ready_ok: &proc_macro2::TokenStream,
 ) -> Option<proc_macro2::TokenStream> {
-    if is_ok_unit_expr(expr) {
+    if let Some(ok_arg) = as_ok_call_arg(expr) {
+        // `Ok(())` can use the shared default ready token; any `Ok(v)` wraps `v`.
+        if is_unit_expr(ok_arg) {
+            return Some(quote! {
+                *self = Self::Finished;
+                break 'step ::core::result::Result::Ok(#ready_ok);
+            });
+        }
         return Some(quote! {
             *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(#ready_ok);
+            break 'step ::core::result::Result::Ok(
+                ::core::task::Poll::Ready(::core::result::Result::Ok(#ok_arg)),
+            );
         });
     }
     if let Some(err) = as_err_call_arg(expr) {
@@ -3184,14 +3283,18 @@ fn as_result_finish_expr(
     None
 }
 
-fn is_ok_unit_expr(expr: &Expr) -> bool {
+fn is_unit_expr(expr: &Expr) -> bool {
+    matches!(unwrap_parens_ref(expr), Expr::Tuple(t) if t.elems.is_empty())
+}
+
+fn as_ok_call_arg(expr: &Expr) -> Option<&Expr> {
     let Expr::Call(call) = unwrap_parens_ref(expr) else {
-        return false;
+        return None;
     };
     if !path_is_ident(&call.func, "Ok") || call.args.len() != 1 {
-        return false;
+        return None;
     }
-    matches!(call.args.first(), Some(Expr::Tuple(t)) if t.elems.is_empty())
+    call.args.first()
 }
 
 fn as_err_call_arg(expr: &Expr) -> Option<&Expr> {
@@ -3292,7 +3395,7 @@ fn as_await_match_stmt(
                     "await in match scrutinee must be a bare `expr.await`",
                 ));
             };
-            let scrut_ty = infer_match_scrut_ty(&expr_match.arms)?;
+            let scrut_ty = infer_match_scrutinee_ty(&expr_match.expr, &expr_match.arms)?;
             let name = format_ident!("scrut{}", index);
             let tmp = format_ident!("__await_{}", name);
                 Ok(Some(AwaitPoint {
@@ -3309,7 +3412,7 @@ fn as_await_match_stmt(
             }))
         }
         (false, Some(ai), None) => {
-            let scrut_ty = infer_match_scrut_ty(&expr_match.arms)?;
+            let scrut_ty = infer_match_scrutinee_ty(&expr_match.expr, &expr_match.arms)?;
             let sus = &expr_match.arms[ai];
             if sus
                 .guard
@@ -3321,8 +3424,8 @@ fn as_await_match_stmt(
                     "#[corot] await in both a match guard and arm body is not supported",
                 ));
             }
-            check_simple_match_pat(&sus.pat)?;
-            let pat_binds = simple_pat_idents(&sus.pat);
+            check_supported_pat(&sus.pat)?;
+            let pat_binds = bindings_from_pat(&sus.pat, &scrut_ty)?;
             let stmts = expr_as_stmts(&sus.body);
             let (before_await, plain, after_await) =
                 extract_single_await_from_stmts(&stmts, err_ty)?;
@@ -3357,7 +3460,7 @@ fn as_await_match_stmt(
             }))
         }
         (false, None, Some(gi)) => {
-            let scrut_ty = infer_match_scrut_ty(&expr_match.arms)?;
+            let scrut_ty = infer_match_scrutinee_ty(&expr_match.expr, &expr_match.arms)?;
             let sus = &expr_match.arms[gi];
             if contains_await(&sus.body) {
                 return Err(syn::Error::new_spanned(
@@ -3365,7 +3468,7 @@ fn as_await_match_stmt(
                     "#[corot] await in both a match guard and arm body is not supported",
                 ));
             }
-            check_simple_match_pat(&sus.pat)?;
+            check_supported_pat(&sus.pat)?;
             let (_, guard_expr) = sus.guard.as_ref().expect("guard await index");
             let Some(base) = bare_await_base(guard_expr) else {
                 return Err(syn::Error::new_spanned(
@@ -3409,33 +3512,83 @@ fn expr_as_stmts(expr: &Expr) -> Vec<Stmt> {
     }
 }
 
-fn check_simple_match_pat(pat: &Pat) -> syn::Result<()> {
+fn check_supported_pat(pat: &Pat) -> syn::Result<()> {
     match pat {
         Pat::Ident(p) => {
             if let Some((_, sub)) = &p.subpat {
-                check_simple_match_pat(sub)?;
+                check_supported_pat(sub)?;
             }
             Ok(())
         }
-        Pat::Wild(_) | Pat::Lit(_) => Ok(()),
+        Pat::Wild(_) | Pat::Lit(_) | Pat::Const(_) => Ok(()),
         Pat::Path(p) if p.qself.is_none() => Ok(()),
+        Pat::Type(p) => check_supported_pat(&p.pat),
+        Pat::Paren(p) => check_supported_pat(&p.pat),
+        Pat::Reference(p) => check_supported_pat(&p.pat),
+        Pat::Tuple(p) => {
+            for e in &p.elems {
+                check_supported_pat(e)?;
+            }
+            Ok(())
+        }
+        Pat::TupleStruct(p)
+            if (p.path.is_ident("Some") || p.path.is_ident("Ok") || p.path.is_ident("Err"))
+                && p.elems.len() == 1 =>
+        {
+            check_supported_pat(&p.elems[0])
+        }
         Pat::Or(p) => {
             for case in &p.cases {
-                check_simple_match_pat(case)?;
+                check_supported_pat(case)?;
             }
             Ok(())
         }
         other => Err(syn::Error::new_spanned(
             other,
-            "#[corot] match-await currently only supports simple patterns \
-             (ident, `ident @ lit`, literal, path, `_`, or `|` of those)",
+            "#[corot] unsupported pattern when match arm/guard or for loop suspends \
+             (supported: ident, `@`, `_`, literals, paths, `Some`/`Ok`/`Err`, tuples, `|`)",
         )),
     }
 }
 
 fn simple_pat_idents(pat: &Pat) -> Vec<Ident> {
     match pat {
-        Pat::Ident(p) => vec![p.ident.clone()],
+        Pat::Ident(p) => {
+            let mut out = vec![p.ident.clone()];
+            if let Some((_, sub)) = &p.subpat {
+                for id in simple_pat_idents(sub) {
+                    if !out.iter().any(|x| x == &id) {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        }
+        Pat::Type(p) => simple_pat_idents(&p.pat),
+        Pat::Paren(p) => simple_pat_idents(&p.pat),
+        Pat::Reference(p) => simple_pat_idents(&p.pat),
+        Pat::Tuple(p) => {
+            let mut out = Vec::new();
+            for e in &p.elems {
+                for id in simple_pat_idents(e) {
+                    if !out.iter().any(|x| x == &id) {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        }
+        Pat::TupleStruct(p) => {
+            let mut out = Vec::new();
+            for e in &p.elems {
+                for id in simple_pat_idents(e) {
+                    if !out.iter().any(|x| x == &id) {
+                        out.push(id);
+                    }
+                }
+            }
+            out
+        }
         Pat::Or(p) => {
             let mut out = Vec::new();
             for case in &p.cases {
@@ -3449,6 +3602,18 @@ fn simple_pat_idents(pat: &Pat) -> Vec<Ident> {
         }
         _ => Vec::new(),
     }
+}
+
+fn infer_match_scrutinee_ty(scrutinee: &Expr, arms: &[syn::Arm]) -> syn::Result<Type> {
+    if let Some((ty, _)) = as_val_call(scrutinee) {
+        return Ok(ty);
+    }
+    if let Some(base) = bare_await_base(scrutinee) {
+        if let Some((ty, _)) = as_val_call(&base) {
+            return Ok(ty);
+        }
+    }
+    infer_match_scrut_ty(arms)
 }
 
 fn infer_match_scrut_ty(arms: &[syn::Arm]) -> syn::Result<Type> {
@@ -3470,8 +3635,8 @@ fn infer_match_scrut_ty(arms: &[syn::Arm]) -> syn::Result<Type> {
     found.ok_or_else(|| {
         syn::Error::new(
             proc_macro2::Span::call_site(),
-            "#[corot] cannot infer match scrutinee type; use a literal pattern \
-             (e.g. `0`, `true`) in at least one arm",
+            "#[corot] cannot infer match scrutinee type; use `corot_rs::val::<T>(…)` \
+             or a literal pattern (e.g. `0`, `Some(0)`, `(0, true)`) in at least one arm",
         )
     })
 }
@@ -3497,7 +3662,32 @@ fn pattern_type_hint(pat: &Pat) -> syn::Result<Option<Type>> {
                 None => Ok(None),
             }
         }
+        Pat::TupleStruct(p) if p.path.is_ident("Ok") && p.elems.len() == 1 => {
+            // Err type unknown from `Ok(…)` alone — need `val::<Result<T, E>>`.
+            let _ = pattern_type_hint(&p.elems[0])?;
+            Ok(None)
+        }
+        Pat::TupleStruct(p) if p.path.is_ident("Err") && p.elems.len() == 1 => {
+            let _ = pattern_type_hint(&p.elems[0])?;
+            Ok(None)
+        }
         Pat::Path(p) if p.path.is_ident("None") => Ok(None),
+        Pat::Tuple(p) => {
+            let mut tys = Vec::new();
+            for e in &p.elems {
+                match pattern_type_hint(e)? {
+                    Some(t) => tys.push(t),
+                    None => return Ok(None),
+                }
+            }
+            if tys.is_empty() {
+                return Ok(None);
+            }
+            Ok(Some(syn::parse_quote! { (#(#tys),*) }))
+        }
+        Pat::Paren(p) => pattern_type_hint(&p.pat),
+        Pat::Reference(p) => pattern_type_hint(&p.pat),
+        Pat::Type(p) => Ok(Some(p.ty.as_ref().clone())),
         Pat::Or(p) => {
             let mut found = None;
             for case in &p.cases {
@@ -3515,7 +3705,7 @@ fn pattern_type_hint(pat: &Pat) -> syn::Result<Option<Type>> {
                 Ok(None)
             }
         }
-        Pat::Wild(_) | Pat::Path(_) => Ok(None),
+        Pat::Wild(_) | Pat::Path(_) | Pat::Const(_) => Ok(None),
         other => Err(syn::Error::new_spanned(
             other,
             "#[corot] cannot infer type from this match pattern",
@@ -5867,23 +6057,11 @@ fn parse_fn_output(output: &syn::ReturnType) -> syn::Result<(Type, Option<Type>)
     match output {
         syn::ReturnType::Default => Ok((syn::parse_quote!(()), None)),
         syn::ReturnType::Type(_, ty) => {
-            if is_unit_ty(ty) {
-                return Ok((syn::parse_quote!(()), None));
-            }
             if let Some(err) = result_err_ty(ty) {
-                // Only `Result<(), E>` for now (Ok payload must be unit).
-                if result_ok_ty(ty).is_some_and(|ok| is_unit_ty(&ok)) {
-                    return Ok(((**ty).clone(), Some(err)));
-                }
-                return Err(syn::Error::new_spanned(
-                    ty,
-                    "#[corot] with `await?` currently supports `Result<(), E>` return types only",
-                ));
+                Ok(((**ty).clone(), Some(err)))
+            } else {
+                Ok(((**ty).clone(), None))
             }
-            Err(syn::Error::new_spanned(
-                ty,
-                "#[corot] return type must be `()` or `Result<(), E>`",
-            ))
         }
     }
 }
@@ -5892,11 +6070,21 @@ fn is_unit_ty(ty: &Type) -> bool {
     matches!(ty, Type::Tuple(t) if t.elems.is_empty())
 }
 
+/// Default `Poll::Ready` when the body falls off the end with no trailing value.
+/// For non-unit / `Result<T, E>` with `T != ()`, uses a diverging `loop {}` so
+/// bare `return` / re-stepping `Finished` still type-checks (real values must
+/// come from a trailing expr or `return <expr>` / `Ok` / `Err`).
 fn ready_ok_tokens(output_ty: &Type) -> proc_macro2::TokenStream {
     if is_unit_ty(output_ty) {
         quote! { ::core::task::Poll::Ready(()) }
+    } else if let Some(ok) = result_ok_ty(output_ty) {
+        if is_unit_ty(&ok) {
+            quote! { ::core::task::Poll::Ready(::core::result::Result::Ok(())) }
+        } else {
+            quote! { ::core::task::Poll::Ready(loop {}) }
+        }
     } else {
-        quote! { ::core::task::Poll::Ready(::core::result::Result::Ok(())) }
+        quote! { ::core::task::Poll::Ready(loop {}) }
     }
 }
 
