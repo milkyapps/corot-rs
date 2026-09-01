@@ -8,8 +8,11 @@ use syn::{
 
 /// Suspension points: typed `let` awaits (including `await?`); `if` / `if let` /
 /// `let…else` / `loop` / `for` / `match` in a supported position (including
-/// multiple plain awaits chained in one construct body, and nested `if` /
-/// `if let` with then-only awaits inside those bodies).
+/// multiple plain awaits chained in one construct body, and nested suspending
+/// `if` / `if let` / `loop` / `while` / `for` / `match` inside those bodies).
+///
+/// Nested `if` may await in then and/or else / else-if (multi-level nesting
+/// supported). Nested loop/while/for/match expand into the parent chain.
 ///
 /// The decorated `async fn` may take typed arguments (`x: T`, `mut x: T`); they
 /// are stored on `NotStarted` and live across awaits like other captures.
@@ -216,6 +219,8 @@ enum SuspendKind {
         join_stmts: Vec<Stmt>,
         /// Nested `if` at this chain position (first await of the nest).
         entry_gate: Option<EntryGate>,
+        /// When set, `LoopHead` re-enters this await instead of this point's body.
+        loop_restart: Option<usize>,
     },
     /// `while COND { … }` / `while let PAT = EXPR { … }` with optional label.
     ///
@@ -423,10 +428,22 @@ struct EntryGate {
     /// Bindings from `if let` (live on the then path / wait captures).
     then_binds: Vec<Binding>,
     else_branch: Option<Box<Expr>>,
-    /// Awaits owned by this nest (else skips this many chain positions).
+    /// Then-path awaits (else with `else_span == 0` skips these).
     span: usize,
+    /// Else-path awaits placed after then awaits (`0` ⇒ sync else / none).
+    else_span: usize,
+    /// Sync then-body stmts when `span == 0` (else-only awaits).
+    then_sync: Vec<Stmt>,
     /// Stmts after the nested `if` and before the next body await / end.
     after: Vec<Stmt>,
+    /// Inner nest on the then path (multi-level nested `if`).
+    inner: Option<Box<EntryGate>>,
+}
+
+impl EntryGate {
+    fn total_span(&self) -> usize {
+        self.span + self.else_span
+    }
 }
 
 /// One suspending unit in a construct body (plain let or nested `if`).
@@ -435,7 +452,7 @@ enum BodyUnit {
         before: Vec<Stmt>,
         plain: PlainAwait,
     },
-    /// Nested `if` / `if let` with awaits only in then (else must be sync).
+    /// Nested `if` / `if let`; then and/or else may suspend.
     NestedIf {
         before: Vec<Stmt>,
         cond: Expr,
@@ -443,6 +460,13 @@ enum BodyUnit {
         else_branch: Option<Box<Expr>>,
         then_units: Vec<BodyUnit>,
         then_trailing: Vec<Stmt>,
+        /// Suspending else / else-if (`None` ⇒ sync `else_branch`).
+        else_units: Option<(Vec<BodyUnit>, Vec<Stmt>)>,
+    },
+    /// Nested `loop` / `while` / `for` / `match` (own SuspendKinds).
+    NestedExpand {
+        before: Vec<Stmt>,
+        points: Vec<AwaitPoint>,
     },
 }
 
@@ -664,6 +688,12 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         {
             if *arm_len > 1 && *body_pos + 1 == *body_len && *chain_pos + 1 < *chain_len {
                 live = join_caps_at[*chain_head].clone();
+            }
+        }
+        // Nested if then-end before exclusive else: reset live to pre-nest.
+        for (start, g) in nest_gates_ending_at(captures_at_await.len() - 1, &awaits) {
+            if g.else_span > 0 && g.span > 0 && start + g.span == captures_at_await.len() {
+                live = captures_at_await[start].clone();
             }
         }
         // Bindings introduced in join_stmts become live before the next await.
@@ -1010,30 +1040,19 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                     before_await,
                     label,
                     break_bind,
+                    loop_restart,
                     ..
                 } => {
                     let join_i = join_caps_index(ap, i);
                     let join_caps = &join_caps_at[join_i];
-                    let go_wait = gen_enter_wait(ap, &var, caps, &effect_enum);
-                    let before_await_toks = rewrite_loop_body_stmts(
-                        head,
-                        before_await,
-                        join_caps,
-                        label.as_ref(),
-                        false,
-                        break_bind.as_ref(),
-                        &ready_ok,
-                    );
-                    let then_body = quote! {
-                        #before_await_toks
-                        #go_wait
-                    };
-                    let body = if let Some(gate) = entry_gate_of(&ap.kind) {
-                        gen_entry_gate_wrap(
-                            i,
-                            ap,
-                            gate,
-                            then_body,
+                    let body = if let Some(restart) = *loop_restart {
+                        let restart_ap = &awaits[restart];
+                        gen_enter_await(
+                            restart,
+                            restart_ap,
+                            &waiting_variant(&restart_ap.name),
+                            &captures_at_await[restart],
+                            &join_caps_at[restart],
                             &awaits,
                             &captures_at_await,
                             &join_caps_at,
@@ -1041,7 +1060,35 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                             &effect_enum,
                         )
                     } else {
-                        then_body
+                        let go_wait = gen_enter_wait(ap, &var, caps, &effect_enum);
+                        let before_await_toks = rewrite_loop_body_stmts(
+                            head,
+                            before_await,
+                            join_caps,
+                            label.as_ref(),
+                            false,
+                            break_bind.as_ref(),
+                            &ready_ok,
+                        );
+                        let then_body = quote! {
+                            #before_await_toks
+                            #go_wait
+                        };
+                        if let Some(gate) = entry_gate_of(&ap.kind) {
+                            gen_entry_gate_wrap(
+                                i,
+                                ap,
+                                gate,
+                                then_body,
+                                &awaits,
+                                &captures_at_await,
+                                &join_caps_at,
+                                &ready_ok,
+                                &effect_enum,
+                            )
+                        } else {
+                            then_body
+                        }
                     };
                     step_arms.push(quote! {
                         Self::#head_var { #(#head_pats,)* } => {
@@ -1370,10 +1417,30 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             let join_i = join_caps_index(ap, i);
             let after_resume =
                 gen_after_resume(i, ap, &join_caps_at[join_i], &ready_ok);
-            let nest_after = if let Some(g) = nest_gate_ending_at(i, &awaits) {
-                rewrite_gate_after_stmts(ap, &g.after, &join_caps_at[join_i], &ready_ok)
-            } else {
-                quote! {}
+            let nest_after = {
+                let gates = nest_gates_ending_at(i, &awaits);
+                let mut parts = Vec::new();
+                for (start, g) in &gates {
+                    parts.push(rewrite_gate_after_stmts(
+                        ap,
+                        &g.after,
+                        &join_caps_at[join_i],
+                        &ready_ok,
+                    ));
+                    // Then-path end with exclusive else awaits: jump past them.
+                    if g.else_span > 0 && g.span > 0 && start + g.span == i + 1 {
+                        parts.push(gen_body_skip_to(
+                            start + g.total_span(),
+                            ap,
+                            &awaits,
+                            &captures_at_await,
+                            &join_caps_at,
+                            &ready_ok,
+                            &effect_enum,
+                        ));
+                    }
+                }
+                quote! { #(#parts)* }
             };
             let tail = match &ap.kind {
                 // Cond-only while: resume already jumps to LoopHead / AfterLoop.
@@ -1783,6 +1850,7 @@ fn extract_body_units(
                 else_branch,
                 then_units,
                 then_trailing,
+                else_units,
                 ..
             } = nested
             else {
@@ -1795,16 +1863,26 @@ fn extract_body_units(
                 else_branch,
                 then_units,
                 then_trailing,
+                else_units,
             });
             continue;
         }
         if stmt_contains_await(stmt) {
-            return Err(syn::Error::new_spanned(
-                stmt,
-                "#[corot] nested suspending construct in a body must be `if` / `if let` \
-                 with awaits only in the then branch (else sync); \
-                 nested loop/while/for/match are not supported yet",
-            ));
+            let start = units_await_count(&units);
+            let Some(mut points) = expand_await_stmt(stmt, start, err_ty)? else {
+                return Err(syn::Error::new_spanned(
+                    stmt,
+                    "#[corot] unsupported nested suspending construct in a body",
+                ));
+            };
+            if start != 0 {
+                remap_await_indices(&mut points, -(start as isize));
+            }
+            units.push(BodyUnit::NestedExpand {
+                before: std::mem::take(&mut current),
+                points,
+            });
+            continue;
         }
         current.push(stmt.clone());
     }
@@ -1824,7 +1902,18 @@ fn units_await_count(units: &[BodyUnit]) -> usize {
 fn unit_await_count(unit: &BodyUnit) -> usize {
     match unit {
         BodyUnit::Plain { .. } => 1,
-        BodyUnit::NestedIf { then_units, .. } => units_await_count(then_units),
+        BodyUnit::NestedIf {
+            then_units,
+            else_units,
+            ..
+        } => {
+            units_await_count(then_units)
+                + else_units
+                    .as_ref()
+                    .map(|(u, _)| units_await_count(u))
+                    .unwrap_or(0)
+        }
+        BodyUnit::NestedExpand { points, .. } => points.len(),
     }
 }
 
@@ -1844,26 +1933,22 @@ fn as_nested_if_unit(stmt: &Stmt, err_ty: Option<&Type>) -> syn::Result<Option<B
         .else_branch
         .as_ref()
         .is_some_and(|(_, e)| contains_await(e));
-    if !then_has {
-        return Ok(None); // sync if — treat as normal stmt by caller
+    if !then_has && !else_has {
+        return Ok(None); // sync if
     }
-    if else_has {
-        return Err(syn::Error::new_spanned(
-            stmt,
-            "#[corot] nested `if` inside a suspending body cannot await in else / else-if yet",
-        ));
-    }
-    let else_branch = expr_if.else_branch.as_ref().map(|(_, e)| e.clone());
-    let (then_units, then_trailing) = extract_body_units(&expr_if.then_branch.stmts, err_ty)?;
-    if then_units
-        .iter()
-        .any(|u| matches!(u, BodyUnit::NestedIf { .. }))
-    {
-        return Err(syn::Error::new_spanned(
-            stmt,
-            "#[corot] only one level of nested `if` inside a suspending body is supported",
-        ));
-    }
+
+    let (then_units, then_trailing) = if then_has {
+        extract_body_units(&expr_if.then_branch.stmts, err_ty)?
+    } else {
+        (Vec::new(), expr_if.then_branch.stmts.clone())
+    };
+
+    let (else_branch, else_units) = match &expr_if.else_branch {
+        None => (None, None),
+        Some((_, e)) if !contains_await(e) => (Some(e.clone()), None),
+        Some((_, e)) => (None, Some(else_expr_to_body_units(e, err_ty)?)),
+    };
+
     let pat_binds = if_let_pat_binds(&expr_if.cond)?;
     let cond = strip_val_in_if_cond(expr_if.cond.as_ref().clone());
     Ok(Some(BodyUnit::NestedIf {
@@ -1873,7 +1958,31 @@ fn as_nested_if_unit(stmt: &Stmt, err_ty: Option<&Type>) -> syn::Result<Option<B
         else_branch,
         then_units,
         then_trailing,
+        else_units,
     }))
+}
+
+fn else_expr_to_body_units(
+    else_expr: &Expr,
+    err_ty: Option<&Type>,
+) -> syn::Result<(Vec<BodyUnit>, Vec<Stmt>)> {
+    match else_expr {
+        Expr::Block(b) => extract_body_units(&b.block.stmts, err_ty),
+        Expr::If(_) => {
+            let stmt = Stmt::Expr(else_expr.clone(), None);
+            let Some(nested) = as_nested_if_unit(&stmt, err_ty)? else {
+                return Err(syn::Error::new_spanned(
+                    else_expr,
+                    "#[corot] unsupported suspending else-if in nested `if`",
+                ));
+            };
+            Ok((vec![nested], Vec::new()))
+        }
+        other => Err(syn::Error::new_spanned(
+            other,
+            "#[corot] else branch must be `else { ... }` or `else if ...`",
+        )),
+    }
 }
 
 
@@ -1890,7 +1999,7 @@ fn extract_single_await_from_stmts(
     }
     match units.into_iter().next().unwrap() {
         BodyUnit::Plain { before, plain } => Ok((before, plain, trailing)),
-        BodyUnit::NestedIf { .. } => Err(syn::Error::new(
+        BodyUnit::NestedIf { .. } | BodyUnit::NestedExpand { .. } => Err(syn::Error::new(
             proc_macro2::Span::call_site(),
             "#[corot] only one await is supported in this position",
         )),
@@ -1949,6 +2058,28 @@ fn flatten_body_units<F>(
                 });
                 *pos += 1;
             }
+            BodyUnit::NestedExpand {
+                before: nest_before,
+                mut points,
+            } => {
+                if let Some(first) = points.first_mut() {
+                    prefix_nest_before(first, nest_before);
+                }
+                let base = *pos;
+                if base != 0 {
+                    remap_await_indices(&mut points, base as isize);
+                }
+                if is_last_unit && !trailing.is_empty() {
+                    if let Some(last) = points.last_mut() {
+                        append_join_or_after(last, trailing.clone());
+                    }
+                }
+                // Parent loop plains after this expand need a distinct chain_head
+                // (avoid AfterLoop clash with nested loop). Stash restart hint via
+                // rewriting parent make_kind positions — handled below when plains follow.
+                *pos += points.len();
+                out.extend(points);
+            }
             BodyUnit::NestedIf {
                 before: nest_before,
                 cond,
@@ -1956,50 +2087,211 @@ fn flatten_body_units<F>(
                 else_branch,
                 mut then_units,
                 then_trailing,
+                else_units,
             } => {
-                let span = units_await_count(&then_units);
+                let then_span = units_await_count(&then_units);
+                let (then_sync, inner_trailing, gate_after) = if then_span == 0 {
+                    if is_last_unit {
+                        (then_trailing, Vec::new(), trailing.clone())
+                    } else {
+                        (then_trailing, Vec::new(), Vec::new())
+                    }
+                } else if is_last_unit {
+                    (Vec::new(), then_trailing, trailing.clone())
+                } else {
+                    (Vec::new(), then_trailing, Vec::new())
+                };
+                let gate_start = out.len();
+
                 if let Some(first) = then_units.first_mut() {
                     let b = match first {
                         BodyUnit::Plain { before, .. }
-                        | BodyUnit::NestedIf { before, .. } => before,
+                        | BodyUnit::NestedIf { before, .. }
+                        | BodyUnit::NestedExpand { before, .. } => before,
                     };
-                    let mut prefixed = nest_before;
+                    let mut prefixed = nest_before.clone();
                     prefixed.append(b);
                     *b = prefixed;
                 }
-                // Body trailing after a final nested `if` runs on both then/else —
-                // keep it on the gate, not only on the resume path.
-                let (inner_trailing, gate_after) = if is_last_unit {
-                    (then_trailing, trailing.clone())
-                } else {
-                    (then_trailing, Vec::new())
-                };
-                let before_len = out.len();
-                flatten_body_units(
-                    then_units,
-                    inner_trailing,
-                    chain_len,
-                    pos,
-                    out,
-                    make_kind,
-                );
-                if before_len < out.len() {
-                    if entry_gate_of(&out[before_len].kind).is_some() {
-                        continue;
+
+                if !then_units.is_empty() {
+                    flatten_body_units(
+                        then_units,
+                        inner_trailing,
+                        chain_len,
+                        pos,
+                        out,
+                        make_kind,
+                    );
+                }
+
+                let else_span = if let Some((eu, et)) = else_units {
+                    let es = units_await_count(&eu);
+                    let mut eu = eu;
+                    if then_span == 0 {
+                        if let Some(first) = eu.first_mut() {
+                    let b = match first {
+                        BodyUnit::Plain { before, .. }
+                        | BodyUnit::NestedIf { before, .. }
+                        | BodyUnit::NestedExpand { before, .. } => before,
+                    };
+                            let mut prefixed = nest_before;
+                            prefixed.append(b);
+                            *b = prefixed;
+                        }
                     }
-                    set_entry_gate(
-                        &mut out[before_len].kind,
-                        Some(EntryGate {
+                    flatten_body_units(eu, et, chain_len, pos, out, make_kind);
+                    es
+                } else {
+                    let _ = nest_before;
+                    0
+                };
+
+                if gate_start < out.len() {
+                    push_entry_gate(
+                        &mut out[gate_start].kind,
+                        EntryGate {
                             cond,
                             then_binds,
                             else_branch,
-                            span,
+                            span: then_span,
+                            else_span,
+                            then_sync,
                             after: gate_after,
-                        }),
+                            inner: None,
+                        },
                     );
                 }
             }
         }
+    }
+}
+
+fn prefix_nest_before(ap: &mut AwaitPoint, nest_before: Vec<Stmt>) {
+    // Prefer AwaitPoint.before so join_caps / LoopHead see bindings (e.g. `let mut i`
+    // before a nested while).
+    let mut prefixed = nest_before;
+    prefixed.append(&mut ap.before);
+    ap.before = prefixed;
+}
+
+fn append_join_or_after(ap: &mut AwaitPoint, stmts: Vec<Stmt>) {
+    match &mut ap.kind {
+        SuspendKind::Loop { join_stmts, .. }
+        | SuspendKind::While { join_stmts, .. }
+        | SuspendKind::For { join_stmts, .. }
+        | SuspendKind::IfThen { join_stmts, .. }
+        | SuspendKind::IfElse { join_stmts, .. }
+        | SuspendKind::MatchArm { join_stmts, .. }
+        | SuspendKind::MatchGuard { join_stmts, .. }
+        | SuspendKind::LabeledBlock { join_stmts, .. }
+        | SuspendKind::TryBlock { join_stmts, .. }
+        | SuspendKind::LetElseAwait { join_stmts, .. } => join_stmts.extend(stmts),
+        SuspendKind::Plain { after_resume } => after_resume.extend(stmts),
+        _ => {}
+    }
+}
+
+fn remap_await_indices(points: &mut [AwaitPoint], delta: isize) {
+    let map = |i: usize| -> usize {
+        if delta >= 0 {
+            i + delta as usize
+        } else {
+            i.saturating_sub((-delta) as usize)
+        }
+    };
+    for ap in points {
+        match &mut ap.kind {
+            SuspendKind::Loop { chain_head, .. }
+            | SuspendKind::While { chain_head, .. }
+            | SuspendKind::For { chain_head, .. }
+            | SuspendKind::IfThen { chain_head, .. }
+            | SuspendKind::IfElse { chain_head, .. }
+            | SuspendKind::MatchGuard { chain_head, .. }
+            | SuspendKind::LabeledBlock { chain_head, .. }
+            | SuspendKind::TryBlock { chain_head, .. } => {
+                *chain_head = map(*chain_head);
+            }
+            SuspendKind::MatchArm {
+                chain_head,
+                multi_sus_heads,
+                ..
+            } => {
+                *chain_head = map(*chain_head);
+                for h in multi_sus_heads.iter_mut() {
+                    *h = map(*h);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// When a nested loop occupies `AfterLoop{head}`, parent loop plains that still
+/// point at that head get a fresh chain starting at the first parent plain.
+/// Their LoopHead re-enters the body start (`loop_restart` via enter at nested head).
+fn retarget_parent_loop_after_nested(points: &mut [AwaitPoint]) {
+    if points.len() < 2 {
+        return;
+    }
+    // Find nested loop chain at the start (or any nested loop whose chain doesn't
+    // cover later Loop points that claim the same head).
+    let mut i = 0usize;
+    while i < points.len() {
+        let Some(head) = chain_head_of(&points[i]) else {
+            i += 1;
+            continue;
+        };
+        if !matches!(
+            points[i].kind,
+            SuspendKind::Loop { .. } | SuspendKind::While { .. } | SuspendKind::For { .. }
+        ) {
+            i += 1;
+            continue;
+        }
+        let nested_len = chain_pos_len(&points[i]).map(|(_, l)| l).unwrap_or(1);
+        if head != i {
+            i += 1;
+            continue;
+        }
+        // Nested chain occupies [head, head+nested_len).
+        let nest_end = head + nested_len;
+        // Collect parent Loop points that claim this head but lie at/after nest_end.
+        let parent: Vec<usize> = (nest_end..points.len())
+            .filter(|&j| {
+                matches!(
+                    &points[j].kind,
+                    SuspendKind::Loop {
+                        chain_head: h,
+                        ..
+                    } if *h == head
+                )
+            })
+            .collect();
+        if parent.is_empty() {
+            i = nest_end;
+            continue;
+        }
+        let new_head = parent[0];
+        let new_len = parent.len();
+        for (pos, &j) in parent.iter().enumerate() {
+            if let SuspendKind::Loop {
+                chain_head,
+                chain_pos,
+                chain_len,
+                loop_restart,
+                ..
+            } = &mut points[j].kind
+            {
+                *chain_head = new_head;
+                *chain_pos = pos;
+                *chain_len = new_len;
+                if pos == 0 {
+                    *loop_restart = Some(head);
+                }
+            }
+        }
+        i = nest_end;
     }
 }
 
@@ -2029,21 +2321,41 @@ fn entry_gate_mut(kind: &mut SuspendKind) -> Option<&mut Option<EntryGate>> {
     }
 }
 
-fn set_entry_gate(kind: &mut SuspendKind, gate: Option<EntryGate>) {
+/// Stack `gate` as an outer wrap; existing gate becomes `inner`.
+fn push_entry_gate(kind: &mut SuspendKind, mut gate: EntryGate) {
     if let Some(slot) = entry_gate_mut(kind) {
-        *slot = gate;
+        if let Some(existing) = slot.take() {
+            gate.inner = Some(Box::new(existing));
+        }
+        *slot = Some(gate);
     }
 }
 
-fn nest_gate_ending_at(index: usize, awaits: &[AwaitPoint]) -> Option<&EntryGate> {
+/// All gates whose nest ends at `index`, innermost first, with gate start index.
+fn nest_gates_ending_at(index: usize, awaits: &[AwaitPoint]) -> Vec<(usize, &EntryGate)> {
+    let mut out = Vec::new();
     for (i, ap) in awaits.iter().enumerate().take(index + 1) {
         if let Some(g) = entry_gate_of(&ap.kind) {
-            if i + g.span == index + 1 {
-                return Some(g);
-            }
+            collect_gates_ending_at(i, g, index, &mut out);
         }
     }
-    None
+    out
+}
+
+fn collect_gates_ending_at<'a>(
+    start: usize,
+    gate: &'a EntryGate,
+    index: usize,
+    out: &mut Vec<(usize, &'a EntryGate)>,
+) {
+    if let Some(inner) = gate.inner.as_deref() {
+        collect_gates_ending_at(start, inner, index, out);
+    }
+    if gate.span > 0 && start + gate.span == index + 1 {
+        out.push((start, gate));
+    } else if gate.else_span > 0 && start + gate.total_span() == index + 1 {
+        out.push((start, gate));
+    }
 }
 
 fn rewrite_gate_after_stmts(
@@ -2146,26 +2458,90 @@ fn gen_entry_gate_wrap(
     ready_ok: &proc_macro2::TokenStream,
     effect_enum: &Ident,
 ) -> proc_macro2::TokenStream {
+    let then_body = if let Some(inner) = gate.inner.as_deref() {
+        gen_entry_gate_wrap(
+            index,
+            ap,
+            inner,
+            then_body,
+            awaits,
+            captures_at_await,
+            join_caps_at,
+            ready_ok,
+            effect_enum,
+        )
+    } else {
+        then_body
+    };
     let cond = &gate.cond;
-    let else_body = else_expr_tokens(&gate.else_branch, ready_ok);
     let join_i = join_caps_index(ap, index);
     let after = rewrite_gate_after_stmts(ap, &gate.after, &join_caps_at[join_i], ready_ok);
-    let skip = gen_body_skip_to(
-        index + gate.span,
-        ap,
-        awaits,
-        captures_at_await,
-        join_caps_at,
-        ready_ok,
-        effect_enum,
-    );
-    quote! {
-        if #cond {
-            #then_body
+
+    if gate.span == 0 && gate.else_span > 0 {
+        // Else-only awaits: gate sits on first else await.
+        let then_sync = rewrite_gate_after_stmts(ap, &gate.then_sync, &join_caps_at[join_i], ready_ok);
+        let skip = gen_body_skip_to(
+            index + gate.else_span,
+            ap,
+            awaits,
+            captures_at_await,
+            join_caps_at,
+            ready_ok,
+            effect_enum,
+        );
+        quote! {
+            if #cond {
+                #then_sync
+                #after
+                #skip
+            } else {
+                #then_body
+            }
+        }
+    } else if gate.else_span > 0 {
+        let else_i = index + gate.span;
+        let else_enter = if else_i < awaits.len() {
+            gen_enter_await(
+                else_i,
+                &awaits[else_i],
+                &waiting_variant(&awaits[else_i].name),
+                &captures_at_await[else_i],
+                &join_caps_at[else_i],
+                awaits,
+                captures_at_await,
+                join_caps_at,
+                ready_ok,
+                effect_enum,
+            )
         } else {
-            #else_body
-            #after
-            #skip
+            quote! { #after }
+        };
+        quote! {
+            if #cond {
+                #then_body
+            } else {
+                #else_enter
+            }
+        }
+    } else {
+        let else_body = else_expr_tokens(&gate.else_branch, ready_ok);
+        let skip = gen_body_skip_to(
+            index + gate.span,
+            ap,
+            awaits,
+            captures_at_await,
+            join_caps_at,
+            ready_ok,
+            effect_enum,
+        );
+        quote! {
+            if #cond {
+                #then_body
+            } else {
+                #else_body
+                #after
+                #skip
+            }
         }
     }
 }
@@ -3067,7 +3443,7 @@ fn expand_if_stmt(
                 };
             let else_branch = expr_if.else_branch.as_ref().map(|(_, e)| e.clone());
             let expr_bind_c = expr_bind.clone();
-            Ok(Some(body_units_to_points(
+            let mut points = body_units_to_points(
                 index,
                 units,
                 trailing,
@@ -3107,7 +3483,31 @@ fn expand_if_stmt(
                     entry_gate,
                     expr_bind: expr_bind_c.clone(),
                 },
-            )))
+            );
+            // NestedExpand inside then (while/match/…) keeps foreign kinds — wrap with
+            // the outer `if` condition as an EntryGate.
+            let span = points.len();
+            if let Some(first) = points.first_mut() {
+                let needs_gate = !matches!(first.kind, SuspendKind::IfThen { .. })
+                    && entry_gate_of(&first.kind).is_none()
+                    && !cond_has;
+                if needs_gate {
+                    push_entry_gate(
+                        &mut first.kind,
+                        EntryGate {
+                            cond: sync_cond.clone(),
+                            then_binds: pat_binds.clone(),
+                            else_branch: else_branch.clone(),
+                            span,
+                            else_span: 0,
+                            then_sync: Vec::new(),
+                            after: Vec::new(),
+                            inner: None,
+                        },
+                    );
+                }
+            }
+            Ok(Some(points))
         }
         (false, false, true) | (true, false, true) => {
             let else_expr = expr_if
@@ -3251,7 +3651,7 @@ fn expand_loop_stmt(
     let (units, trailing) = extract_body_units(&body_stmts, err_ty)?;
     let label = label;
     let break_bind = break_bind;
-    Ok(Some(body_units_to_points(
+    let mut points = body_units_to_points(
         index,
         units,
         trailing,
@@ -3265,8 +3665,11 @@ fn expand_loop_stmt(
             after_await,
             join_stmts: Vec::new(),
             entry_gate,
+            loop_restart: None,
         },
-    )))
+    );
+    retarget_parent_loop_after_nested(&mut points);
+    Ok(Some(points))
 }
 
 fn expand_while_stmt(
@@ -6587,7 +6990,11 @@ fn after_resume_should_escape(index: usize, ap: &AwaitPoint, awaits: &[AwaitPoin
         return false;
     }
     if let Some((start, g)) = nest_gate_covering(index, awaits) {
-        index + 1 < start + g.span
+        // Exclusive else awaits must not see then-path locals.
+        if g.else_span > 0 && index + 1 == start + g.span {
+            return false;
+        }
+        index + 1 < start + g.total_span()
     } else {
         true
     }
@@ -6596,12 +7003,29 @@ fn after_resume_should_escape(index: usize, ap: &AwaitPoint, awaits: &[AwaitPoin
 fn nest_gate_covering(index: usize, awaits: &[AwaitPoint]) -> Option<(usize, &EntryGate)> {
     for (i, ap) in awaits.iter().enumerate().take(index + 1) {
         if let Some(g) = entry_gate_of(&ap.kind) {
-            if i <= index && index < i + g.span {
-                return Some((i, g));
+            if let Some(found) = nest_gate_covering_from(i, g, index) {
+                return Some((i, found));
             }
         }
     }
     None
+}
+
+fn nest_gate_covering_from<'a>(
+    start: usize,
+    gate: &'a EntryGate,
+    index: usize,
+) -> Option<&'a EntryGate> {
+    if let Some(inner) = gate.inner.as_deref() {
+        if let Some(found) = nest_gate_covering_from(start, inner, index) {
+            return Some(found);
+        }
+    }
+    if start <= index && index < start + gate.total_span() {
+        Some(gate)
+    } else {
+        None
+    }
 }
 
 fn is_mid_chain_kind(kind: &SuspendKind) -> bool {
