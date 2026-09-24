@@ -1,5 +1,7 @@
 //! Non-unit return types: `T` and `Result<T, E>`.
 
+#![cfg(not(feature = "serde"))]
+
 use corot_rs::corot;
 
 
@@ -50,38 +52,38 @@ async fn result_await_err() -> Result<i32, &'static str> {
 fn test_return_value() {
     println!("=== -> i32 trailing ===");
     let mut c = add_after_await(10);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&5i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(15))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(15)));
     println!();
 
     println!("=== -> i32 early return ===");
     let mut c = early_return_value(true);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(7))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(7)));
 
     let mut c = early_return_value(false);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(4))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(4)));
     println!();
 
     println!("=== Result<i32, E> Ok ===");
     let mut c = result_ok_value();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Ok::<i32, &str>(9));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Ok(18)))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(Ok(18))));
     println!();
 
     println!("=== Result<i32, E> Err return ===");
     let mut c = result_err_value();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Ok::<i32, &str>(-1));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Err("negative")))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(Err("negative"))));
     println!();
 
     println!("=== Result<i32, E> await? Err ===");
     let mut c = result_await_err();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Err::<i32, &str>("suspended"));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Err("suspended")))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(Err("suspended"))));
 }

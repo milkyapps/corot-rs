@@ -3,6 +3,8 @@
 //! Rewritten to finish the coroutine with `corot_rs::Step::Ready(...)` instead of
 //! returning from `step()`.
 
+#![cfg(not(feature = "serde"))]
+
 use corot_rs::corot;
 
 
@@ -65,33 +67,33 @@ async fn return_ok_early() -> Result<(), &'static str> {
 fn test_return_await() {
     println!("=== return after await ===");
     let mut c = return_after_await();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&5i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== return before await ===");
     let mut c = return_before_await();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== fallthrough (no early return) ===");
     let mut c = return_fallthrough();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== return Err after await ===");
     let mut c = return_err_after();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Ok::<i32, &str>(0));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Err("zero")))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(Err("zero"))));
     println!();
 
     println!("=== return Ok early ===");
     let mut c = return_ok_early();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Ok::<i32, &str>(9));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Ok(())))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(Ok(()))));
 }

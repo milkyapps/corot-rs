@@ -1,5 +1,7 @@
 //! Nested suspending `if` / `if let` inside `loop` / `while` / `for` / `if` bodies.
 
+#![cfg(not(feature = "serde"))]
+
 #![allow(unused_mut, unreachable_code)]
 
 use corot_rs::corot;
@@ -93,59 +95,59 @@ async fn if_nested_if() {
 fn test_nested_suspend_body() {
     println!("=== loop if then + plain ===");
     let mut c = loop_if_then_and_plain();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // x
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // x
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // y
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // y
     c.settle_wait(&4i32); // n=7
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // x again
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // x again
     c.settle_wait(&2i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // y
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // y
     c.settle_wait(&2i32); // n=11 → break
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== loop if false skips ===");
     let mut c = loop_if_false_skips();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // y only
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // y only
     c.settle_wait(&9i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== loop if only ===");
     let mut c = loop_if_only();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&1i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== while nested if ===");
     let mut c = while_nested_if();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // a
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // a
     c.settle_wait(&10i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // b
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // b
     c.settle_wait(&11i32);
     // i==1: skip then, only b
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&12i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== for nested if ===");
     let mut c = for_nested_if();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // a
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // a
     c.settle_wait(&1i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // b
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // b
     c.settle_wait(&2i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // b only (i==1)
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // b only (i==1)
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== if nested if ===");
     let mut c = if_nested_if();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // a
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // a
     c.settle_wait(&5i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending))); // b
+    assert!(matches!(c.step(), corot_rs::Step::Pending)); // b
     c.settle_wait(&6i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

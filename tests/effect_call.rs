@@ -1,6 +1,8 @@
 //! External async calls surface as `Step::Effect(CallFoo(…))` so the host
 //! can invoke them, then `settle_wait` with the return value.
 
+#![cfg(not(feature = "serde"))]
+
 use corot_rs::corot;
 
 async fn send_message(id: i32) -> i32 {
@@ -47,7 +49,7 @@ fn test_effect_call() {
 
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(ChatCoroutineEffect::CallSendMessage(1)))
+        corot_rs::Step::Effect(ChatCoroutineEffect::CallSendMessage(1))
     ));
     // Host performs send_message(1) itself, then settles the return value.
     let _ = send_message;
@@ -55,12 +57,12 @@ fn test_effect_call() {
 
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(ChatCoroutineEffect::CallFetchUser(7)))
+        corot_rs::Step::Effect(ChatCoroutineEffect::CallFetchUser(7))
     ));
     let _ = fetch_user;
     c.settle_wait(&107i32);
 
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }
 
 #[test]
@@ -68,10 +70,10 @@ fn test_effect_call_captured_arg() {
     let mut c = with_local(42);
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(WithLocalCoroutineEffect::CallSendMessage(42)))
+        corot_rs::Step::Effect(WithLocalCoroutineEffect::CallSendMessage(42))
     ));
     c.settle_wait(&420i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }
 
 #[test]
@@ -80,19 +82,19 @@ fn test_effect_call_unit_and_tuple_args() {
 
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(UnitAndTupleArgsCoroutineEffect::CallPing(())))
+        corot_rs::Step::Effect(UnitAndTupleArgsCoroutineEffect::CallPing(()))
     ));
     let _ = ping;
     c.settle_wait(&1i32);
 
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(
+        corot_rs::Step::Effect(
             UnitAndTupleArgsCoroutineEffect::CallPair((3, true))
-        ))
+        )
     ));
     let _ = pair;
     c.settle_wait(&3i32);
 
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

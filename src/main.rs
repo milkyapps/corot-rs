@@ -1,6 +1,5 @@
 use corot_macros::corot;
 
-
 trait Print {
     fn print(self) -> Self;
 }
@@ -27,17 +26,28 @@ async fn f() {
 }
 
 fn main() {
+    // `step` is bare `Step` by default; with `serde` it is `Result<Step, Rehydration>`.
+    macro_rules! assert_step {
+        ($e:expr, $pat:pat) => {{
+            let __v = $e;
+            #[cfg(feature = "serde")]
+            assert!(matches!(__v, Ok($pat)));
+            #[cfg(not(feature = "serde"))]
+            assert!(matches!(__v, $pat));
+        }};
+    }
+
     let mut c = f();
 
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert_step!(c.step(), corot_rs::Step::Pending);
     c.settle_wait(&2);
 
-    assert!(matches!(
+    assert_step!(
         c.step(),
-        Ok(corot_rs::Step::Effect(FCoroutineEffect::CallPreB(2)))
-    ));
+        corot_rs::Step::Effect(FCoroutineEffect::CallPreB(2))
+    );
     c.settle_wait(&pre_b(2));
 
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert_step!(c.step(), corot_rs::Step::Ready(()));
+    assert_step!(c.step(), corot_rs::Step::Ready(()));
 }

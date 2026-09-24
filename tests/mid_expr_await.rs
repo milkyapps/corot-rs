@@ -1,6 +1,8 @@
 //! Mid-expression awaits outside bare typed `let x = ….await`:
 //! `foo(val::<T>(a()).await, val::<U>(b()).await)`.
 
+#![cfg(not(feature = "serde"))]
+
 #![allow(unused_mut, unreachable_code, dead_code)]
 
 use corot_rs::corot;
@@ -80,88 +82,88 @@ fn test_mid_expr_await() {
     let mut c = call_two_args();
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallLeft()))
+        corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallLeft())
     ));
     c.settle_wait(&3i32);
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallRight()))
+        corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallRight())
     ));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== call two args stmt ===");
     let mut c = call_two_args_stmt();
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallLeft()))
+        corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallLeft())
     ));
     c.settle_wait(&3i32);
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallRight()))
+        corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallRight())
     ));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== method two awaits ===");
     let mut c = method_two_awaits();
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallLeft()))
+        corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallLeft())
     ));
     c.settle_wait(&3i32);
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallRight()))
+        corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallRight())
     ));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== binary two awaits ===");
     let mut c = binary_two_awaits();
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallLeft()))
+        corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallLeft())
     ));
     c.settle_wait(&3i32);
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallRight()))
+        corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallRight())
     ));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== tuple awaits ===");
     let mut c = tuple_awaits();
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallLeft()))
+        corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallLeft())
     ));
     c.settle_wait(&3i32);
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallRight()))
+        corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallRight())
     ));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== single mid ===");
     let mut c = single_mid_keeps_let_ty();
     assert!(matches!(
         c.step(),
-        Ok(corot_rs::Step::Effect(SingleMidKeepsLetTyCoroutineEffect::CallLeft()))
+        corot_rs::Step::Effect(SingleMidKeepsLetTyCoroutineEffect::CallLeft())
     ));
     c.settle_wait(&10i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== mid then plain ===");
     let mut c = mid_then_plain();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Effect(_))));
+    assert!(matches!(c.step(), corot_rs::Step::Effect(_)));
     c.settle_wait(&1i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Effect(_))));
+    assert!(matches!(c.step(), corot_rs::Step::Effect(_)));
     c.settle_wait(&2i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&0i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

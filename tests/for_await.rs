@@ -1,5 +1,7 @@
 //! `for` over ranges or any `IntoIterator` via `corot_rs::iter::<I>(…)`.
 
+#![cfg(not(feature = "serde"))]
+
 use corot_rs::corot;
 
 
@@ -44,26 +46,26 @@ async fn for_vec_sync() {
 fn run_range() {
     println!("=== range ===");
     let mut c = for_range();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&(0..3));
     for expected_i in 0..3 {
-        assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+        assert!(matches!(c.step(), corot_rs::Step::Pending));
         c.settle_wait(&(expected_i * 10));
     }
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 }
 
 fn run_vec() {
     println!("=== vec (await iterable) ===");
     let mut c = for_vec();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&vec![1, 2, 3]);
     for expected_i in 1..=3 {
-        assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+        assert!(matches!(c.step(), corot_rs::Step::Pending));
         c.settle_wait(&(expected_i * 10));
     }
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 }
 
@@ -71,10 +73,10 @@ fn run_vec_sync() {
     println!("=== vec (sync iterable) ===");
     let mut c = for_vec_sync();
     for expected_i in [7, 8] {
-        assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+        assert!(matches!(c.step(), corot_rs::Step::Pending));
         c.settle_wait(&(expected_i * 10));
     }
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 }
 

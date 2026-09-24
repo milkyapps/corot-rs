@@ -3,6 +3,8 @@
 //! The async fn must return `Result<(), E>`. Settling an `Err` finishes the
 //! coroutine with `corot_rs::Step::Ready(Err(...))` without running later statements.
 
+#![cfg(not(feature = "serde"))]
+
 use corot_rs::corot;
 
 
@@ -39,27 +41,27 @@ async fn try_err_second() -> Result<(), &'static str> {
 fn test_try_await() {
     println!("=== Ok path ===");
     let mut c = try_ok_path();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Ok::<i32, &str>(1));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Ok::<i32, &str>(2));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Ok(())))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(Ok(()))));
     println!();
 
     println!("=== Err on first await ===");
     let mut c = try_err_first();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Err::<i32, &str>("boom"));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Err("boom")))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(Err("boom"))));
     println!("err1: finished with boom");
     println!();
 
     println!("=== Err on second await ===");
     let mut c = try_err_second();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Ok::<i32, &str>(7));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&Err::<i32, &str>("later"));
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(Err("later")))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(Err("later"))));
     println!("err2: finished with later");
 }

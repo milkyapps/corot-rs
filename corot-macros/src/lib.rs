@@ -21,7 +21,9 @@ use syn::{
 /// Return type may be `()`, any `T`, or `Result<T, E>`. A trailing expression
 /// (or `return` / `Ok(…)` / `Err(…)`) becomes `Step::Ready(…)`.
 ///
-/// `step` returns `Result<corot_rs::Step<Output, Effect>, Rehydration>`:
+/// `step` returns `corot_rs::Step<Output, Effect>` by default, or (with the
+/// `serde` feature) `Result<Step<…>, Rehydration>` so hosts can rehydrate
+/// `SkipSerde` captures after checkpoint restore:
 /// `Ready` / `Pending` (settle with `settle_wait`) / `Effect` (host runs an
 /// external async call such as `send_message(1).await`, then settles).
 ///
@@ -1536,20 +1538,19 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
             if ap.nested_child.is_some() {
                 let cap_moves_pending = cap_moves.clone();
-                let cap_moves_err = cap_moves.clone();
-                let cap_moves_effect = cap_moves;
+                let cap_moves_effect = cap_moves.clone();
                 let child_ty = ap.nested_child.as_ref().unwrap();
                 let nest_var = nested_effect_variant(child_ty)?;
-                step_arms.push(quote! {
-                    Self::#var { #(#cap_pats,)* mut __child } => {
-                        #guard
+                let child_match = if cfg!(feature = "serde") {
+                    let cap_moves_err = cap_moves;
+                    quote! {
                         match __child.step() {
                             ::core::result::Result::Ok(::corot_rs::Step::Pending) => {
                                 *self = Self::#var {
                                     #(#cap_moves_pending,)*
                                     __child,
                                 };
-                                break 'step ::core::result::Result::Ok(
+                                break 'step __corot_step_ok!(
                                     ::corot_rs::Step::Pending,
                                 );
                             }
@@ -1563,7 +1564,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                                     #(#cap_moves_effect,)*
                                     __child,
                                 };
-                                break 'step ::core::result::Result::Ok(
+                                break 'step __corot_step_ok!(
                                     ::corot_rs::Step::Effect(#effect_enum::#nest_var(__eff)),
                                 );
                             }
@@ -1577,6 +1578,41 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
                                 );
                             }
                         }
+                    }
+                } else {
+                    let _ = cap_moves;
+                    quote! {
+                        match __child.step() {
+                            ::corot_rs::Step::Pending => {
+                                *self = Self::#var {
+                                    #(#cap_moves_pending,)*
+                                    __child,
+                                };
+                                break 'step __corot_step_ok!(
+                                    ::corot_rs::Step::Pending,
+                                );
+                            }
+                            ::corot_rs::Step::Ready(#tmp) => {
+                                #after_resume
+                                #nest_after
+                                #tail
+                            }
+                            ::corot_rs::Step::Effect(__eff) => {
+                                *self = Self::#var {
+                                    #(#cap_moves_effect,)*
+                                    __child,
+                                };
+                                break 'step __corot_step_ok!(
+                                    ::corot_rs::Step::Effect(#effect_enum::#nest_var(__eff)),
+                                );
+                            }
+                        }
+                    }
+                };
+                step_arms.push(quote! {
+                    Self::#var { #(#cap_pats,)* mut __child } => {
+                        #guard
+                        #child_match
                     }
                 });
             } else {
@@ -1626,7 +1662,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
     step_arms.push(quote! {
         Self::Finished => {
-            break 'step ::core::result::Result::Ok(#ready_ok);
+            break 'step __corot_step_ok!(#ready_ok);
         }
     });
 
@@ -1658,6 +1694,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         &output_ty,
         &effect_enum,
     );
+    let step_ok_macro = step_ok_macro_tokens();
     let getters = make_getters(&awaits, &captures_at_await, &join_caps_at);
 
     let ctor_params = fn_args.iter().map(|b| {
@@ -1703,6 +1740,7 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
             #[allow(unused_variables, unreachable_code)]
             pub fn step(&mut self) -> #step_ret {
+                #step_ok_macro
                 'step: loop {
                     match ::core::mem::replace(self, Self::Finished) {
                         #(#step_arms,)*
@@ -5678,7 +5716,7 @@ fn emit_question_fn_exit(inner: proc_macro2::TokenStream) -> proc_macro2::TokenS
             ::core::result::Result::Ok(__v) => __v,
             ::core::result::Result::Err(__e) => {
                 *self = Self::Finished;
-                break 'step ::core::result::Result::Ok(
+                break 'step __corot_step_ok!(
                     ::corot_rs::Step::Ready(::core::result::Result::Err(
                         ::core::convert::From::from(__e),
                     )),
@@ -5870,11 +5908,11 @@ fn emit_return_finish(
     match value {
         None => quote! {{
             *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(#ready_ok);
+            break 'step __corot_step_ok!(#ready_ok);
         }},
         Some(e) => quote! {{
             *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(::corot_rs::Step::Ready(#e));
+            break 'step __corot_step_ok!(::corot_rs::Step::Ready(#e));
         }},
     }
 }
@@ -5889,7 +5927,7 @@ fn emit_completion_stmts(
 ) -> proc_macro2::TokenStream {
     let default_finish = quote! {
         *self = Self::Finished;
-        break 'step ::core::result::Result::Ok(#ready_ok);
+        break 'step __corot_step_ok!(#ready_ok);
     };
     if stmts.is_empty() {
         return default_finish;
@@ -5908,7 +5946,7 @@ fn emit_completion_stmts(
         quote! {
             #prefix_toks
             *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(::corot_rs::Step::Ready(#e));
+            break 'step __corot_step_ok!(::corot_rs::Step::Ready(#e));
         }
     } else {
         let last_tok = emit_stmt_rewrite_returns(last, ready_ok);
@@ -5943,12 +5981,12 @@ fn as_result_finish_expr(
         if is_unit_expr(ok_arg) {
             return Some(quote! {
                 *self = Self::Finished;
-                break 'step ::core::result::Result::Ok(#ready_ok);
+                break 'step __corot_step_ok!(#ready_ok);
             });
         }
         return Some(quote! {
             *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(
+            break 'step __corot_step_ok!(
                 ::corot_rs::Step::Ready(::core::result::Result::Ok(#ok_arg)),
             );
         });
@@ -5956,7 +5994,7 @@ fn as_result_finish_expr(
     if let Some(err) = as_err_call_arg(expr) {
         return Some(quote! {
             *self = Self::Finished;
-            break 'step ::core::result::Result::Ok(
+            break 'step __corot_step_ok!(
                 ::corot_rs::Step::Ready(::core::result::Result::Err(
                     ::core::convert::From::from(#err),
                 )),
@@ -7675,7 +7713,7 @@ fn gen_go_waiting(
                 #(#cap_moves,)*
                 __wait: ::core::option::Option::None,
             };
-            break 'step ::core::result::Result::Ok(::corot_rs::Step::Effect(
+            break 'step __corot_step_ok!(::corot_rs::Step::Effect(
                 #effect_enum::#variant(#(#arg_ids),*)
             ));
         }
@@ -7686,7 +7724,7 @@ fn gen_go_waiting(
                 #(#cap_moves,)*
                 __wait: ::core::option::Option::None,
             };
-            break 'step ::core::result::Result::Ok(::corot_rs::Step::Pending);
+            break 'step __corot_step_ok!(::corot_rs::Step::Pending);
         }
     }
 }
@@ -7951,7 +7989,7 @@ fn gen_enter_await(
                         #(#join_moves,)*
                         __wait: ::core::option::Option::None,
                     };
-                    break 'step ::core::result::Result::Ok(::corot_rs::Step::Pending);
+                    break 'step __corot_step_ok!(::corot_rs::Step::Pending);
                 }
             } else {
                 let expr = iter_expr
@@ -8471,7 +8509,7 @@ fn gen_after_resume(
                     ::core::result::Result::Ok(v) => v,
                     ::core::result::Result::Err(e) => {
                         *self = Self::Finished;
-                        break 'step ::core::result::Result::Ok(
+                        break 'step __corot_step_ok!(
                             ::corot_rs::Step::Ready(::core::result::Result::Err(
                                 ::core::convert::From::from(e),
                             )),
@@ -8677,7 +8715,7 @@ fn gen_after_resume(
                 quote! {
                     #parts
                     *self = Self::Finished;
-                    break 'step ::core::result::Result::Ok(#ready_ok);
+                    break 'step __corot_step_ok!(#ready_ok);
                 }
             }
         }
@@ -10107,6 +10145,9 @@ fn rehydration_guard(
     var: &Ident,
     caps: &[Binding],
 ) -> proc_macro2::TokenStream {
+    if !cfg!(feature = "serde") {
+        return quote! {};
+    }
     let skips: Vec<_> = caps.iter().filter(|b| is_skip_serde(&b.ty)).collect();
     if skips.is_empty() {
         return quote! {};
@@ -10129,6 +10170,30 @@ fn rehydration_guard(
     }
 }
 
+/// `macro_rules!` used inside generated `step()` to wrap `Step` returns.
+/// With `serde`: `Ok(step)`. Without: bare `step` (no `Result` / `Rehydration`).
+fn step_ok_macro_tokens() -> proc_macro2::TokenStream {
+    if cfg!(feature = "serde") {
+        quote! {
+            #[allow(unused_macros)]
+            macro_rules! __corot_step_ok {
+                ($__e:expr $(,)?) => {
+                    ::core::result::Result::Ok($__e)
+                };
+            }
+        }
+    } else {
+        quote! {
+            #[allow(unused_macros)]
+            macro_rules! __corot_step_ok {
+                ($__e:expr $(,)?) => {
+                    $__e
+                };
+            }
+        }
+    }
+}
+
 fn make_rehydration(
     vis: &syn::Visibility,
     rehyd_name: &Ident,
@@ -10144,6 +10209,14 @@ fn make_rehydration(
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
 ) {
+    // Without serde there is no rehydration channel: `step` returns `Step` directly.
+    if !cfg!(feature = "serde") {
+        let step_ret = quote! {
+            ::corot_rs::Step<#output_ty, #effect_enum>
+        };
+        return (quote! {}, quote! {}, step_ret);
+    }
+
     let step_ret = quote! {
         ::core::result::Result<::corot_rs::Step<#output_ty, #effect_enum>, #rehyd_name>
     };

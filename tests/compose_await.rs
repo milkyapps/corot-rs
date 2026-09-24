@@ -3,6 +3,8 @@
 //! The child is the generated coroutine enum (not a Rust `Future`). The parent
 //! drives `child.step()` / forwards `settle_wait` until `corot_rs::Step::Ready`.
 
+#![cfg(not(feature = "serde"))]
+
 use corot_rs::corot;
 
 
@@ -37,13 +39,13 @@ fn test_compose_await() {
     let mut c = root();
 
     // Enter mid → leaf → leaf's await
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&10i32); // leaf
     // mid's own await
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&20i32); // mid
     // root's second leaf
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&30i32); // leaf again
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

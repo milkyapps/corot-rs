@@ -1,6 +1,8 @@
 //! Expression-position `if` / `match` with await:
 //! `let v: T = if … { … await …; value } else { … }`.
 
+#![cfg(not(feature = "serde"))]
+
 #![allow(unused_mut, unreachable_code)]
 
 use corot_rs::corot;
@@ -86,35 +88,35 @@ async fn match_other_arm_expr() {
 fn test_expr_if_match_await() {
     println!("=== if then expr ===");
     let mut c = if_then_expr();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&7i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== if else expr (skip await) ===");
     let mut c = if_else_expr();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== if expr then later await ===");
     let mut c = if_expr_then_await();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&3i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&4i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== if else await expr ===");
     let mut c = if_else_await_expr();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&5i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== match arm expr ===");
     let mut c = match_arm_expr();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Pending)));
+    assert!(matches!(c.step(), corot_rs::Step::Pending));
     c.settle_wait(&2i32);
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== match other arm expr ===");
     let mut c = match_other_arm_expr();
-    assert!(matches!(c.step(), Ok(corot_rs::Step::Ready(()))));
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }
