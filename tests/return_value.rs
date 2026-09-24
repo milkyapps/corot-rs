@@ -53,7 +53,7 @@ fn test_return_value() {
     println!("=== -> i32 trailing ===");
     let mut c = add_after_await(10);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&5i32);
+    c.settle_wait(5i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(15)));
     println!();
 
@@ -63,27 +63,27 @@ fn test_return_value() {
 
     let mut c = early_return_value(false);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&3i32);
+    c.settle_wait(3i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(4)));
     println!();
 
     println!("=== Result<i32, E> Ok ===");
     let mut c = result_ok_value();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Ok::<i32, &str>(9));
+    c.settle_wait(Ok::<i32, &str>(9));
     assert!(matches!(c.step(), corot_rs::Step::Ready(Ok(18))));
     println!();
 
     println!("=== Result<i32, E> Err return ===");
     let mut c = result_err_value();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Ok::<i32, &str>(-1));
+    c.settle_wait(Ok::<i32, &str>(-1));
     assert!(matches!(c.step(), corot_rs::Step::Ready(Err("negative"))));
     println!();
 
     println!("=== Result<i32, E> await? Err ===");
     let mut c = result_await_err();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Err::<i32, &str>("suspended"));
+    c.settle_wait(Err::<i32, &str>("suspended"));
     assert!(matches!(c.step(), corot_rs::Step::Ready(Err("suspended"))));
 }

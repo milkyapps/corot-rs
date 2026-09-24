@@ -75,30 +75,30 @@ fn test_rich_patterns() {
     println!("=== match Some(x) ===");
     let mut c = match_some_arm();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&11i32);
+    c.settle_wait(11i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== match (a, true) ===");
     let mut c = match_tuple_arm();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&22i32);
+    c.settle_wait(22i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== match Ok(v) ===");
     let mut c = match_ok_arm();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&33i32);
+    c.settle_wait(33i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== for (a, b) ===");
     let mut c = for_tuple_items();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&100i32);
+    c.settle_wait(100i32);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&200i32);
+    c.settle_wait(200i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
@@ -106,9 +106,9 @@ fn test_rich_patterns() {
     let mut c = for_option_items();
     // first Some(5)
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1i32);
+    c.settle_wait(1i32);
     // None is skipped by pattern; next Some(7)
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32);
+    c.settle_wait(2i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

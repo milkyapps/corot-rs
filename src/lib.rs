@@ -13,14 +13,50 @@ pub use corot_macros::corot;
 /// Result of `step` on a `#[corot]` coroutine.
 ///
 /// - [`Ready`](Step::Ready): coroutine finished with this value
-/// - [`Pending`](Step::Pending): suspended on a typed settle await — call `settle_wait`
+/// - [`Pending`](Step::Pending): suspended on a typed await — use `pending_slot()`
+///   and [`SettleWait::set`] on the matching variant
 /// - [`Effect`](Step::Effect): suspended on an external call (e.g. `send_message(1).await`);
-///   the host should perform that call, then `settle_wait` with its return value
+///   the host should perform that call, then settle via `pending_slot()` with its return value
 #[derive(Debug)]
 pub enum Step<T, E = core::convert::Infallible> {
     Ready(T),
     Pending,
     Effect(E),
+}
+
+/// Typed handle for filling a suspended await slot.
+///
+/// Produced by generated `pending_slot()` → `{Corout}PendingSlot::{Name}(SettleWait)`.
+/// Call [`SettleWait::set`] with the resume value (by value, not `&dyn Any`).
+pub struct SettleWait<'a, T> {
+    slot: &'a mut Option<T>,
+}
+
+impl<'a, T> SettleWait<'a, T> {
+    /// Used by `#[corot]`-generated `pending_slot` arms.
+    #[doc(hidden)]
+    #[inline]
+    pub fn new(slot: &'a mut Option<T>) -> Self {
+        Self { slot }
+    }
+
+    /// Provide the value that the suspended await should resume with.
+    #[inline]
+    pub fn set(self, value: T) {
+        *self.slot = Some(value);
+    }
+}
+
+/// Move `value` to type `U` when `TypeId` matches; otherwise return it unchanged.
+#[doc(hidden)]
+pub fn __try_cast<T: 'static, U: 'static>(value: T) -> Result<U, T> {
+    if core::any::TypeId::of::<T>() == core::any::TypeId::of::<U>() {
+        let out = unsafe { core::ptr::read(&value as *const T as *const U) };
+        core::mem::forget(value);
+        Ok(out)
+    } else {
+        Err(value)
+    }
 }
 
 /// Type ascription helper for `#[corot]` `for` loops over arbitrary iterables.
@@ -95,7 +131,7 @@ pub fn iter_fields<I: IntoIterator, Fields>(iterable: I) -> I {
 /// ```
 ///
 /// `C` is the child's coroutine enum type (the return type of the `#[corot]` fn).
-/// The parent drives `C::step` / `settle_wait` until `Step::Ready`, then resumes.
+/// The parent drives `C::step` / `pending_slot` until `Step::Ready`, then resumes.
 /// Child `Step::Effect` values bubble as `ParentEffect::NestedChildCoroutine(…)`.
 ///
 /// This function is the identity: it exists only so the macro can read `C`.

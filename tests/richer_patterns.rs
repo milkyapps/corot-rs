@@ -110,54 +110,54 @@ fn test_richer_patterns() {
     println!("=== match struct ===");
     let mut c = match_struct_arm();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&11i32);
+    c.settle_wait(11i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== match tuple-struct ===");
     let mut c = match_tuple_struct_arm();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&22i32);
+    c.settle_wait(22i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== match slice ===");
     let mut c = match_slice_arm();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&33i32);
+    c.settle_wait(33i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== match @ hint ===");
     let mut c = match_struct_at_hint();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&44i32);
+    c.settle_wait(44i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== for struct ===");
     let mut c = for_struct_items();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1i32);
+    c.settle_wait(1i32);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32);
+    c.settle_wait(2i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== for tuple-struct ===");
     let mut c = for_tuple_struct_items();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1i32);
+    c.settle_wait(1i32);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32);
+    c.settle_wait(2i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== for array ===");
     let mut c = for_array_items();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1i32);
+    c.settle_wait(1i32);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32);
+    c.settle_wait(2i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== match range @ ===");
     let mut c = match_struct_range_at();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&55i32);
+    c.settle_wait(55i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

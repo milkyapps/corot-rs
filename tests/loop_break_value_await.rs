@@ -86,20 +86,20 @@ fn test_loop_break_value_await() {
     println!("=== break value ===");
     let mut c = break_value();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&-1i32); // continue looping
+    c.settle_wait(-1i32); // continue looping
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== labeled break value ===");
     let mut c = labeled_break_value();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&-3i32); // continue
+    c.settle_wait(-3i32); // continue
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&5i32); // keep going (5 < 10)
+    c.settle_wait(5i32); // keep going (5 < 10)
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&12i32);
+    c.settle_wait(12i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
@@ -111,15 +111,15 @@ fn test_loop_break_value_await() {
     println!("=== break value then await ===");
     let mut c = break_value_then_await();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&7i32);
+    c.settle_wait(7i32);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&3i32);
+    c.settle_wait(3i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== break from nested for ===");
     let mut c = break_from_nested_for();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&10i32);
+    c.settle_wait(10i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

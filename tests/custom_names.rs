@@ -28,7 +28,9 @@ fn test_custom_name_and_effect() {
     // Must be `GoSanctuary`, not `GoSanctuaryCorotCoroutine`.
     let mut c: GoSanctuary = go_sanctuary_corot();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&7i32);
+    match c.pending_slot().unwrap() {
+        GoSanctuaryPendingSlot::N(s) => s.set(7),
+    }
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }
 
@@ -39,9 +41,18 @@ fn test_name_only_defaults_effect_to_name_effect() {
     let _leaf_ctor: fn() -> Leaf = leaf_corot;
 
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1i32);
+    // Nested child slot: drill into `Leaf`, then settle its await.
+    match c.pending_slot().unwrap() {
+        RootPendingSlot::Unit0(leaf) => match leaf.pending_slot().unwrap() {
+            LeafPendingSlot::N(s) => s.set(1),
+        },
+        RootPendingSlot::M(_) => panic!("expected nested leaf"),
+    }
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32);
+    match c.pending_slot().unwrap() {
+        RootPendingSlot::M(s) => s.set(2),
+        RootPendingSlot::Unit0(_) => panic!("expected own await"),
+    }
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }
 

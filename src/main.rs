@@ -40,13 +40,19 @@ fn main() {
     let mut c = f();
 
     assert_step!(c.step(), corot_rs::Step::Pending);
-    c.settle_wait(&2);
+    match c.pending_slot().unwrap() {
+        FCoroutinePendingSlot::A(s) => s.set(2),
+        FCoroutinePendingSlot::B(_) => unreachable!("expected A"),
+    }
 
     assert_step!(
         c.step(),
         corot_rs::Step::Effect(FCoroutineEffect::CallPreB(2))
     );
-    c.settle_wait(&pre_b(2));
+    match c.pending_slot().unwrap() {
+        FCoroutinePendingSlot::A(_) => unreachable!("expected B"),
+        FCoroutinePendingSlot::B(s) => s.set(pre_b(2)),
+    }
 
     assert_step!(c.step(), corot_rs::Step::Ready(()));
     assert_step!(c.step(), corot_rs::Step::Ready(()));

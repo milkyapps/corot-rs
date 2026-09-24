@@ -108,14 +108,14 @@ fn test_try_block_await() {
     println!("=== general ? ok ===");
     let mut c = general_question_ok();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(Ok(()))));
     println!();
 
     println!("=== general ? err after await ===");
     let mut c = general_question_err();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1i32);
+    c.settle_wait(1i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(Err("nope"))));
     println!();
 
@@ -132,20 +132,20 @@ fn test_try_block_await() {
     println!("=== try await ok ===");
     let mut c = try_await_ok();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Ok::<i32, &str>(9));
+    c.settle_wait(Ok::<i32, &str>(9));
     assert!(matches!(c.step(), corot_rs::Step::Ready(Ok(()))));
     println!();
 
     println!("=== try await err ===");
     let mut c = try_await_err();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Err::<i32, &str>("suspended"));
+    c.settle_wait(Err::<i32, &str>("suspended"));
     assert!(matches!(c.step(), corot_rs::Step::Ready(Ok(()))));
     println!();
 
     println!("=== try await then ? ===");
     let mut c = try_await_then_question();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Ok::<i32, &str>(5));
+    c.settle_wait(Ok::<i32, &str>(5));
     assert!(matches!(c.step(), corot_rs::Step::Ready(Ok(()))));
 }

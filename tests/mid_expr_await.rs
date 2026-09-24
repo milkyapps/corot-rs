@@ -84,12 +84,12 @@ fn test_mid_expr_await() {
         c.step(),
         corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallLeft())
     ));
-    c.settle_wait(&3i32);
+    c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
         corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallRight())
     ));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== call two args stmt ===");
@@ -98,12 +98,12 @@ fn test_mid_expr_await() {
         c.step(),
         corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallLeft())
     ));
-    c.settle_wait(&3i32);
+    c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
         corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallRight())
     ));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== method two awaits ===");
@@ -112,12 +112,12 @@ fn test_mid_expr_await() {
         c.step(),
         corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallLeft())
     ));
-    c.settle_wait(&3i32);
+    c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
         corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallRight())
     ));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== binary two awaits ===");
@@ -126,12 +126,12 @@ fn test_mid_expr_await() {
         c.step(),
         corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallLeft())
     ));
-    c.settle_wait(&3i32);
+    c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
         corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallRight())
     ));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== tuple awaits ===");
@@ -140,12 +140,12 @@ fn test_mid_expr_await() {
         c.step(),
         corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallLeft())
     ));
-    c.settle_wait(&3i32);
+    c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
         corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallRight())
     ));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== single mid ===");
@@ -154,16 +154,16 @@ fn test_mid_expr_await() {
         c.step(),
         corot_rs::Step::Effect(SingleMidKeepsLetTyCoroutineEffect::CallLeft())
     ));
-    c.settle_wait(&10i32);
+    c.settle_wait(10i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     println!("=== mid then plain ===");
     let mut c = mid_then_plain();
     assert!(matches!(c.step(), corot_rs::Step::Effect(_)));
-    c.settle_wait(&1i32);
+    c.settle_wait(1i32);
     assert!(matches!(c.step(), corot_rs::Step::Effect(_)));
-    c.settle_wait(&2i32);
+    c.settle_wait(2i32);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&0i32);
+    c.settle_wait(0i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

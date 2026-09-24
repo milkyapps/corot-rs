@@ -79,13 +79,13 @@ fn run_scrutinee() {
     println!("=== await in scrutinee ===");
     let mut c = await_in_scrutinee();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1);
+    c.settle_wait(1);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     let mut c = await_in_scrutinee();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&7);
+    c.settle_wait(7);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 }
@@ -94,7 +94,7 @@ fn run_arm() {
     println!("=== await in arm ===");
     let mut c = await_in_arm();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&42);
+    c.settle_wait(42);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 }
@@ -110,21 +110,21 @@ fn run_guard() {
     println!("=== await in guard (true) ===");
     let mut c = await_in_guard();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&true);
+    c.settle_wait(true);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== await in guard (false → fallthrough) ===");
     let mut c = await_in_guard();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&false);
+    c.settle_wait(false);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== await in guard with binding ===");
     let mut c = await_in_guard_binding();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&true);
+    c.settle_wait(true);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 }

@@ -131,43 +131,43 @@ async fn nested_for_in_loop() {
 fn test_nested_suspend_rich() {
     let mut c = multi_level_if();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1i32);
+    c.settle_wait(1i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     let mut c = multi_level_if_false_outer();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32);
+    c.settle_wait(2i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     let mut c = nested_if_else_await();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&7i32);
+    c.settle_wait(7i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     let mut c = nested_if_then_and_else();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&3i32);
+    c.settle_wait(3i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     let mut c = nested_if_then_and_else_false();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     let mut c = nested_else_if_await();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&5i32);
+    c.settle_wait(5i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     let mut c = nested_match_in_loop();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 
     let mut c = nested_for_in_loop();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1i32);
+    c.settle_wait(1i32);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32);
+    c.settle_wait(2i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

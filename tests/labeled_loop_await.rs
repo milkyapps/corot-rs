@@ -139,55 +139,55 @@ fn test_labeled_loop_await() {
     println!("=== labeled break ===");
     let mut c = labeled_break();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&7i32);
+    c.settle_wait(7i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== unlabeled continue ===");
     let mut c = unlabeled_continue();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&-1i32); // continue
+    c.settle_wait(-1i32); // continue
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&3i32); // seen=1
+    c.settle_wait(3i32); // seen=1
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&-2i32); // continue
+    c.settle_wait(-2i32); // continue
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&5i32); // seen=2 → break
+    c.settle_wait(5i32); // seen=2 → break
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== labeled continue ===");
     let mut c = labeled_continue();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&0i32); // continue 'again
+    c.settle_wait(0i32); // continue 'again
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&1i32); // ok=1
+    c.settle_wait(1i32); // ok=1
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32); // ok=2 → break
+    c.settle_wait(2i32); // ok=2 → break
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== nested sync + break 'outer ===");
     let mut c = nested_sync_break_outer();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&3i32); // n<=5 → unlabeled break after for
+    c.settle_wait(3i32); // n<=5 → unlabeled break after for
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     let mut c = nested_sync_break_outer();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&9i32); // break 'outer from for
+    c.settle_wait(9i32); // break 'outer from for
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== labeled for break ===");
     let mut c = labeled_for_break();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&0i32);
+    c.settle_wait(0i32);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
@@ -195,13 +195,13 @@ fn test_labeled_loop_await() {
     let mut c = continue_before_await();
     // two LoopHead iterations that continue without suspending
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&42i32);
+    c.settle_wait(42i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== continue in sync for body ===");
     let mut c = continue_in_sync_for();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&(0..4));
+    c.settle_wait((0..4));
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

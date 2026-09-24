@@ -25,8 +25,9 @@ use syn::{
 /// `step` returns `corot_rs::Step<Output, Effect>` by default, or (with the
 /// `serde` feature) `Result<Step<…>, Rehydration>` so hosts can rehydrate
 /// `SkipSerde` captures after checkpoint restore:
-/// `Ready` / `Pending` (settle with `settle_wait`) / `Effect` (host runs an
-/// external async call such as `send_message(1).await`, then settles).
+/// `Ready` / `Pending` (settle via `pending_slot()` + typed `SettleWait::set`) /
+/// `Effect` (host runs an external async call such as `send_message(1).await`,
+/// then settles the same way).
 ///
 /// - `let name: T = expr.await?` when the fn returns `Result<U, E>` (settle
 ///   `Result<T, E>`; `Err` finishes with `Step::Ready(Err(...))`)
@@ -892,48 +893,62 @@ fn expand_corot(attrs: CorotAttrs, input: ItemFn) -> syn::Result<proc_macro2::To
     }
     variants.push(quote! { Finished });
 
-    let mut settle_arms = Vec::new();
+    let pending_slot_name = format_ident!("{}PendingSlot", enum_name);
+    let mut pending_variants = Vec::new();
+    let mut pending_arms = Vec::new();
     for (i, ap) in awaits.iter().enumerate() {
         if for_has_iter_await(&ap.kind) {
             let iter_var = waiting_iter_variant(i);
             let into_ty = for_into_ty(&ap.kind).unwrap();
-            settle_arms.push(quote! {
+            let slot_var = format_ident!("Iter{}", i);
+            pending_variants.push(quote! {
+                #slot_var(::corot_rs::SettleWait<'a, #into_ty>)
+            });
+            pending_arms.push(quote! {
                 Self::#iter_var { __wait, .. } => {
-                    let value = value
-                        .downcast_ref::<#into_ty>()
-                        .unwrap_or_else(|| panic!("settle_wait: expected {}", ::core::any::type_name::<#into_ty>()));
-                    *__wait = ::core::option::Option::Some(::core::clone::Clone::clone(value));
+                    ::core::option::Option::Some(#pending_slot_name::#slot_var(
+                        ::corot_rs::SettleWait::new(__wait),
+                    ))
                 }
             });
         }
         if while_has_cond_wait_slot(&ap.kind) {
             let cond_var = waiting_cond_variant(join_caps_index(ap, i));
             let wait_ty = cond_wait_ty_tokens(&ap.kind).unwrap();
-            settle_arms.push(quote! {
+            let slot_var = format_ident!("Cond{}", join_caps_index(ap, i));
+            pending_variants.push(quote! {
+                #slot_var(::corot_rs::SettleWait<'a, #wait_ty>)
+            });
+            pending_arms.push(quote! {
                 Self::#cond_var { __wait, .. } => {
-                    let value = value
-                        .downcast_ref::<#wait_ty>()
-                        .unwrap_or_else(|| panic!("settle_wait: expected {}", ::core::any::type_name::<#wait_ty>()));
-                    *__wait = ::core::option::Option::Some(*value);
+                    ::core::option::Option::Some(#pending_slot_name::#slot_var(
+                        ::corot_rs::SettleWait::new(__wait),
+                    ))
                 }
             });
         }
         if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, ..}) {
             let var = waiting_variant(&ap.name);
-            if ap.nested_child.is_some() {
-                settle_arms.push(quote! {
+            let slot_var = format_ident!("{}", to_upper_camel_case(&ap.name.to_string()));
+            if let Some(child_ty) = &ap.nested_child {
+                pending_variants.push(quote! {
+                    #slot_var(&'a mut #child_ty)
+                });
+                pending_arms.push(quote! {
                     Self::#var { __child, .. } => {
-                        __child.settle_wait(value);
+                        ::core::option::Option::Some(#pending_slot_name::#slot_var(__child))
                     }
                 });
             } else {
                 let ty = &ap.wait_ty;
-                settle_arms.push(quote! {
+                pending_variants.push(quote! {
+                    #slot_var(::corot_rs::SettleWait<'a, #ty>)
+                });
+                pending_arms.push(quote! {
                     Self::#var { __wait, .. } => {
-                        let value = value
-                            .downcast_ref::<#ty>()
-                            .unwrap_or_else(|| panic!("settle_wait: expected {}", ::core::any::type_name::<#ty>()));
-                        *__wait = ::core::option::Option::Some(*value);
+                        ::core::option::Option::Some(#pending_slot_name::#slot_var(
+                            ::corot_rs::SettleWait::new(__wait),
+                        ))
                     }
                 });
             }
@@ -1727,11 +1742,130 @@ fn expand_corot(attrs: CorotAttrs, input: ItemFn) -> syn::Result<proc_macro2::To
         }
     });
 
-    let settle_fn = quote! {
-        pub fn settle_wait(&mut self, value: &dyn ::std::any::Any) {
-            match self {
-                #(#settle_arms)*
-                _ => panic!("settle_wait called when not waiting"),
+    let pending_slot_tokens = if pending_variants.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            #[allow(dead_code)]
+            #vis enum #pending_slot_name<'a> {
+                #(#pending_variants,)*
+            }
+        }
+    };
+
+    let pending_slot_fn = if pending_arms.is_empty() {
+        quote! {
+            /// Returns `None` — this coroutine has no typed await slots.
+            pub fn pending_slot(&mut self) -> ::core::option::Option<::core::convert::Infallible> {
+                ::core::option::Option::None
+            }
+        }
+    } else {
+        quote! {
+            /// Which typed await is pending (after [`Self::step`] returned
+            /// [`corot_rs::Step::Pending`] or [`corot_rs::Step::Effect`]).
+            ///
+            /// Prefer matching on this over [`Self::settle_wait`]: it is exhaustive
+            /// and does not panic on the wrong state.
+            pub fn pending_slot(&mut self) -> ::core::option::Option<#pending_slot_name<'_>> {
+                match self {
+                    #(#pending_arms,)*
+                    _ => ::core::option::Option::None,
+                }
+            }
+        }
+    };
+
+    // Convenience settle: by-value + TypeId (no `dyn Any`). Prefer `pending_slot`.
+    let mut settle_arms = Vec::new();
+    for (i, ap) in awaits.iter().enumerate() {
+        if for_has_iter_await(&ap.kind) {
+            let iter_var = waiting_iter_variant(i);
+            let into_ty = for_into_ty(&ap.kind).unwrap();
+            settle_arms.push(quote! {
+                Self::#iter_var { __wait, .. } => {
+                    match ::corot_rs::__try_cast::<T, #into_ty>(value) {
+                        ::core::result::Result::Ok(v) => {
+                            *__wait = ::core::option::Option::Some(v);
+                        }
+                        ::core::result::Result::Err(_) => {
+                            panic!(
+                                "settle_wait: expected {}",
+                                ::core::any::type_name::<#into_ty>()
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        if while_has_cond_wait_slot(&ap.kind) {
+            let cond_var = waiting_cond_variant(join_caps_index(ap, i));
+            let wait_ty = cond_wait_ty_tokens(&ap.kind).unwrap();
+            settle_arms.push(quote! {
+                Self::#cond_var { __wait, .. } => {
+                    match ::corot_rs::__try_cast::<T, #wait_ty>(value) {
+                        ::core::result::Result::Ok(v) => {
+                            *__wait = ::core::option::Option::Some(v);
+                        }
+                        ::core::result::Result::Err(_) => {
+                            panic!(
+                                "settle_wait: expected {}",
+                                ::core::any::type_name::<#wait_ty>()
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        if !matches!(&ap.kind, SuspendKind::For { has_body_await: false, ..}) {
+            let var = waiting_variant(&ap.name);
+            if ap.nested_child.is_some() {
+                settle_arms.push(quote! {
+                    Self::#var { __child, .. } => {
+                        __child.settle_wait(value);
+                    }
+                });
+            } else {
+                let ty = &ap.wait_ty;
+                settle_arms.push(quote! {
+                    Self::#var { __wait, .. } => {
+                        match ::corot_rs::__try_cast::<T, #ty>(value) {
+                            ::core::result::Result::Ok(v) => {
+                                *__wait = ::core::option::Option::Some(v);
+                            }
+                            ::core::result::Result::Err(_) => {
+                                panic!(
+                                    "settle_wait: expected {}",
+                                    ::core::any::type_name::<#ty>()
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    let settle_fn = if settle_arms.is_empty() {
+        quote! {
+            /// No await slots — calling this always panics.
+            pub fn settle_wait<T: 'static>(&mut self, _value: T) {
+                panic!("settle_wait called when not waiting");
+            }
+        }
+    } else {
+        quote! {
+            /// Resume the current await with `value` (by value).
+            ///
+            /// Prefer [`Self::pending_slot`] + [`corot_rs::SettleWait::set`] for
+            /// exhaustiveness without panics / type checks. This helper uses
+            /// `TypeId` to pick the slot and panics if not waiting or if `T`
+            /// does not match the suspended await.
+            pub fn settle_wait<T: 'static>(&mut self, value: T) {
+                match self {
+                    #(#settle_arms)*
+                    _ => panic!("settle_wait called when not waiting"),
+                }
             }
         }
     };
@@ -1792,7 +1926,11 @@ fn expand_corot(attrs: CorotAttrs, input: ItemFn) -> syn::Result<proc_macro2::To
 
         #rehyd_enum
 
+        #pending_slot_tokens
+
         impl #enum_name {
+            #pending_slot_fn
+
             #settle_fn
 
             #rehyd_method

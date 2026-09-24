@@ -81,14 +81,14 @@ fn test_labeled_block_await() {
     println!("=== break with value ===");
     let mut c = break_with_value();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&4i32);
+    c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== fallthrough value ===");
     let mut c = fallthrough_value();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&5i32);
+    c.settle_wait(5i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
@@ -100,19 +100,19 @@ fn test_labeled_block_await() {
     println!("=== stmt labeled block ===");
     let mut c = stmt_labeled_block();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&-1i32);
+    c.settle_wait(-1i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     let mut c = stmt_labeled_block();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&3i32);
+    c.settle_wait(3i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== break from nested for ===");
     let mut c = break_from_nested_for();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&9i32);
+    c.settle_wait(9i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

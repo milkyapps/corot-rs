@@ -53,16 +53,16 @@ fn test_fn_args() {
     println!("=== greet ===");
     let mut c = greet("Ada".into());
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&7i32);
+    c.settle_wait(7i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
     println!("=== accumulate ===");
     let mut c = accumulate(10, 3);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&5i32); // sum = 10 + 5 + 3 = 18
+    c.settle_wait(5i32); // sum = 10 + 5 + 3 = 18
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32); // sum = 20
+    c.settle_wait(2i32); // sum = 20
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
     println!();
 
@@ -74,6 +74,6 @@ fn test_fn_args() {
     println!("=== compose with args ===");
     let mut c = root_calls_leaf(40);
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&2i32); // leaf: 41 + 2
+    c.settle_wait(2i32); // leaf: 41 + 2
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

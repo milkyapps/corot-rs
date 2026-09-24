@@ -28,15 +28,15 @@ fn test_loop_await() {
 
     // iteration 1
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&3);
+    c.settle_wait(3);
 
     // iteration 2
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&4);
+    c.settle_wait(4);
 
     // iteration 3 → sum becomes 10 → break → done
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&3);
+    c.settle_wait(3);
 
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }

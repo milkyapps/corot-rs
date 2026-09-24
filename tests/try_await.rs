@@ -42,16 +42,16 @@ fn test_try_await() {
     println!("=== Ok path ===");
     let mut c = try_ok_path();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Ok::<i32, &str>(1));
+    c.settle_wait(Ok::<i32, &str>(1));
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Ok::<i32, &str>(2));
+    c.settle_wait(Ok::<i32, &str>(2));
     assert!(matches!(c.step(), corot_rs::Step::Ready(Ok(()))));
     println!();
 
     println!("=== Err on first await ===");
     let mut c = try_err_first();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Err::<i32, &str>("boom"));
+    c.settle_wait(Err::<i32, &str>("boom"));
     assert!(matches!(c.step(), corot_rs::Step::Ready(Err("boom"))));
     println!("err1: finished with boom");
     println!();
@@ -59,9 +59,9 @@ fn test_try_await() {
     println!("=== Err on second await ===");
     let mut c = try_err_second();
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Ok::<i32, &str>(7));
+    c.settle_wait(Ok::<i32, &str>(7));
     assert!(matches!(c.step(), corot_rs::Step::Pending));
-    c.settle_wait(&Err::<i32, &str>("later"));
+    c.settle_wait(Err::<i32, &str>("later"));
     assert!(matches!(c.step(), corot_rs::Step::Ready(Err("later"))));
     println!("err2: finished with later");
 }

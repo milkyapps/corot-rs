@@ -69,7 +69,7 @@ fn test_with_serde() {
     let mut b: CheckoutCoroutine = serde_json::from_str(&json).unwrap();
     dump("freshly deserialized B", &b);
 
-    b.settle_wait(&10);
+    b.settle_wait(10);
     assert!(matches!(
         b.step(),
         Err(CheckoutCoroutineRehydration::NeedsRehydrationDb { .. })
@@ -92,7 +92,7 @@ fn test_with_serde() {
     )); // → WaitingTotal via scale(rows).await
     dump("B waiting for total", &b);
 
-    b.settle_wait(&99.5);
+    b.settle_wait(99.5);
     assert!(matches!(b.step(), Ok(corot_rs::Step::Ready(()))));
     dump("B finished", &b);
 }

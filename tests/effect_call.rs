@@ -1,5 +1,5 @@
 //! External async calls surface as `Step::Effect(CallFoo(…))` so the host
-//! can invoke them, then `settle_wait` with the return value.
+//! can invoke them, then settle via `pending_slot()` with the return value.
 
 #![cfg(not(feature = "serde"))]
 
@@ -51,16 +51,20 @@ fn test_effect_call() {
         c.step(),
         corot_rs::Step::Effect(ChatCoroutineEffect::CallSendMessage(1))
     ));
-    // Host performs send_message(1) itself, then settles the return value.
+    // Host performs send_message(1) itself, then settles via the typed slot.
     let _ = send_message;
-    c.settle_wait(&10i32);
+    match c.pending_slot().unwrap() {
+        ChatCoroutinePendingSlot::Reply(s) | ChatCoroutinePendingSlot::N(s) => s.set(10),
+    }
 
     assert!(matches!(
         c.step(),
         corot_rs::Step::Effect(ChatCoroutineEffect::CallFetchUser(7))
     ));
     let _ = fetch_user;
-    c.settle_wait(&107i32);
+    match c.pending_slot().unwrap() {
+        ChatCoroutinePendingSlot::Reply(s) | ChatCoroutinePendingSlot::N(s) => s.set(107),
+    }
 
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }
@@ -72,7 +76,9 @@ fn test_effect_call_captured_arg() {
         c.step(),
         corot_rs::Step::Effect(WithLocalCoroutineEffect::CallSendMessage(42))
     ));
-    c.settle_wait(&420i32);
+    match c.pending_slot().unwrap() {
+        WithLocalCoroutinePendingSlot::Reply(s) => s.set(420),
+    }
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }
 
@@ -85,7 +91,10 @@ fn test_effect_call_unit_and_tuple_args() {
         corot_rs::Step::Effect(UnitAndTupleArgsCoroutineEffect::CallPing(()))
     ));
     let _ = ping;
-    c.settle_wait(&1i32);
+    match c.pending_slot().unwrap() {
+        UnitAndTupleArgsCoroutinePendingSlot::A(s)
+        | UnitAndTupleArgsCoroutinePendingSlot::B(s) => s.set(1),
+    }
 
     assert!(matches!(
         c.step(),
@@ -94,7 +103,10 @@ fn test_effect_call_unit_and_tuple_args() {
         )
     ));
     let _ = pair;
-    c.settle_wait(&3i32);
+    match c.pending_slot().unwrap() {
+        UnitAndTupleArgsCoroutinePendingSlot::A(s)
+        | UnitAndTupleArgsCoroutinePendingSlot::B(s) => s.set(3),
+    }
 
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
 }
