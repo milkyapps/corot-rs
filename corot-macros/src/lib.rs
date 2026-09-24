@@ -5233,8 +5233,7 @@ fn build_effect_enum(
                 continue;
             }
             seen_calls.push((eff.variant.clone(), tys.clone()));
-            let v = &eff.variant;
-            variants.push(quote! { #v(#(#tys),*) });
+            variants.push(effect_variant_decl_tokens(&eff.variant, &tys));
         }
     }
     let mut seen_nested = Vec::new();
@@ -5257,6 +5256,28 @@ fn build_effect_enum(
             #(#variants,)*
         }
     })
+}
+
+/// Effect-enum variant declaration: unit (`V`) when no args, else tuple (`V(T…)`).
+fn effect_variant_decl_tokens(variant: &Ident, tys: &[Type]) -> proc_macro2::TokenStream {
+    if tys.is_empty() {
+        quote! { #variant }
+    } else {
+        quote! { #variant(#(#tys),*) }
+    }
+}
+
+/// Effect-enum construction: unit (`Enum::V`) when no args, else tuple (`Enum::V(a…)`).
+fn effect_ctor_tokens(
+    effect_enum: &Ident,
+    variant: &Ident,
+    arg_ids: &[Ident],
+) -> proc_macro2::TokenStream {
+    if arg_ids.is_empty() {
+        quote! { #effect_enum::#variant }
+    } else {
+        quote! { #effect_enum::#variant(#(#arg_ids),*) }
+    }
 }
 
 /// `val::<T>(arg)` / `corot_rs::val::<T>(arg)` — identity wrapper for type ascription.
@@ -7937,15 +7958,14 @@ fn gen_go_waiting(
         let arg_ids: Vec<_> = (0..eff.args.len())
             .map(|i| format_ident!("__eff_arg{}", i))
             .collect();
+        let effect_ctor = effect_ctor_tokens(effect_enum, variant, &arg_ids);
         quote! {
             #(#arg_lets)*
             *self = Self::#var {
                 #(#cap_moves,)*
                 __wait: ::core::option::Option::None,
             };
-            break 'step __corot_step_ok!(::corot_rs::Step::Effect(
-                #effect_enum::#variant(#(#arg_ids),*)
-            ));
+            break 'step __corot_step_ok!(::corot_rs::Step::Effect(#effect_ctor));
         }
     } else {
         quote! {

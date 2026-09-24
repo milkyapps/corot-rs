@@ -82,12 +82,12 @@ fn test_mid_expr_await() {
     let mut c = call_two_args();
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallLeft())
+        corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallLeft)
     ));
     c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallRight())
+        corot_rs::Step::Effect(CallTwoArgsCoroutineEffect::CallRight)
     ));
     c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
@@ -96,12 +96,12 @@ fn test_mid_expr_await() {
     let mut c = call_two_args_stmt();
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallLeft())
+        corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallLeft)
     ));
     c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallRight())
+        corot_rs::Step::Effect(CallTwoArgsStmtCoroutineEffect::CallRight)
     ));
     c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
@@ -110,12 +110,12 @@ fn test_mid_expr_await() {
     let mut c = method_two_awaits();
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallLeft())
+        corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallLeft)
     ));
     c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallRight())
+        corot_rs::Step::Effect(MethodTwoAwaitsCoroutineEffect::CallRight)
     ));
     c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
@@ -124,12 +124,12 @@ fn test_mid_expr_await() {
     let mut c = binary_two_awaits();
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallLeft())
+        corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallLeft)
     ));
     c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallRight())
+        corot_rs::Step::Effect(BinaryTwoAwaitsCoroutineEffect::CallRight)
     ));
     c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
@@ -138,12 +138,12 @@ fn test_mid_expr_await() {
     let mut c = tuple_awaits();
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallLeft())
+        corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallLeft)
     ));
     c.settle_wait(3i32);
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallRight())
+        corot_rs::Step::Effect(TupleAwaitsCoroutineEffect::CallRight)
     ));
     c.settle_wait(4i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
@@ -152,7 +152,7 @@ fn test_mid_expr_await() {
     let mut c = single_mid_keeps_let_ty();
     assert!(matches!(
         c.step(),
-        corot_rs::Step::Effect(SingleMidKeepsLetTyCoroutineEffect::CallLeft())
+        corot_rs::Step::Effect(SingleMidKeepsLetTyCoroutineEffect::CallLeft)
     ));
     c.settle_wait(10i32);
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));
