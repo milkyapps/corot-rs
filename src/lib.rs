@@ -14,9 +14,11 @@ pub use corot_macros::corot;
 ///
 /// - [`Ready`](Step::Ready): coroutine finished with this value
 /// - [`Pending`](Step::Pending): suspended on a typed await — use `pending_slot()`
-///   and [`SettleWait::set`] on the matching variant
+///   and [`SettleWait::set`] on the matching variant (or `settle_and_step` for a
+///   one-shot settle + re-step)
 /// - [`Effect`](Step::Effect): suspended on an external call (e.g. `send_message(1).await`);
-///   the host should perform that call, then settle via `pending_slot()` with its return value
+///   the host should perform that call, then settle via `pending_slot()` / `settle_and_step`
+///   with its return value
 #[derive(Debug)]
 pub enum Step<T, E = core::convert::Infallible> {
     Ready(T),

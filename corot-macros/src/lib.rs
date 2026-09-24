@@ -25,7 +25,8 @@ use syn::{
 /// `step` returns `corot_rs::Step<Output, Effect>` by default, or (with the
 /// `serde` feature) `Result<Step<…>, Rehydration>` so hosts can rehydrate
 /// `SkipSerde` captures after checkpoint restore:
-/// `Ready` / `Pending` (settle via `pending_slot()` + typed `SettleWait::set`) /
+/// `Ready` / `Pending` (settle via `pending_slot()` + typed `SettleWait::set`,
+/// or `settle_and_step(value)` to settle and re-step in one call) /
 /// `Effect` (host runs an external async call such as `send_message(1).await`,
 /// then settles the same way).
 ///
@@ -1846,11 +1847,29 @@ fn expand_corot(attrs: CorotAttrs, input: ItemFn) -> syn::Result<proc_macro2::To
         }
     }
 
+    let (rehyd_enum, rehyd_method, step_ret) = make_rehydration(
+        &vis,
+        &rehyd_name,
+        &fn_args,
+        &awaits,
+        &captures_at_await,
+        &join_caps_at,
+        &all_skips,
+        &output_ty,
+        &effect_enum,
+    );
+
     let settle_fn = if settle_arms.is_empty() {
         quote! {
             /// No await slots — calling this always panics.
             pub fn settle_wait<T: 'static>(&mut self, _value: T) {
                 panic!("settle_wait called when not waiting");
+            }
+
+            /// Settle then [`Self::step`] in one call. Always panics (no await slots).
+            pub fn settle_and_step<T: 'static>(&mut self, value: T) -> #step_ret {
+                self.settle_wait(value);
+                self.step()
             }
         }
     } else {
@@ -1867,6 +1886,19 @@ fn expand_corot(attrs: CorotAttrs, input: ItemFn) -> syn::Result<proc_macro2::To
                     _ => panic!("settle_wait called when not waiting"),
                 }
             }
+
+            /// Settle the current await with `value`, then immediately [`Self::step`].
+            ///
+            /// Collapses the common one-shot effect host frame:
+            /// `step` → `Effect` / `Pending` → settle → `step` again.
+            /// Same `TypeId` / panic rules as [`Self::settle_wait`].
+            ///
+            /// Prefer [`Self::pending_slot`] + [`corot_rs::SettleWait::set`] +
+            /// [`Self::step`] when you need an exhaustive match on the slot.
+            pub fn settle_and_step<T: 'static>(&mut self, value: T) -> #step_ret {
+                self.settle_wait(value);
+                self.step()
+            }
         }
     };
 
@@ -1878,17 +1910,6 @@ fn expand_corot(attrs: CorotAttrs, input: ItemFn) -> syn::Result<proc_macro2::To
         quote! {}
     };
 
-    let (rehyd_enum, rehyd_method, step_ret) = make_rehydration(
-        &vis,
-        &rehyd_name,
-        &fn_args,
-        &awaits,
-        &captures_at_await,
-        &join_caps_at,
-        &all_skips,
-        &output_ty,
-        &effect_enum,
-    );
     let step_ok_macro = step_ok_macro_tokens();
     let getters = make_getters(&awaits, &captures_at_await, &join_caps_at);
 

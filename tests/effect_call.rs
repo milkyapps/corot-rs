@@ -86,10 +86,11 @@ fn test_effect_call_captured_arg() {
         c.step(),
         corot_rs::Step::Effect(WithLocalCoroutineEffect::CallSendMessage(42))
     ));
-    match c.pending_slot().unwrap() {
-        WithLocalCoroutinePendingSlot::Reply(s) => s.set(420),
-    }
-    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
+    // One-shot: settle the effect reply and step again in a single call.
+    assert!(matches!(
+        c.settle_and_step(420),
+        corot_rs::Step::Ready(())
+    ));
 }
 
 #[test]
@@ -130,31 +131,16 @@ fn test_statement_effect_await_defaults_unit() {
         corot_rs::Step::Effect(StatementEffectAwaitsCoroutineEffect::CallLogEvent("start"))
     ));
     let _ = (log_event, ping);
-    match c.pending_slot().unwrap() {
-        StatementEffectAwaitsCoroutinePendingSlot::Unit0(s)
-        | StatementEffectAwaitsCoroutinePendingSlot::Unit1(s)
-        | StatementEffectAwaitsCoroutinePendingSlot::Unit2(s) => s.set(()),
-    }
-
     assert!(matches!(
-        c.step(),
+        c.settle_and_step(()),
         corot_rs::Step::Effect(StatementEffectAwaitsCoroutineEffect::CallPing(()))
     ));
-    match c.pending_slot().unwrap() {
-        StatementEffectAwaitsCoroutinePendingSlot::Unit0(s)
-        | StatementEffectAwaitsCoroutinePendingSlot::Unit1(s)
-        | StatementEffectAwaitsCoroutinePendingSlot::Unit2(s) => s.set(()),
-    }
-
     assert!(matches!(
-        c.step(),
+        c.settle_and_step(()),
         corot_rs::Step::Effect(StatementEffectAwaitsCoroutineEffect::CallLogEvent("done"))
     ));
-    match c.pending_slot().unwrap() {
-        StatementEffectAwaitsCoroutinePendingSlot::Unit0(s)
-        | StatementEffectAwaitsCoroutinePendingSlot::Unit1(s)
-        | StatementEffectAwaitsCoroutinePendingSlot::Unit2(s) => s.set(()),
-    }
-
-    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
+    assert!(matches!(
+        c.settle_and_step(()),
+        corot_rs::Step::Ready(())
+    ));
 }
