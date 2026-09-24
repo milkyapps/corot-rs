@@ -2,8 +2,9 @@ use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use syn::{
+    parse::{Parse, ParseStream},
     parse_macro_input, Expr, ExprPath, FnArg, Ident, ItemFn, Lifetime, Lit, Local, LocalInit, Pat,
-    PatIdent, PatType, Path, Stmt, Type,
+    PatIdent, PatType, Path, Stmt, Token, Type,
 };
 
 /// Suspension points: typed `let` awaits (including `await?`); `if` / `if let` /
@@ -75,12 +76,68 @@ use syn::{
 /// With the `serde` feature, wrap non-serializable captures in `SkipSerde<T>`
 /// (from the `corot-rs` crate). The macro matches that type name and emits
 /// `#[serde(skip)]` — it cannot detect `Serialize` bounds itself.
+///
+/// Generated type names default to `{Fn}Coroutine` / `{Fn}CoroutineEffect` /
+/// `{Fn}CoroutineRehydration`. Override with attribute args:
+/// `#[corot(name = GoSanctuary, effect = GoSanctuaryEffect)]`.
+/// `effect` defaults to `{name}Effect` when only `name` is set.
 #[proc_macro_attribute]
-pub fn corot(_attr: TokenStream, item: TokenStream) -> TokenStream {
+pub fn corot(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attrs = parse_macro_input!(attr as CorotAttrs);
     let input = parse_macro_input!(item as ItemFn);
-    match expand_corot(input) {
+    match expand_corot(attrs, input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
+    }
+}
+
+/// Optional `#[corot(name = …, effect = …)]` overrides for generated enums.
+struct CorotAttrs {
+    name: Option<Ident>,
+    effect: Option<Ident>,
+}
+
+impl Parse for CorotAttrs {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut name = None;
+        let mut effect = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            let value: Ident = input.parse()?;
+            match key.to_string().as_str() {
+                "name" => {
+                    if name.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            &key,
+                            "#[corot] duplicate `name` argument",
+                        ));
+                    }
+                    name = Some(value);
+                }
+                "effect" => {
+                    if effect.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            &key,
+                            "#[corot] duplicate `effect` argument",
+                        ));
+                    }
+                    effect = Some(value);
+                }
+                other => {
+                    return Err(syn::Error::new_spanned(
+                        &key,
+                        format!(
+                            "#[corot] unknown argument `{other}`; expected `name` or `effect`"
+                        ),
+                    ));
+                }
+            }
+            if input.peek(Token![,]) {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self { name, effect })
     }
 }
 
@@ -472,7 +529,7 @@ enum BodyUnit {
     },
 }
 
-fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
+fn expand_corot(attrs: CorotAttrs, input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     if input.sig.asyncness.is_none() {
         return Err(syn::Error::new_spanned(
             &input.sig.fn_token,
@@ -489,7 +546,12 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
 
     let vis = &input.vis;
     let fn_name = &input.sig.ident;
-    let enum_name = coroutine_name(fn_name);
+    let enum_name = attrs
+        .name
+        .unwrap_or_else(|| coroutine_name(fn_name));
+    let effect_enum = attrs
+        .effect
+        .unwrap_or_else(|| format_ident!("{}Effect", enum_name));
     let (output_ty, err_ty) = parse_fn_output(&input.sig.output)?;
     let ready_ok = ready_ok_tokens(&output_ty);
 
@@ -712,7 +774,6 @@ fn expand_corot(input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
         resolve_effect_arg_types(ap, caps)?;
     }
 
-    let effect_enum = format_ident!("{}Effect", enum_name);
     let effect_enum_tokens = build_effect_enum(vis, &effect_enum, &awaits)?;
 
     let mut variants = if fn_args.is_empty() {
