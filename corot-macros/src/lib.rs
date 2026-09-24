@@ -2714,16 +2714,13 @@ fn resolve_await_base_ty(base: &Expr) -> syn::Result<Type> {
     if let Some((ty, _)) = as_val_call(base) {
         return Ok(ty);
     }
-    if is_unit_expr(base) {
-        return Ok(syn::parse_quote!(()));
-    }
-    if let Expr::Cast(c) = base {
-        return Ok(c.ty.as_ref().clone());
+    if let Some(ty) = infer_effect_arg_ty(base) {
+        return Ok(ty);
     }
     Err(syn::Error::new_spanned(
         base,
         "#[corot] mid-expression await needs a known settle type; use \
-         `val::<T>(expr).await` (or `().await` / `(expr as T).await`)",
+         `val::<T>(expr).await` (or `().await` / `(1, true).await` / `(expr as T).await`)",
     ))
 }
 
@@ -4862,6 +4859,15 @@ fn infer_effect_arg_ty(expr: &Expr) -> Option<Type> {
             }
         }
         Expr::Unary(u) if matches!(u.op, syn::UnOp::Neg(_)) => infer_effect_arg_ty(&u.expr),
+        Expr::Tuple(t) => {
+            let elems: Vec<Type> = t
+                .elems
+                .iter()
+                .map(infer_effect_arg_ty)
+                .collect::<Option<_>>()?;
+            // Trailing commas keep 1-tuples as `(T,)` rather than parenthesized `T`.
+            Some(syn::parse_quote!((#(#elems,)*)))
+        }
         _ => None,
     }
 }
@@ -4890,7 +4896,7 @@ fn resolve_effect_arg_types(ap: &mut AwaitPoint, caps: &[Binding]) -> syn::Resul
         return Err(syn::Error::new_spanned(
             &arg.expr,
             "#[corot] external call arg needs a known type \
-             (literal, `as T`, `corot_rs::val::<T>(…)`, or a captured local)",
+             (literal, `()`, tuple, `as T`, `corot_rs::val::<T>(…)`, or a captured local)",
         ));
     }
     Ok(())
@@ -5108,7 +5114,13 @@ fn resolve_let_wait_ty(pat: &Pat, expr: &Expr) -> syn::Result<Type> {
         if let Some((ty, _)) = as_val_call(&base) {
             return Ok(ty);
         }
+        if let Some(ty) = infer_effect_arg_ty(&base) {
+            return Ok(ty);
+        }
         return resolve_scrut_ty(pat, &base);
+    }
+    if let Some(ty) = infer_effect_arg_ty(expr) {
+        return Ok(ty);
     }
     resolve_scrut_ty(pat, expr)
 }
