@@ -43,6 +43,16 @@ async fn unit_and_tuple_args() {
     println!("unit_and_tuple: {a},{b}");
 }
 
+/// Statement-position effect await with no type hint defaults settle type to `()`.
+async fn log_event(_msg: &'static str) {}
+
+#[corot]
+async fn statement_effect_awaits() {
+    log_event("start").await;
+    ping(()).await;
+    log_event("done").await;
+}
+
 #[test]
 fn test_effect_call() {
     let mut c = chat();
@@ -106,6 +116,44 @@ fn test_effect_call_unit_and_tuple_args() {
     match c.pending_slot().unwrap() {
         UnitAndTupleArgsCoroutinePendingSlot::A(s)
         | UnitAndTupleArgsCoroutinePendingSlot::B(s) => s.set(3),
+    }
+
+    assert!(matches!(c.step(), corot_rs::Step::Ready(())));
+}
+
+#[test]
+fn test_statement_effect_await_defaults_unit() {
+    let mut c = statement_effect_awaits();
+
+    assert!(matches!(
+        c.step(),
+        corot_rs::Step::Effect(StatementEffectAwaitsCoroutineEffect::CallLogEvent("start"))
+    ));
+    let _ = (log_event, ping);
+    match c.pending_slot().unwrap() {
+        StatementEffectAwaitsCoroutinePendingSlot::Unit0(s)
+        | StatementEffectAwaitsCoroutinePendingSlot::Unit1(s)
+        | StatementEffectAwaitsCoroutinePendingSlot::Unit2(s) => s.set(()),
+    }
+
+    assert!(matches!(
+        c.step(),
+        corot_rs::Step::Effect(StatementEffectAwaitsCoroutineEffect::CallPing(()))
+    ));
+    match c.pending_slot().unwrap() {
+        StatementEffectAwaitsCoroutinePendingSlot::Unit0(s)
+        | StatementEffectAwaitsCoroutinePendingSlot::Unit1(s)
+        | StatementEffectAwaitsCoroutinePendingSlot::Unit2(s) => s.set(()),
+    }
+
+    assert!(matches!(
+        c.step(),
+        corot_rs::Step::Effect(StatementEffectAwaitsCoroutineEffect::CallLogEvent("done"))
+    ));
+    match c.pending_slot().unwrap() {
+        StatementEffectAwaitsCoroutinePendingSlot::Unit0(s)
+        | StatementEffectAwaitsCoroutinePendingSlot::Unit1(s)
+        | StatementEffectAwaitsCoroutinePendingSlot::Unit2(s) => s.set(()),
     }
 
     assert!(matches!(c.step(), corot_rs::Step::Ready(())));

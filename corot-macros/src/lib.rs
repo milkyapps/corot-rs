@@ -3092,13 +3092,23 @@ fn as_plain_awaits(
                 ));
             }
             // Bare `expr.await;` — synthesize a typed discard let when possible.
+            // Effect-call returns are host-supplied; with no type hint, default to `()`.
             if count_awaits(expr) == 1 {
                 if let Some(base) = bare_await_base(expr) {
-                    if let Ok(wait_ty) = resolve_await_base_ty(&base) {
+                    let wait_ty = match resolve_await_base_ty(&base) {
+                        Ok(ty) => Some(ty),
+                        Err(_) if as_effect_call(&base)?.is_some() => {
+                            Some(syn::parse_quote!(()))
+                        }
+                        Err(_) => None,
+                    };
+                    if let Some(wait_ty) = wait_ty {
                         let tmp_stmt: Stmt = syn::parse_quote! {
                             let _: #wait_ty = #expr;
                         };
-                        return Ok(as_plain_await_let(&tmp_stmt, err_ty, await_index)?.map(|p| vec![p]));
+                        return Ok(
+                            as_plain_await_let(&tmp_stmt, err_ty, await_index)?.map(|p| vec![p]),
+                        );
                     }
                 }
             }
